@@ -1,15 +1,22 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, status
+from graphiti_core.errors import NodeNotFoundError  # type: ignore
+from graphiti_core.nodes import EpisodicNode  # type: ignore
 
 from graph_service.dto import (
+    EpisodeStatus,
     GetMemoryRequest,
     GetMemoryResponse,
     Message,
     SearchQuery,
     SearchResults,
 )
-from graph_service.zep_graphiti import ZepGraphitiDep, get_fact_result_from_edge
+from graph_service.zep_graphiti import (
+    ZepGraphitiDep,
+    get_fact_result_from_edge,
+    resolve_episode_names,
+)
 
 router = APIRouter()
 
@@ -21,7 +28,8 @@ async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
         query=query.query,
         num_results=query.max_facts,
     )
-    facts = [get_fact_result_from_edge(edge) for edge in relevant_edges]
+    episode_names = await resolve_episode_names(graphiti.driver, relevant_edges)
+    facts = [get_fact_result_from_edge(edge, episode_names) for edge in relevant_edges]
     return SearchResults(
         facts=facts,
     )
@@ -30,7 +38,24 @@ async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
 @router.get('/entity-edge/{uuid}', status_code=status.HTTP_200_OK)
 async def get_entity_edge(uuid: str, graphiti: ZepGraphitiDep):
     entity_edge = await graphiti.get_entity_edge(uuid)
-    return get_fact_result_from_edge(entity_edge)
+    episode_names = await resolve_episode_names(graphiti.driver, [entity_edge])
+    return get_fact_result_from_edge(entity_edge, episode_names)
+
+
+@router.get('/episodes/status/{uuid}', status_code=status.HTTP_200_OK)
+async def episode_status(uuid: str, graphiti: ZepGraphitiDep):
+    """Has this episode been processed into the graph?
+
+    The durability check for queued /messages ingestion: writers that
+    received a 202 can confirm the episode actually exists instead of
+    trusting the in-memory queue. Only a missing node maps to
+    exists=false; any other failure propagates as an error.
+    """
+    try:
+        episode = await EpisodicNode.get_by_uuid(graphiti.driver, uuid)
+    except NodeNotFoundError:
+        return EpisodeStatus(uuid=uuid, exists=False, name=None)
+    return EpisodeStatus(uuid=uuid, exists=True, name=episode.name)
 
 
 @router.get('/episodes/{group_id}', status_code=status.HTTP_200_OK)
@@ -52,7 +77,8 @@ async def get_memory(
         query=combined_query,
         num_results=request.max_facts,
     )
-    facts = [get_fact_result_from_edge(edge) for edge in result]
+    episode_names = await resolve_episode_names(graphiti.driver, result)
+    facts = [get_fact_result_from_edge(edge, episode_names) for edge in result]
     return GetMemoryResponse(facts=facts)
 
 
