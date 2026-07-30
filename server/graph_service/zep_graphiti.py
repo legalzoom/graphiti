@@ -126,7 +126,22 @@ async def initialize_graphiti(settings: ZepEnvDep):
         await client.close()
 
 
-def get_fact_result_from_edge(edge: EntityEdge):
+async def resolve_episode_names(driver, edges: list[EntityEdge]) -> dict[str, str]:
+    """Batch-resolve the episode uuids referenced by edges to episode names.
+
+    Returns a uuid -> name map covering every episode node that still
+    exists; uuids whose nodes were deleted are simply absent from the
+    map (represented as-is to callers, never invented).
+    """
+    uuids = sorted({u for edge in edges for u in (edge.episodes or [])})
+    if not uuids:
+        return {}
+    nodes = await EpisodicNode.get_by_uuids(driver, uuids)
+    return {node.uuid: node.name for node in nodes}
+
+
+def get_fact_result_from_edge(edge: EntityEdge, episode_names_by_uuid: dict[str, str]):
+    episodes = list(edge.episodes or [])
     return FactResult(
         uuid=edge.uuid,
         name=edge.name,
@@ -135,6 +150,8 @@ def get_fact_result_from_edge(edge: EntityEdge):
         invalid_at=edge.invalid_at,
         created_at=edge.created_at,
         expired_at=edge.expired_at,
+        episodes=episodes,
+        episode_names={u: episode_names_by_uuid[u] for u in episodes if u in episode_names_by_uuid},
     )
 
 
