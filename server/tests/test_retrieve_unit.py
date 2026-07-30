@@ -20,7 +20,7 @@ NOW = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
 def _edge(uuid: str, fact: str, episodes: list[str]):
     edge = MagicMock()
     edge.uuid = uuid
-    edge.name = f"fact-{uuid}"
+    edge.name = f'fact-{uuid}'
     edge.fact = fact
     edge.valid_at = NOW
     edge.invalid_at = None
@@ -47,92 +47,80 @@ def _client(graphiti: MagicMock) -> TestClient:
 class TestSearchProvenance:
     def test_search_returns_episode_uuids_and_names(self):
         graphiti = MagicMock()
-        graphiti.search = AsyncMock(
-            return_value=[_edge("e1", "A depends on B", ["ep-1", "ep-2"])]
-        )
+        graphiti.search = AsyncMock(return_value=[_edge('e1', 'A depends on B', ['ep-1', 'ep-2'])])
         with patch(
-            "graph_service.zep_graphiti.EpisodicNode.get_by_uuids",
+            'graph_service.zep_graphiti.EpisodicNode.get_by_uuids',
             new=AsyncMock(
                 return_value=[
-                    _episode_node("ep-1", "curated:knowledge/a.md"),
-                    _episode_node("ep-2", "curated:knowledge/b.md"),
+                    _episode_node('ep-1', 'curated:knowledge/a.md'),
+                    _episode_node('ep-2', 'curated:knowledge/b.md'),
                 ]
             ),
         ):
-            resp = _client(graphiti).post(
-                "/search", json={"query": "a", "max_facts": 5}
-            )
+            resp = _client(graphiti).post('/search', json={'query': 'a', 'max_facts': 5})
 
         assert resp.status_code == 200
-        fact = resp.json()["facts"][0]
-        assert fact["episodes"] == ["ep-1", "ep-2"]
-        assert fact["episode_names"] == {
-            "ep-1": "curated:knowledge/a.md",
-            "ep-2": "curated:knowledge/b.md",
+        fact = resp.json()['facts'][0]
+        assert fact['episodes'] == ['ep-1', 'ep-2']
+        assert fact['episode_names'] == {
+            'ep-1': 'curated:knowledge/a.md',
+            'ep-2': 'curated:knowledge/b.md',
         }
 
     def test_deleted_episode_absent_from_names_but_kept_in_uuids(self):
         graphiti = MagicMock()
         graphiti.search = AsyncMock(
-            return_value=[_edge("e1", "A depends on B", ["ep-1", "ep-gone"])]
+            return_value=[_edge('e1', 'A depends on B', ['ep-1', 'ep-gone'])]
         )
         with patch(
-            "graph_service.zep_graphiti.EpisodicNode.get_by_uuids",
-            new=AsyncMock(
-                return_value=[_episode_node("ep-1", "curated:knowledge/a.md")]
-            ),
+            'graph_service.zep_graphiti.EpisodicNode.get_by_uuids',
+            new=AsyncMock(return_value=[_episode_node('ep-1', 'curated:knowledge/a.md')]),
         ):
-            resp = _client(graphiti).post(
-                "/search", json={"query": "a", "max_facts": 5}
-            )
+            resp = _client(graphiti).post('/search', json={'query': 'a', 'max_facts': 5})
 
-        fact = resp.json()["facts"][0]
-        assert fact["episodes"] == ["ep-1", "ep-gone"]
-        assert fact["episode_names"] == {"ep-1": "curated:knowledge/a.md"}
+        fact = resp.json()['facts'][0]
+        assert fact['episodes'] == ['ep-1', 'ep-gone']
+        assert fact['episode_names'] == {'ep-1': 'curated:knowledge/a.md'}
 
     def test_search_with_no_episode_refs_skips_lookup(self):
         graphiti = MagicMock()
-        graphiti.search = AsyncMock(return_value=[_edge("e1", "fact", [])])
+        graphiti.search = AsyncMock(return_value=[_edge('e1', 'fact', [])])
         with patch(
-            "graph_service.zep_graphiti.EpisodicNode.get_by_uuids",
+            'graph_service.zep_graphiti.EpisodicNode.get_by_uuids',
             new=AsyncMock(),
         ) as lookup:
-            resp = _client(graphiti).post(
-                "/search", json={"query": "a", "max_facts": 5}
-            )
+            resp = _client(graphiti).post('/search', json={'query': 'a', 'max_facts': 5})
 
         assert resp.status_code == 200
         lookup.assert_not_awaited()
-        fact = resp.json()["facts"][0]
-        assert fact["episodes"] == []
-        assert fact["episode_names"] == {}
+        fact = resp.json()['facts'][0]
+        assert fact['episodes'] == []
+        assert fact['episode_names'] == {}
 
 
 class TestEpisodeStatus:
     def test_existing_episode(self):
         graphiti = MagicMock()
         with patch(
-            "graph_service.routers.retrieve.EpisodicNode.get_by_uuid",
-            new=AsyncMock(
-                return_value=_episode_node("ep-1", "curated:knowledge/a.md")
-            ),
+            'graph_service.routers.retrieve.EpisodicNode.get_by_uuid',
+            new=AsyncMock(return_value=_episode_node('ep-1', 'curated:knowledge/a.md')),
         ):
-            resp = _client(graphiti).get("/episodes/status/ep-1")
+            resp = _client(graphiti).get('/episodes/status/ep-1')
 
         assert resp.status_code == 200
         assert resp.json() == {
-            "uuid": "ep-1",
-            "exists": True,
-            "name": "curated:knowledge/a.md",
+            'uuid': 'ep-1',
+            'exists': True,
+            'name': 'curated:knowledge/a.md',
         }
 
     def test_missing_episode(self):
         graphiti = MagicMock()
         with patch(
-            "graph_service.routers.retrieve.EpisodicNode.get_by_uuid",
-            new=AsyncMock(side_effect=NodeNotFoundError("ep-x")),
+            'graph_service.routers.retrieve.EpisodicNode.get_by_uuid',
+            new=AsyncMock(side_effect=NodeNotFoundError('ep-x')),
         ):
-            resp = _client(graphiti).get("/episodes/status/ep-x")
+            resp = _client(graphiti).get('/episodes/status/ep-x')
 
         assert resp.status_code == 200
-        assert resp.json() == {"uuid": "ep-x", "exists": False, "name": None}
+        assert resp.json() == {'uuid': 'ep-x', 'exists': False, 'name': None}
