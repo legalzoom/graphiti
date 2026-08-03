@@ -126,7 +126,15 @@ async def initialize_graphiti(settings: ZepEnvDep):
         await client.close()
 
 
-def get_fact_result_from_edge(edge: EntityEdge):
+def get_fact_result_from_edge(edge: EntityEdge, score: float = 0.0):
+    """Serialize an EntityEdge to a FactResult.
+
+    score is the reranker score for this edge from the search that produced
+    it. EntityEdge itself carries no score: graphiti_core returns scores in
+    SearchResults.edge_reranker_scores, a list parallel to SearchResults.edges,
+    so callers must pass it in. Defaults to 0.0 for callers that did not rank
+    (get_entity_edge fetches one edge by uuid).
+    """
     return FactResult(
         uuid=edge.uuid,
         name=edge.name,
@@ -135,6 +143,7 @@ def get_fact_result_from_edge(edge: EntityEdge):
         invalid_at=edge.invalid_at,
         created_at=edge.created_at,
         expired_at=edge.expired_at,
+        score=score,
     )
 
 
