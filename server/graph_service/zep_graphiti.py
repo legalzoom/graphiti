@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping, Sequence
 from typing import Annotated
 
 from fastapi import Depends, HTTPException
@@ -126,7 +127,48 @@ async def initialize_graphiti(settings: ZepEnvDep):
         await client.close()
 
 
-def get_fact_result_from_edge(edge: EntityEdge):
+async def resolve_node_names(graphiti: ZepGraphiti, edges: Sequence[EntityEdge]) -> dict[str, str]:
+    """Map entity-node uuid to name for every node these edges connect.
+
+    EntityEdge carries source_node_uuid and target_node_uuid but not the node
+    names, and a caller joining facts against its own entity records needs
+    names: uuids are internal to this graph and not portable. Batched into a
+    single lookup across all edges rather than one per edge.
+
+    Degrades to an empty mapping on failure. Names are additive context, so a
+    node-lookup problem must not fail a search that already succeeded.
+    """
+    uuids = {
+        uuid for edge in edges for uuid in (edge.source_node_uuid, edge.target_node_uuid) if uuid
+    }
+    if not uuids:
+        return {}
+    try:
+        nodes = await EntityNode.get_by_uuids(graphiti.driver, sorted(uuids))
+    except Exception:
+        logger.warning('Entity node name lookup failed; omitting node names', exc_info=True)
+        return {}
+    return {node.uuid: node.name for node in nodes if node.uuid and node.name}
+
+
+def get_fact_result_from_edge(
+    edge: EntityEdge,
+    score: float = 0.0,
+    node_names: Mapping[str, str] | None = None,
+):
+    """Serialize an EntityEdge to a FactResult.
+
+    score is the reranker score for this edge from the search that produced
+    it. EntityEdge itself carries no score: graphiti_core returns scores in
+    SearchResults.edge_reranker_scores, a list parallel to SearchResults.edges,
+    so callers must pass it in. Defaults to 0.0 for callers that did not rank
+    (get_entity_edge fetches one edge by uuid).
+
+    node_names maps entity-node uuid to name, as built by resolve_node_names.
+    Omitting it leaves source_node and target_node None; the uuids are always
+    populated because the edge carries them directly.
+    """
+    names = node_names or {}
     return FactResult(
         uuid=edge.uuid,
         name=edge.name,
@@ -135,6 +177,11 @@ def get_fact_result_from_edge(edge: EntityEdge):
         invalid_at=edge.invalid_at,
         created_at=edge.created_at,
         expired_at=edge.expired_at,
+        score=score,
+        source_node_uuid=edge.source_node_uuid,
+        target_node_uuid=edge.target_node_uuid,
+        source_node=names.get(edge.source_node_uuid),
+        target_node=names.get(edge.target_node_uuid),
     )
 
 
