@@ -36,6 +36,20 @@ class FactResult(BaseModel):
             'so switching reranker means revisiting this sentinel.'
         ),
     )
+    source_node_uuid: str = Field(description='uuid of the entity node this fact originates from')
+    target_node_uuid: str = Field(description='uuid of the entity node this fact points to')
+    source_node: str | None = Field(
+        default=None,
+        description=(
+            'Name of the source entity node, resolved from source_node_uuid. None when '
+            'the node could not be looked up. Names are what callers need to join facts '
+            'against their own entity records; uuids alone are not portable.'
+        ),
+    )
+    target_node: str | None = Field(
+        default=None,
+        description='Name of the target entity node, resolved from target_node_uuid.',
+    )
 
     class Config:
         json_encoders = {datetime: lambda v: v.astimezone(timezone.utc).isoformat()}

@@ -13,7 +13,12 @@ from graph_service.dto import (
     SearchQuery,
     SearchResults,
 )
-from graph_service.zep_graphiti import ZepGraphitiDep, get_fact_result_from_edge
+from graph_service.zep_graphiti import (
+    ZepGraphiti,
+    ZepGraphitiDep,
+    get_fact_result_from_edge,
+    resolve_node_names,
+)
 
 router = APIRouter()
 
@@ -34,16 +39,21 @@ def _rrf_search_config(max_facts: int) -> SearchConfig:
     return config
 
 
-def _facts_with_scores(results: CoreSearchResults) -> list[FactResult]:
-    """Zip edges with their reranker scores.
+async def _facts_from_results(
+    graphiti: ZepGraphiti, results: CoreSearchResults
+) -> list[FactResult]:
+    """Serialize search results, joining scores and entity-node names.
 
     edge_reranker_scores is a parallel list to edges. Indexed defensively
     rather than with zip() so that a short or empty score list degrades to
     score 0.0 instead of silently dropping facts from the response.
+
+    Node names come from one batched lookup for all edges, not one per edge.
     """
+    node_names = await resolve_node_names(graphiti, results.edges)
     scores = results.edge_reranker_scores
     return [
-        get_fact_result_from_edge(edge, scores[i] if i < len(scores) else 0.0)
+        get_fact_result_from_edge(edge, scores[i] if i < len(scores) else 0.0, node_names)
         for i, edge in enumerate(results.edges)
     ]
 
@@ -59,14 +69,17 @@ async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
         group_ids=query.group_ids,
     )
     return SearchResults(
-        facts=_facts_with_scores(results),
+        facts=await _facts_from_results(graphiti, results),
     )
 
 
 @router.get('/entity-edge/{uuid}', status_code=status.HTTP_200_OK)
 async def get_entity_edge(uuid: str, graphiti: ZepGraphitiDep):
     entity_edge = await graphiti.get_entity_edge(uuid)
-    return get_fact_result_from_edge(entity_edge)
+    # Names resolved here too, so a fact's shape does not depend on which route
+    # produced it. No score: this path fetches one edge, it does not rank.
+    node_names = await resolve_node_names(graphiti, [entity_edge])
+    return get_fact_result_from_edge(entity_edge, node_names=node_names)
 
 
 @router.get('/episodes/{group_id}', status_code=status.HTTP_200_OK)
@@ -92,7 +105,7 @@ async def get_memory(
         config=_rrf_search_config(request.max_facts),
         group_ids=[request.group_id],
     )
-    return GetMemoryResponse(facts=_facts_with_scores(results))
+    return GetMemoryResponse(facts=await _facts_from_results(graphiti, results))
 
 
 def compose_query_from_messages(messages: list[Message]):
