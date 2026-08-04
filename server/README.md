@@ -38,6 +38,16 @@ Only stable releases are built automatically (pre-release versions are skipped).
    NEO4J_PORT=your_neo4j_port
    ```
 
+   Optional:
+
+   ```
+   GRAPHITI_INGEST_QUEUE_MAX=200
+   ```
+
+   Capacity of the in-memory ingest queue behind `POST /messages` (default
+   200, must be >= 1). When the queue is full the endpoint returns 503 and
+   callers are expected to retry the rejected messages later.
+
 4. This service depends on having access to a neo4j instance, you may wish to add a neo4j image to your service setup as well. Or you may wish to use neo4j cloud or a desktop version if running this locally.
 
    An example of docker compose setup may look like this:
