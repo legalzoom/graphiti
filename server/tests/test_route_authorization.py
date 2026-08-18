@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
@@ -163,6 +163,47 @@ async def test_message_write_rejects_known_cross_group_uuid_before_enqueue():
 
     assert exc_info.value.status_code == 409
     assert_episode_uuid_group.assert_awaited_once_with('opr-owned-episode', 'other')
+
+
+@pytest.mark.asyncio
+async def test_episode_uuid_group_preflight_keeps_configured_neo4j_database(monkeypatch):
+    with_database = Mock()
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEO4J,
+        with_database=with_database,
+    )
+    get_by_uuid = AsyncMock(return_value=SimpleNamespace(group_id='opr'))
+    monkeypatch.setattr(
+        'graph_service.zep_graphiti.EpisodicNode.get_by_uuid',
+        get_by_uuid,
+    )
+    graphiti = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    await ZepGraphiti.assert_episode_uuid_group(graphiti, 'episode-id', 'opr')
+
+    with_database.assert_not_called()
+    get_by_uuid.assert_awaited_once_with(driver, 'episode-id')
+
+
+@pytest.mark.asyncio
+async def test_episode_uuid_group_preflight_selects_falkordb_group(monkeypatch):
+    group_driver = object()
+    with_database = Mock(return_value=group_driver)
+    driver = SimpleNamespace(
+        provider=GraphProvider.FALKORDB,
+        with_database=with_database,
+    )
+    get_by_uuid = AsyncMock(return_value=SimpleNamespace(group_id='opr'))
+    monkeypatch.setattr(
+        'graph_service.zep_graphiti.EpisodicNode.get_by_uuid',
+        get_by_uuid,
+    )
+    graphiti = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    await ZepGraphiti.assert_episode_uuid_group(graphiti, 'episode-id', 'opr')
+
+    with_database.assert_called_once_with('opr')
+    get_by_uuid.assert_awaited_once_with(group_driver, 'episode-id')
 
 
 @pytest.mark.asyncio

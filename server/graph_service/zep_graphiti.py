@@ -86,7 +86,11 @@ class ZepGraphiti(Graphiti):
         The write query repeats this ownership check after taking the node lock;
         this read is an early rejection only and is not the race-safety boundary.
         """
-        query_driver = self.driver.with_database(group_id)
+        query_driver = (
+            self.driver.with_database(group_id)
+            if self.driver.provider == GraphProvider.FALKORDB
+            else self.driver
+        )
         try:
             episode = await EpisodicNode.get_by_uuid(query_driver, uuid)
         except NodeNotFoundError:
