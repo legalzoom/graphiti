@@ -45,7 +45,7 @@ permissions:
 
 jobs:
   ruff:
-    runs-on: depot-ubuntu-22.04
+    runs-on: engineering-services-amd64-medium
     steps:
       # Install tooling BEFORE checking out untrusted PR code (see SECURITY note).
       - name: Install uv
