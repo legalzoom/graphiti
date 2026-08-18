@@ -21,12 +21,26 @@ from pydantic import SecretStr
 
 from graph_service.config import Settings
 from graph_service.dto import DeleteEpisodeIfMatchRequest
-from graph_service.protocol import GRAPHITI_RECONCILIATION_PROTOCOL
+from graph_service.protocol import (
+    GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE,
+    GRAPHITI_RECONCILIATION_PROTOCOL,
+)
 from graph_service.routers.ingest import delete_episode_if_matches
 from graph_service.routers.retrieve import get_episodes, get_episodes_for_reconciliation
 from graph_service.zep_graphiti import ZepGraphiti, _conditional_episode_identity_digest
 
 EPISODE_UUID = '11111111-1111-4111-8111-111111111111'
+
+
+def test_privileged_listing_and_retirement_tokens_must_be_distinct():
+    with pytest.raises(ValueError, match='tokens must be distinct'):
+        Settings.model_validate(
+            {
+                'openai_api_key': 'test',
+                'opr_reconciliation_token': 'same-secret',
+                'opr_retirement_token': 'same-secret',
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -99,6 +113,31 @@ async def test_dedicated_reconciliation_listing_attests_same_response(monkeypatc
         'graphiti_core_version': '0.29.4',
         'episodes': [episode],
     }
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_listing_is_bound_to_opr_group():
+    reconciliation_listing = AsyncMock(return_value=[])
+    graphiti = cast(
+        ZepGraphiti,
+        SimpleNamespace(retrieve_episodes_for_reconciliation=reconciliation_listing),
+    )
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_reconciliation_token=SecretStr('reconcile-secret')),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_episodes_for_reconciliation(
+            'other-group',
+            20,
+            graphiti,
+            settings,
+            x_opr_reconciliation_token='reconcile-secret',
+        )
+
+    assert exc_info.value.status_code == 403
+    reconciliation_listing.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -431,9 +470,20 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
         content='stored content',
         source_description='publish',
     )
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+    )
 
     with pytest.raises(HTTPException) as exc_info:
-        await delete_episode_if_matches('episode-id', request, graphiti)
+        await delete_episode_if_matches(
+            'episode-id',
+            request,
+            graphiti,
+            settings,
+            x_opr_retirement_token='retire-secret',
+            x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+        )
 
     assert exc_info.value.status_code == 412
 
@@ -448,10 +498,21 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
         content='stored content',
         source_description='publish',
     )
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+    )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr('graph_service.routers.ingest.version', lambda _name: '0.29.4')
-        result = await delete_episode_if_matches('episode-id', request, graphiti)
+        result = await delete_episode_if_matches(
+            'episode-id',
+            request,
+            graphiti,
+            settings,
+            x_opr_retirement_token='retire-secret',
+            x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+        )
 
     assert result == {
         'message': 'Episode conditionally deleted',
@@ -466,3 +527,74 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
         content='stored content',
         source_description='publish',
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('token', 'operation'),
+    [
+        (None, GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+        ('wrong', GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+        ('retire-secret', None),
+        ('retire-secret', 'list_episodes'),
+        ('reconcile-secret', GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+    ],
+)
+async def test_conditional_delete_requires_token_and_exact_operation_scope(
+    token,
+    operation,
+):
+    graphiti = MagicMock()
+    graphiti.delete_episodic_node_if_matches = AsyncMock(return_value=True)
+    request = DeleteEpisodeIfMatchRequest(
+        group_id='opr',
+        name='curated:test.md',
+        content='stored content',
+        source_description='publish',
+    )
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await delete_episode_if_matches(
+            'episode-id',
+            request,
+            graphiti,
+            settings,
+            x_opr_retirement_token=token,
+            x_opr_reconciliation_operation=operation,
+        )
+
+    assert exc_info.value.status_code == 403
+    graphiti.delete_episodic_node_if_matches.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_conditional_delete_is_bound_to_opr_group():
+    graphiti = MagicMock()
+    graphiti.delete_episodic_node_if_matches = AsyncMock(return_value=True)
+    request = DeleteEpisodeIfMatchRequest(
+        group_id='other-group',
+        name='curated:test.md',
+        content='stored content',
+        source_description='publish',
+    )
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await delete_episode_if_matches(
+            'episode-id',
+            request,
+            graphiti,
+            settings,
+            x_opr_retirement_token='retire-secret',
+            x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+        )
+
+    assert exc_info.value.status_code == 403
+    graphiti.delete_episodic_node_if_matches.assert_not_awaited()

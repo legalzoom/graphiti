@@ -1,8 +1,9 @@
+import hmac
 from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
 
 
@@ -25,8 +26,21 @@ class Settings(BaseSettings):
     kuzu_max_concurrent_queries: int | None = Field(None)
     db_backend: str = Field('neo4j')
     opr_reconciliation_token: SecretStr = SecretStr('')
+    opr_retirement_token: SecretStr = SecretStr('')
 
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+
+    @model_validator(mode='after')
+    def require_distinct_opr_privileged_tokens(self):
+        listing_token = self.opr_reconciliation_token.get_secret_value()
+        retirement_token = self.opr_retirement_token.get_secret_value()
+        if (
+            listing_token
+            and retirement_token
+            and hmac.compare_digest(listing_token, retirement_token)
+        ):
+            raise ValueError('OPR reconciliation and retirement tokens must be distinct')
+        return self
 
 
 @lru_cache

@@ -3,11 +3,13 @@ import logging
 from contextlib import asynccontextmanager
 from functools import partial
 from importlib.metadata import version
+from typing import Annotated
 
-from fastapi import APIRouter, FastAPI, HTTPException, status
+from fastapi import APIRouter, FastAPI, Header, HTTPException, status
 from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 
+from graph_service.config import ZepEnvDep
 from graph_service.dto import (
     AddEntityNodeRequest,
     AddMessagesRequest,
@@ -15,7 +17,12 @@ from graph_service.dto import (
     Message,
     Result,
 )
-from graph_service.protocol import GRAPHITI_RECONCILIATION_PROTOCOL
+from graph_service.protocol import (
+    GRAPHITI_RECONCILIATION_GROUP_ID,
+    GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE,
+    GRAPHITI_RECONCILIATION_PROTOCOL,
+    reconciliation_token_matches,
+)
 from graph_service.zep_graphiti import ZepGraphitiDep
 
 logger = logging.getLogger('uvicorn.error')
@@ -116,12 +123,27 @@ async def delete_episode(uuid: str, graphiti: ZepGraphitiDep):
     return Result(message='Episode deleted', success=True)
 
 
-@router.delete('/episode/{uuid}/if-matches', status_code=status.HTTP_200_OK)
+@router.delete('/episode/{uuid}/retire/v2', status_code=status.HTTP_200_OK)
 async def delete_episode_if_matches(
     uuid: str,
     request: DeleteEpisodeIfMatchRequest,
     graphiti: ZepGraphitiDep,
+    settings: ZepEnvDep,
+    x_opr_retirement_token: Annotated[str | None, Header()] = None,
+    x_opr_reconciliation_operation: Annotated[str | None, Header()] = None,
 ):
+    expected_token = settings.opr_retirement_token.get_secret_value()
+    if not reconciliation_token_matches(
+        expected_token,
+        x_opr_retirement_token,
+    ) or (
+        x_opr_reconciliation_operation != GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE
+        or request.group_id != GRAPHITI_RECONCILIATION_GROUP_ID
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='conditional episode retirement is not authorized',
+        )
     deleted = await graphiti.delete_episodic_node_if_matches(
         uuid,
         group_id=request.group_id,

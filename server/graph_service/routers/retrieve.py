@@ -1,4 +1,3 @@
-import hmac
 from datetime import datetime, timezone
 from importlib.metadata import version
 from typing import Annotated
@@ -13,7 +12,11 @@ from graph_service.dto import (
     SearchQuery,
     SearchResults,
 )
-from graph_service.protocol import GRAPHITI_RECONCILIATION_PROTOCOL
+from graph_service.protocol import (
+    GRAPHITI_RECONCILIATION_GROUP_ID,
+    GRAPHITI_RECONCILIATION_PROTOCOL,
+    reconciliation_token_matches,
+)
 from graph_service.zep_graphiti import ZepGraphitiDep, get_fact_result_from_edge
 
 router = APIRouter()
@@ -22,10 +25,11 @@ router = APIRouter()
 def _authorize_reconciliation_listing(
     settings: ZepEnvDep,
     supplied_token: str | None,
+    group_id: str,
 ) -> None:
     expected_token = settings.opr_reconciliation_token.get_secret_value()
-    if not (
-        expected_token and supplied_token and hmac.compare_digest(expected_token, supplied_token)
+    if group_id != GRAPHITI_RECONCILIATION_GROUP_ID or not reconciliation_token_matches(
+        expected_token, supplied_token
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -62,7 +66,7 @@ async def get_episodes(
     x_opr_reconciliation_token: Annotated[str | None, Header()] = None,
 ):
     if include_retired_for_reconciliation:
-        _authorize_reconciliation_listing(settings, x_opr_reconciliation_token)
+        _authorize_reconciliation_listing(settings, x_opr_reconciliation_token, group_id)
         return await graphiti.retrieve_episodes_for_reconciliation(group_id, last_n)
     episodes = await graphiti.retrieve_episodes(
         group_ids=[group_id], last_n=last_n, reference_time=datetime.now(timezone.utc)
@@ -70,7 +74,7 @@ async def get_episodes(
     return episodes
 
 
-@router.get('/episodes/{group_id}/reconciliation', status_code=status.HTTP_200_OK)
+@router.get('/episodes/{group_id}/reconciliation/v2', status_code=status.HTTP_200_OK)
 async def get_episodes_for_reconciliation(
     group_id: str,
     last_n: int,
@@ -85,7 +89,7 @@ async def get_episodes_for_reconciliation(
     exact listing response, so a load balancer cannot split capability proof
     and destructive audit across different pods.
     """
-    _authorize_reconciliation_listing(settings, x_opr_reconciliation_token)
+    _authorize_reconciliation_listing(settings, x_opr_reconciliation_token, group_id)
     episodes = await graphiti.retrieve_episodes_for_reconciliation(group_id, last_n)
     return {
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
