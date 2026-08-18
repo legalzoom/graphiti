@@ -2,6 +2,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from functools import partial
+from importlib.metadata import version
 
 from fastapi import APIRouter, FastAPI, HTTPException, status
 from graphiti_core.nodes import EpisodeType  # type: ignore
@@ -14,6 +15,7 @@ from graph_service.dto import (
     Message,
     Result,
 )
+from graph_service.protocol import GRAPHITI_RECONCILIATION_PROTOCOL
 from graph_service.zep_graphiti import ZepGraphitiDep
 
 logger = logging.getLogger('uvicorn.error')
@@ -132,7 +134,12 @@ async def delete_episode_if_matches(
             status_code=status.HTTP_412_PRECONDITION_FAILED,
             detail='Episode identity precondition failed',
         )
-    return Result(message='Episode conditionally deleted', success=True)
+    return {
+        'message': 'Episode conditionally deleted',
+        'success': True,
+        'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
+        'graphiti_core_version': version('graphiti-core'),
+    }
 
 
 @router.post('/clear', status_code=status.HTTP_200_OK)

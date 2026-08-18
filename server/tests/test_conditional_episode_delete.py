@@ -21,8 +21,9 @@ from pydantic import SecretStr
 
 from graph_service.config import Settings
 from graph_service.dto import DeleteEpisodeIfMatchRequest
+from graph_service.protocol import GRAPHITI_RECONCILIATION_PROTOCOL
 from graph_service.routers.ingest import delete_episode_if_matches
-from graph_service.routers.retrieve import get_episodes
+from graph_service.routers.retrieve import get_episodes, get_episodes_for_reconciliation
 from graph_service.zep_graphiti import ZepGraphiti, _conditional_episode_identity_digest
 
 EPISODE_UUID = '11111111-1111-4111-8111-111111111111'
@@ -67,6 +68,37 @@ async def test_retired_reconciliation_listing_requires_distinct_service_token():
         == []
     )
     reconciliation_listing.assert_awaited_once_with('opr', 20)
+
+
+@pytest.mark.asyncio
+async def test_dedicated_reconciliation_listing_attests_same_response(monkeypatch):
+    episode = MagicMock()
+    reconciliation_listing = AsyncMock(return_value=[episode])
+    graphiti = cast(
+        ZepGraphiti,
+        SimpleNamespace(
+            retrieve_episodes_for_reconciliation=reconciliation_listing,
+        ),
+    )
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_reconciliation_token=SecretStr('reconcile-secret')),
+    )
+    monkeypatch.setattr('graph_service.routers.retrieve.version', lambda _name: '0.29.4')
+
+    result = await get_episodes_for_reconciliation(
+        'opr',
+        20,
+        graphiti,
+        settings,
+        x_opr_reconciliation_token='reconcile-secret',
+    )
+
+    assert result == {
+        'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
+        'graphiti_core_version': '0.29.4',
+        'episodes': [episode],
+    }
 
 
 @pytest.mark.parametrize(
@@ -417,9 +449,16 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
         source_description='publish',
     )
 
-    result = await delete_episode_if_matches('episode-id', request, graphiti)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr('graph_service.routers.ingest.version', lambda _name: '0.29.4')
+        result = await delete_episode_if_matches('episode-id', request, graphiti)
 
-    assert result.success is True
+    assert result == {
+        'message': 'Episode conditionally deleted',
+        'success': True,
+        'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
+        'graphiti_core_version': '0.29.4',
+    }
     graphiti.delete_episodic_node_if_matches.assert_awaited_once_with(
         'episode-id',
         group_id='opr',
