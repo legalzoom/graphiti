@@ -77,6 +77,48 @@ class ZepGraphiti(Graphiti):
         except NodeNotFoundError as e:
             raise HTTPException(status_code=404, detail=e.message) from e
 
+    async def delete_episodic_node_if_matches(
+        self,
+        uuid: str,
+        *,
+        group_id: str,
+        name: str,
+        content: str,
+        source_description: str,
+    ) -> bool:
+        """Atomically compare the complete episode identity and delete it.
+
+        A separate read followed by ``delete_episodic_node`` is unsafe because
+        episode writes MERGE on caller-controlled UUIDs. This single graph
+        statement makes a same-UUID replacement either happen before the
+        comparison (and fail it) or after the delete; it can never delete a
+        representation that was not the one supplied by the caller.
+        """
+        # The transient property follows Neo4j's documented explicit-lock
+        # pattern: acquire the node write lock before reading the compared
+        # fields, then immediately remove the property. Without this ordering,
+        # read-committed isolation can admit a lost-update style TOCTOU race.
+        # https://neo4j.com/docs/operations-manual/current/database-internals/concurrent-data-access/
+        records, _, _ = await self.driver.execute_query(
+            """
+            MATCH (episode:Episodic {uuid: $uuid, group_id: $group_id})
+            SET episode._opr_conditional_delete_lock = true
+            REMOVE episode._opr_conditional_delete_lock
+            WITH episode
+            WHERE episode.name = $name
+              AND episode.content = $content
+              AND episode.source_description = $source_description
+            DETACH DELETE episode
+            RETURN $uuid AS uuid
+            """,
+            uuid=uuid,
+            group_id=group_id,
+            name=name,
+            content=content,
+            source_description=source_description,
+        )
+        return bool(records)
+
 
 def _create_graphiti_client(settings: ZepEnvDep) -> ZepGraphiti:
     """Create a ZepGraphiti client based on the configured database backend."""

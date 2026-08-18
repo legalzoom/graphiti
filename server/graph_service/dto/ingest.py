@@ -13,3 +13,16 @@ class AddEntityNodeRequest(BaseModel):
     group_id: str = Field(..., description='The group id of the node to add')
     name: str = Field(..., description='The name of the node to add')
     summary: str = Field(default='', description='The summary of the node to add')
+
+
+class DeleteEpisodeIfMatchRequest(BaseModel):
+    """Complete episode identity required for an atomic conditional delete."""
+
+    group_id: str = Field(..., min_length=1, description='The owning graph group')
+    name: str = Field(..., description='The exact stored episode name')
+    content: str = Field(..., description='The exact stored episode content')
+    source_description: str = Field(
+        ...,
+        min_length=1,
+        description='The exact stored producer provenance',
+    )

@@ -3,11 +3,17 @@ import logging
 from contextlib import asynccontextmanager
 from functools import partial
 
-from fastapi import APIRouter, FastAPI, status
+from fastapi import APIRouter, FastAPI, HTTPException, status
 from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 
-from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, Message, Result
+from graph_service.dto import (
+    AddEntityNodeRequest,
+    AddMessagesRequest,
+    DeleteEpisodeIfMatchRequest,
+    Message,
+    Result,
+)
 from graph_service.zep_graphiti import ZepGraphitiDep
 
 logger = logging.getLogger('uvicorn.error')
@@ -106,6 +112,27 @@ async def delete_group(group_id: str, graphiti: ZepGraphitiDep):
 async def delete_episode(uuid: str, graphiti: ZepGraphitiDep):
     await graphiti.delete_episodic_node(uuid)
     return Result(message='Episode deleted', success=True)
+
+
+@router.delete('/episode/{uuid}/if-matches', status_code=status.HTTP_200_OK)
+async def delete_episode_if_matches(
+    uuid: str,
+    request: DeleteEpisodeIfMatchRequest,
+    graphiti: ZepGraphitiDep,
+):
+    deleted = await graphiti.delete_episodic_node_if_matches(
+        uuid,
+        group_id=request.group_id,
+        name=request.name,
+        content=request.content,
+        source_description=request.source_description,
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail='Episode identity precondition failed',
+        )
+    return Result(message='Episode conditionally deleted', success=True)
 
 
 @router.post('/clear', status_code=status.HTTP_200_OK)
