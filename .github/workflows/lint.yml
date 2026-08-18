@@ -45,7 +45,7 @@ permissions:
 
 jobs:
   ruff:
-    runs-on: engineering-services-amd64-medium
+    runs-on: ubuntu-latest
     steps:
       # Install tooling BEFORE checking out untrusted PR code (see SECURITY note).
       - name: Install uv
