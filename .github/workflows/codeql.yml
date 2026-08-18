@@ -29,8 +29,8 @@ jobs:
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
     # LegalZoom's GitHub IP allowlist rejects SARIF uploads from the shared
     # github-hosted runner pool. Depot uses the approved egress path already
-    # used by this repository's test and lint workflows.
-    runs-on: engineering-services-amd64-medium
+    # used by this repository's release workflows.
+    runs-on: depot-ubuntu-24.04-small
     permissions:
       # required for all workflows
       security-events: write
