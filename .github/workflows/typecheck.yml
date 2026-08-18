@@ -11,7 +11,7 @@ on:
 
 jobs:
   pyright:
-    runs-on: engineering-services-amd64-medium
+    runs-on: ubuntu-latest
     environment: development
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
