@@ -68,6 +68,40 @@ class TestNeptuneDriverAsyncBoundary:
         assert result == [{'query': 'RETURN 2'}]
 
 
+def test_episode_aoss_write_uses_external_generation_when_supplied():
+    driver = object.__new__(NeptuneDriver)
+    driver.aoss_client = MagicMock()
+    with (
+        patch(
+            'graphiti_core.driver.neptune_driver.aoss_indices',
+            [
+                {
+                    'index_name': 'episode_content',
+                    'body': {'mappings': {'properties': {'content': {}}}},
+                }
+            ],
+        ),
+        patch('graphiti_core.driver.neptune_driver.helpers.bulk', return_value=(1, 0)) as bulk,
+    ):
+        assert (
+            driver.save_to_aoss(
+                'episode_content',
+                [{'uuid': 'episode-id', 'content': '', '_version': 42}],
+            )
+            == 1
+        )
+
+    assert bulk.call_args.args[1] == [
+        {
+            '_index': 'episode_content',
+            '_id': 'episode-id',
+            '_version': 42,
+            '_version_type': 'external_gte',
+            'content': '',
+        }
+    ]
+
+
 class TestNeptuneClientTimeouts:
     """A boto3 client with no explicit Config falls back to 60s connect/read
     timeouts and minimal retries, which turns a slow-but-alive Neptune query

@@ -31,8 +31,17 @@ from graphiti_core.driver.driver import (
     GraphProvider,
 )
 from graphiti_core.embedder import EmbedderClient
-from graphiti_core.errors import NodeNotFoundError
-from graphiti_core.helpers import parse_db_date, validate_node_labels
+from graphiti_core.errors import (
+    EpisodeTombstonedError,
+    NodeGroupMismatchError,
+    NodeNotFoundError,
+)
+from graphiti_core.helpers import (
+    EPISODE_AOSS_WRITE_VERSION,
+    parse_db_date,
+    query_result_record_count,
+    validate_node_labels,
+)
 from graphiti_core.models.nodes.node_db_queries import (
     COMMUNITY_NODE_RETURN,
     COMMUNITY_NODE_RETURN_NEPTUNE,
@@ -120,7 +129,11 @@ class Node(BaseModel, ABC):
                 records, _, _ = await driver.execute_query(
                     """
                     MATCH (n {uuid: $uuid})
-                    WHERE n:Entity OR n:Episodic OR n:Community
+                    SET n._opr_conditional_delete_lock = true
+                    REMOVE n._opr_conditional_delete_lock
+                    WITH n
+                    WHERE (n:Entity OR n:Episodic OR n:Community)
+                      AND coalesce(n.opr_deleted, false) = false
                     OPTIONAL MATCH (n)-[r]-()
                     WITH collect(r.uuid) AS edge_uuids, n
                     DETACH DELETE n
@@ -159,6 +172,10 @@ class Node(BaseModel, ABC):
                     await driver.execute_query(
                         f"""
                         MATCH (n:{label} {{uuid: $uuid}})
+                        SET n._opr_conditional_delete_lock = true
+                        REMOVE n._opr_conditional_delete_lock
+                        WITH n
+                        WHERE coalesce(n.opr_deleted, false) = false
                         DETACH DELETE n
                         """,
                         uuid=self.uuid,
@@ -190,7 +207,12 @@ class Node(BaseModel, ABC):
                     await session.run(
                         """
                         MATCH (n:Entity|Episodic|Community {group_id: $group_id})
+                        WITH n ORDER BY n.uuid
                         CALL (n) {
+                            SET n._opr_conditional_delete_lock = true
+                            REMOVE n._opr_conditional_delete_lock
+                            WITH n
+                            WHERE coalesce(n.opr_deleted, false) = false
                             DETACH DELETE n
                         } IN TRANSACTIONS OF $batch_size ROWS
                         """,
@@ -228,6 +250,11 @@ class Node(BaseModel, ABC):
                     await driver.execute_query(
                         f"""
                         MATCH (n:{label} {{group_id: $group_id}})
+                        WITH n ORDER BY n.uuid
+                        SET n._opr_conditional_delete_lock = true
+                        REMOVE n._opr_conditional_delete_lock
+                        WITH n
+                        WHERE coalesce(n.opr_deleted, false) = false
                         DETACH DELETE n
                         """,
                         group_id=group_id,
@@ -250,6 +277,11 @@ class Node(BaseModel, ABC):
                         f"""
                         MATCH (n:{label})
                         WHERE n.uuid IN $uuids
+                        WITH n ORDER BY n.uuid
+                        SET n._opr_conditional_delete_lock = true
+                        REMOVE n._opr_conditional_delete_lock
+                        WITH n
+                        WHERE coalesce(n.opr_deleted, false) = false
                         DETACH DELETE n
                         """,
                         uuids=uuids,
@@ -300,7 +332,12 @@ class Node(BaseModel, ABC):
                         """
                         MATCH (n:Entity|Episodic|Community)
                         WHERE n.uuid IN $uuids
+                        WITH n ORDER BY n.uuid
                         CALL (n) {
+                            SET n._opr_conditional_delete_lock = true
+                            REMOVE n._opr_conditional_delete_lock
+                            WITH n
+                            WHERE coalesce(n.opr_deleted, false) = false
                             DETACH DELETE n
                         } IN TRANSACTIONS OF $batch_size ROWS
                         """,
@@ -353,6 +390,8 @@ class EpisodicNode(Node):
         result = await driver.execute_query(
             get_episode_node_save_query(driver.provider), **episode_args
         )
+        if await query_result_record_count(result) != 1:
+            raise EpisodeTombstonedError()
 
         if driver.provider == GraphProvider.NEPTUNE:
             driver.save_to_aoss(  # pyright: ignore reportAttributeAccessIssue
@@ -364,6 +403,7 @@ class EpisodicNode(Node):
                         'source': self.source.value,
                         'source_description': self.source_description,
                         'group_id': self.group_id,
+                        '_version': EPISODE_AOSS_WRITE_VERSION,
                     }
                 ],
             )
@@ -382,9 +422,20 @@ class EpisodicNode(Node):
             except NotImplementedError:
                 pass
 
+        tombstone_guard = (
+            ''
+            if driver.provider == GraphProvider.KUZU
+            else (
+                'WHERE coalesce(e.opr_deleted, false) = false '
+                'AND coalesce(e.opr_episode_reservation, false) = false'
+            )
+        )
         records, _, _ = await driver.execute_query(
             """
             MATCH (e:Episodic {uuid: $uuid})
+            """
+            + tombstone_guard
+            + """
             RETURN
             """
             + (
@@ -413,10 +464,21 @@ class EpisodicNode(Node):
             except NotImplementedError:
                 pass
 
+        tombstone_guard = (
+            ''
+            if driver.provider == GraphProvider.KUZU
+            else (
+                'AND coalesce(e.opr_deleted, false) = false '
+                'AND coalesce(e.opr_episode_reservation, false) = false'
+            )
+        )
         records, _, _ = await driver.execute_query(
             """
             MATCH (e:Episodic)
             WHERE e.uuid IN $uuids
+            """
+            + tombstone_guard
+            + """
             RETURN DISTINCT
             """
             + (
@@ -450,12 +512,21 @@ class EpisodicNode(Node):
 
         cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
         limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+        tombstone_guard: LiteralString = (
+            ''
+            if driver.provider == GraphProvider.KUZU
+            else (
+                'AND coalesce(e.opr_deleted, false) = false '
+                'AND coalesce(e.opr_episode_reservation, false) = false'
+            )
+        )
 
         records, _, _ = await driver.execute_query(
             """
             MATCH (e:Episodic)
             WHERE e.group_id IN $group_ids
             """
+            + tombstone_guard
             + cursor_query
             + """
             RETURN DISTINCT
@@ -491,9 +562,20 @@ class EpisodicNode(Node):
             except NotImplementedError:
                 pass
 
+        tombstone_guard = (
+            ''
+            if driver.provider == GraphProvider.KUZU
+            else (
+                'WHERE coalesce(e.opr_deleted, false) = false '
+                'AND coalesce(e.opr_episode_reservation, false) = false'
+            )
+        )
         records, _, _ = await driver.execute_query(
             """
             MATCH (e:Episodic)-[r:MENTIONS]->(n:Entity {uuid: $entity_node_uuid})
+            """
+            + tombstone_guard
+            + """
             RETURN DISTINCT
             """
             + (
@@ -590,6 +672,9 @@ class EntityNode(Node):
                 get_entity_node_save_query(driver.provider, labels),
                 entity_data=entity_data,
             )
+
+        if await query_result_record_count(result) != 1:
+            raise NodeGroupMismatchError()
 
         if driver.provider == GraphProvider.NEPTUNE:
             driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]

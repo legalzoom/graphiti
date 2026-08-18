@@ -375,7 +375,12 @@ class NeptuneDriver(GraphDriver):
         return self.client.client.close()
 
     async def _delete_all_data(self) -> Any:
-        return await self.execute_query('MATCH (n) DETACH DELETE n')
+        return await self.execute_query(
+            'MATCH (n) WITH n ORDER BY n.uuid '
+            'SET n._opr_conditional_delete_lock = true '
+            'REMOVE n._opr_conditional_delete_lock '
+            'WITH n WHERE coalesce(n.opr_deleted, false) = false DETACH DELETE n'
+        )
 
     def delete_all_indexes(self) -> Coroutine[Any, Any, Any]:
         return self.delete_all_indexes_impl()
@@ -421,6 +426,9 @@ class NeptuneDriver(GraphDriver):
                 to_index = []
                 for d in data:
                     item = {'_index': name, '_id': d['uuid']}
+                    if '_version' in d:
+                        item['_version'] = d['_version']
+                        item['_version_type'] = 'external_gte'
                     for p in index['body']['mappings']['properties']:
                         if p in d:
                             item[p] = d[p]

@@ -16,6 +16,7 @@ from graphiti_core.driver.neptune.operations.episodic_edge_ops import (
     NeptuneEpisodicEdgeOperations,
 )
 from graphiti_core.edges import EntityEdge, EpisodicEdge
+from graphiti_core.errors import EpisodeTombstonedError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -178,16 +179,43 @@ class TestEntityEdgeBatching:
 
 class TestEpisodeNodeBatching:
     @pytest.mark.asyncio
-    async def test_save_bulk_chunks_by_batch_size(self):
-        executor = FakeExecutor()
+    async def test_save_bulk_uses_one_bounded_atomic_request_for_tombstone_preflight(self):
+        ops = NeptuneEpisodeNodeOperations()
+        nodes = [make_episodic_node(f'ep{i}') for i in range(5)]
+        executor = FakeExecutor([([{'uuid': node.uuid} for node in nodes], None, None)])
+
+        await ops.save_bulk(executor, nodes, batch_size=5)
+
+        assert len(executor.calls) == 1
+        query, kwargs = executor.calls[0]
+        assert len(kwargs['episodes']) == 5
+        assert 'MERGE (existing:Episodic {uuid: episode.uuid})' in query
+        assert query.index('SET existing._opr_conditional_delete_lock') < query.index(
+            'coalesce(candidate.existing.opr_deleted, false) = false'
+        )
+
+    @pytest.mark.asyncio
+    async def test_save_bulk_rejects_tombstone_without_chunked_partial_commit(self):
+        executor = FakeExecutor([([], None, None)])
         ops = NeptuneEpisodeNodeOperations()
         nodes = [make_episodic_node(f'ep{i}') for i in range(5)]
 
-        await ops.save_bulk(executor, nodes, batch_size=2)
+        with pytest.raises(EpisodeTombstonedError):
+            await ops.save_bulk(executor, nodes, batch_size=5)
 
-        assert len(executor.calls) == 3
-        for _, kwargs in executor.calls:
-            assert len(kwargs['episodes']) <= 2
+        assert len(executor.calls) == 1
+        assert len(executor.calls[0][1]['episodes']) == 5
+
+    @pytest.mark.asyncio
+    async def test_save_bulk_rejects_oversized_atomic_request_before_query(self):
+        executor = FakeExecutor()
+        ops = NeptuneEpisodeNodeOperations()
+        nodes = [make_episodic_node(f'ep{i}') for i in range(3)]
+
+        with pytest.raises(ValueError, match='cannot exceed batch_size'):
+            await ops.save_bulk(executor, nodes, batch_size=2)
+
+        assert executor.calls == []
 
     @pytest.mark.asyncio
     async def test_save_bulk_noop_on_empty_list(self):
