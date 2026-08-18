@@ -18,7 +18,10 @@ import logging
 from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
-from graphiti_core.driver.neo4j.schema import ensure_episode_uuid_uniqueness
+from graphiti_core.driver.neo4j.schema import (
+    delete_standalone_indexes,
+    ensure_episode_uuid_uniqueness,
+)
 from graphiti_core.driver.operations.graph_ops import GraphMaintenanceOperations
 from graphiti_core.driver.operations.graph_utils import Neighbor, label_propagation
 from graphiti_core.driver.query_executor import QueryExecutor
@@ -83,7 +86,7 @@ class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
         self,
         executor: QueryExecutor,
     ) -> None:
-        await executor.execute_query('CALL db.indexes() YIELD name DROP INDEX name')
+        await delete_standalone_indexes(executor)
 
     async def get_community_clusters(
         self,

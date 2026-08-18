@@ -1,12 +1,40 @@
 """Sequential Neo4j schema upgrades required by episode retirement."""
 
 import asyncio
+from typing import Any, cast
 
 from neo4j.exceptions import ClientError
+from typing_extensions import LiteralString
 
 from graphiti_core.driver.query_executor import QueryExecutor
 from graphiti_core.errors import GraphitiError
 from graphiti_core.helpers import query_result_record_count
+
+
+def _query_records(result: Any) -> list[Any]:
+    if isinstance(result, tuple):
+        return list(result[0])
+    records = getattr(result, 'records', None)
+    if records is not None:
+        return list(records)
+    raise TypeError(f'unsupported Neo4j query result: {type(result).__name__}')
+
+
+async def delete_standalone_indexes(executor: QueryExecutor) -> None:
+    """Drop rebuildable indexes without touching constraint-owned indexes."""
+    result = await executor.execute_query(
+        """
+        SHOW INDEXES YIELD name, owningConstraint
+        WHERE owningConstraint IS NULL
+        RETURN name
+        """
+    )
+    for record in _query_records(result):
+        name = record['name']
+        if not isinstance(name, str):
+            raise TypeError('Neo4j index name must be a string')
+        escaped_name = name.replace('`', '``')
+        await executor.execute_query(cast(LiteralString, f'DROP INDEX `{escaped_name}` IF EXISTS'))
 
 
 async def ensure_episode_uuid_uniqueness(executor: QueryExecutor) -> None:

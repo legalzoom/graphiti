@@ -6,7 +6,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from graphiti_core.driver.kuzu_driver import KuzuDriver
-from graphiti_core.driver.neo4j.schema import ensure_episode_uuid_uniqueness
+from graphiti_core.driver.neo4j.schema import (
+    delete_standalone_indexes,
+    ensure_episode_uuid_uniqueness,
+)
 from graphiti_core.driver.query_executor import QueryExecutor
 from graphiti_core.errors import GraphitiError
 from graphiti_core.nodes import EpisodeType, EpisodicNode
@@ -69,3 +72,27 @@ async def test_neo4j_episode_uuid_constraint_rejects_existing_duplicates():
         await ensure_episode_uuid_uniqueness(executor)
 
     execute_query.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_neo4j_index_rebuild_preserves_constraint_owned_indexes():
+    execute_query = AsyncMock(
+        side_effect=[
+            ([{'name': 'episode_group_id'}, {'name': 'episode_content'}], None, None),
+            ([], None, None),
+            ([], None, None),
+        ]
+    )
+    executor = cast(
+        QueryExecutor,
+        SimpleNamespace(execute_query=execute_query),
+    )
+
+    await delete_standalone_indexes(executor)
+
+    queries = [call.args[0] for call in execute_query.await_args_list]
+    assert 'owningConstraint IS NULL' in queries[0]
+    assert queries[1:] == [
+        'DROP INDEX `episode_group_id` IF EXISTS',
+        'DROP INDEX `episode_content` IF EXISTS',
+    ]
