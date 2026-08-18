@@ -18,6 +18,7 @@ import logging
 from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.neo4j.schema import ensure_episode_uuid_uniqueness
 from graphiti_core.driver.operations.graph_ops import GraphMaintenanceOperations
 from graphiti_core.driver.operations.graph_utils import Neighbor, label_propagation
 from graphiti_core.driver.query_executor import QueryExecutor
@@ -69,6 +70,8 @@ class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
     ) -> None:
         if delete_existing:
             await self.delete_all_indexes(executor)
+
+        await ensure_episode_uuid_uniqueness(executor)
 
         range_indices = get_range_indices(GraphProvider.NEO4J)
         fulltext_indices = get_fulltext_indices(GraphProvider.NEO4J)

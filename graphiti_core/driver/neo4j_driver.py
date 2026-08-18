@@ -40,6 +40,7 @@ from graphiti_core.driver.neo4j.operations.next_episode_edge_ops import (
 )
 from graphiti_core.driver.neo4j.operations.saga_node_ops import Neo4jSagaNodeOperations
 from graphiti_core.driver.neo4j.operations.search_ops import Neo4jSearchOperations
+from graphiti_core.driver.neo4j.schema import ensure_episode_uuid_uniqueness
 from graphiti_core.driver.operations.community_edge_ops import CommunityEdgeOperations
 from graphiti_core.driver.operations.community_node_ops import CommunityNodeOperations
 from graphiti_core.driver.operations.entity_edge_ops import EntityEdgeOperations
@@ -211,6 +212,10 @@ class Neo4jDriver(GraphDriver):
     async def build_indices_and_constraints(self, delete_existing: bool = False):
         if delete_existing:
             await self.delete_all_indexes()
+
+        # This sequentially replaces the historical UUID range index. Neo4j
+        # rejects a uniqueness constraint while that same-schema index exists.
+        await ensure_episode_uuid_uniqueness(self)
 
         range_indices: list[LiteralString] = get_range_indices(self.provider)
 

@@ -28,6 +28,7 @@ def _neo4j_driver() -> Neo4jDriver:
 @pytest.mark.asyncio
 async def test_conditional_delete_rechecks_group_after_waiting_for_writer():
     driver = _neo4j_driver()
+    await driver.build_indices_and_constraints()
     service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
     episode_uuid = str(uuid4())
     await driver.execute_query(
@@ -49,7 +50,8 @@ async def test_conditional_delete_rechecks_group_after_waiting_for_writer():
             )
 
             delete_task = asyncio.create_task(
-                service.delete_episodic_node_if_matches(
+                ZepGraphiti.delete_episodic_node_if_matches(
+                    service,
                     episode_uuid,
                     group_id='opr',
                     name='curated:test.md',
@@ -75,6 +77,7 @@ async def test_conditional_delete_rechecks_group_after_waiting_for_writer():
 @pytest.mark.asyncio
 async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
     driver = _neo4j_driver()
+    await driver.build_indices_and_constraints()
     service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
     episode_uuid = str(uuid4())
     await driver.execute_query(
@@ -88,7 +91,8 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
     )
 
     try:
-        assert await service.delete_episodic_node_if_matches(
+        assert await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
             episode_uuid,
             group_id='opr',
             name='curated:test.md',
@@ -132,6 +136,7 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
 @pytest.mark.asyncio
 async def test_bulk_save_cannot_overwrite_concurrently_created_tombstone():
     driver = _neo4j_driver()
+    await driver.build_indices_and_constraints()
     episode_uuid = str(uuid4())
     fresh_uuid = str(uuid4())
     episode = EpisodicNode(
@@ -206,6 +211,7 @@ async def test_bulk_save_cannot_overwrite_concurrently_created_tombstone():
 @pytest.mark.asyncio
 async def test_legacy_delete_rechecks_tombstone_after_waiting_for_retirement():
     driver = _neo4j_driver()
+    await driver.build_indices_and_constraints()
     episode_uuid = str(uuid4())
     episode = EpisodicNode(
         uuid=episode_uuid,
@@ -284,14 +290,16 @@ async def test_falkor_conditional_delete_routes_group_and_preserves_tombstone():
     await episode.save(group_driver)
 
     try:
-        assert not await service.delete_episodic_node_if_matches(
+        assert not await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
             episode_uuid,
             group_id=group_id,
             name=episode.name,
             content='changed content',
             source_description=episode.source_description,
         )
-        assert await service.delete_episodic_node_if_matches(
+        assert await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
             episode_uuid,
             group_id=group_id,
             name=episode.name,
