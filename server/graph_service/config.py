@@ -28,7 +28,11 @@ class Settings(BaseSettings):
     opr_reconciliation_token: SecretStr = SecretStr('')
     opr_retirement_token: SecretStr = SecretStr('')
 
-    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+    model_config = SettingsConfigDict(
+        env_file='.env',
+        extra='ignore',
+        hide_input_in_errors=True,
+    )
 
     @model_validator(mode='after')
     def require_distinct_opr_privileged_tokens(self):

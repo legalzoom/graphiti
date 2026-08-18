@@ -33,14 +33,16 @@ EPISODE_UUID = '11111111-1111-4111-8111-111111111111'
 
 
 def test_privileged_listing_and_retirement_tokens_must_be_distinct():
-    with pytest.raises(ValueError, match='tokens must be distinct'):
+    sentinel = 'super-secret-identical-token-abc123'
+    with pytest.raises(ValueError, match='tokens must be distinct') as exc_info:
         Settings.model_validate(
             {
                 'openai_api_key': 'test',
-                'opr_reconciliation_token': 'same-secret',
-                'opr_retirement_token': 'same-secret',
+                'opr_reconciliation_token': sentinel,
+                'opr_retirement_token': sentinel,
             }
         )
+    assert sentinel not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
