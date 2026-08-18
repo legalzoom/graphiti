@@ -191,14 +191,12 @@ async def test_search_requires_opr_bearer_for_explicit_or_unrestricted_group_acc
 
 
 @pytest.mark.asyncio
-async def test_ordinary_opr_listing_uses_read_bearer_while_privileged_listing_uses_own_token():
+async def test_ordinary_opr_listing_uses_read_bearer():
     ordinary = AsyncMock(return_value=[])
-    privileged = AsyncMock(return_value=[])
     graphiti = cast(
         ZepGraphiti,
         SimpleNamespace(
             retrieve_episodes=ordinary,
-            retrieve_episodes_for_reconciliation=privileged,
         ),
     )
     settings = _settings()
@@ -225,16 +223,6 @@ async def test_ordinary_opr_listing_uses_read_bearer_while_privileged_listing_us
         authorization=_bearer('opr-read-secret'),
     )
     ordinary.assert_awaited_once()
-
-    await get_episodes(
-        'opr',
-        10,
-        graphiti,
-        settings,
-        include_retired_for_reconciliation=True,
-        x_opr_reconciliation_token='reconcile-secret',
-    )
-    privileged.assert_awaited_once_with('opr', 10)
 
 
 @pytest.mark.asyncio

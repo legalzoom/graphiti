@@ -96,13 +96,8 @@ async def get_episodes(
     last_n: int,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
-    include_retired_for_reconciliation: bool = False,
-    x_opr_reconciliation_token: Annotated[str | None, Header()] = None,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    if include_retired_for_reconciliation:
-        _authorize_reconciliation_listing(settings, x_opr_reconciliation_token, group_id)
-        return await graphiti.retrieve_episodes_for_reconciliation(group_id, last_n)
     _authorize_opr_read(settings, authorization, group_id)
     episodes = await graphiti.retrieve_episodes(
         group_ids=[group_id], last_n=last_n, reference_time=datetime.now(timezone.utc)

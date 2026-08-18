@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 from types import SimpleNamespace
 from typing import cast
@@ -53,45 +54,8 @@ def test_privileged_listing_and_retirement_tokens_must_be_distinct():
     assert sentinel not in str(exc_info.value)
 
 
-@pytest.mark.asyncio
-async def test_retired_reconciliation_listing_requires_distinct_service_token():
-    reconciliation_listing = AsyncMock(return_value=[])
-    graphiti = cast(
-        ZepGraphiti,
-        SimpleNamespace(
-            retrieve_episodes_for_reconciliation=reconciliation_listing,
-            retrieve_episodes=AsyncMock(return_value=[]),
-        ),
-    )
-    settings = cast(
-        Settings,
-        SimpleNamespace(opr_reconciliation_token=SecretStr('reconcile-secret')),
-    )
-
-    with pytest.raises(HTTPException) as exc_info:
-        await get_episodes(
-            'opr',
-            20,
-            graphiti,
-            settings,
-            include_retired_for_reconciliation=True,
-            x_opr_reconciliation_token='wrong',
-        )
-    assert exc_info.value.status_code == 403
-    reconciliation_listing.assert_not_awaited()
-
-    assert (
-        await get_episodes(
-            'opr',
-            20,
-            graphiti,
-            settings,
-            include_retired_for_reconciliation=True,
-            x_opr_reconciliation_token='reconcile-secret',
-        )
-        == []
-    )
-    reconciliation_listing.assert_awaited_once_with('opr', 20)
+def test_legacy_episode_listing_cannot_request_privileged_reconciliation_data():
+    assert 'include_retired_for_reconciliation' not in inspect.signature(get_episodes).parameters
 
 
 @pytest.mark.asyncio
