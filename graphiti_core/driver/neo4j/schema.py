@@ -56,55 +56,72 @@ async def ensure_episode_uuid_uniqueness(executor: QueryExecutor) -> None:
 
 
 async def _ensure_episode_uuid_uniqueness(executor: QueryExecutor) -> None:
-    duplicates = await executor.execute_query(
-        """
-        MATCH (episode:Episodic)
-        WHERE episode.uuid IS NOT NULL
-        WITH episode.uuid AS uuid, count(*) AS occurrences
-        WHERE occurrences > 1
-        RETURN uuid
-        LIMIT 1
-        """
-    )
-    if await query_result_record_count(duplicates):
-        raise GraphitiError('cannot enforce episode UUID uniqueness while duplicate UUIDs exist')
-
-    await executor.execute_query('DROP INDEX episode_uuid IF EXISTS')
-    try:
-        await executor.execute_query(
-            'CREATE CONSTRAINT episode_uuid_unique IF NOT EXISTS '
-            'FOR (episode:Episodic) REQUIRE episode.uuid IS UNIQUE'
-        )
-    except ClientError as exc:
-        # Separate service replicas can race this one-time upgrade. Neo4j may
-        # surface the equivalent-rule race despite IF NOT EXISTS; the catalog
-        # verification below is still authoritative.
-        if 'EquivalentSchemaRuleAlreadyExists' not in str(exc):
-            raise
-    constraint = await executor.execute_query(
+    constraints = await executor.execute_query(
         """
         SHOW CONSTRAINTS YIELD name
-        WHERE name = 'episode_uuid_unique'
+        WHERE name IN ['episode_uuid_unique', 'opr_retirement_request_id_unique']
         RETURN name
         """
     )
-    if await query_result_record_count(constraint) != 1:
-        raise GraphitiError('episode UUID uniqueness constraint is unavailable')
+    existing_constraints = {record['name'] for record in _query_records(constraints)}
+    episode_constraint_exists = 'episode_uuid_unique' in existing_constraints
+    receipt_constraint_exists = 'opr_retirement_request_id_unique' in existing_constraints
+    if episode_constraint_exists and receipt_constraint_exists:
+        return
 
-    try:
-        await executor.execute_query(
-            'CREATE CONSTRAINT opr_retirement_request_id_unique IF NOT EXISTS '
-            'FOR (receipt:OPRRetirementReceipt) REQUIRE receipt.request_id IS UNIQUE'
+    if not episode_constraint_exists:
+        duplicates = await executor.execute_query(
+            """
+            MATCH (episode:Episodic)
+            WHERE episode.uuid IS NOT NULL
+            WITH episode.uuid AS uuid, count(*) AS occurrences
+            WHERE occurrences > 1
+            RETURN uuid
+            LIMIT 1
+            """
         )
-    except ClientError as exc:
-        if 'EquivalentSchemaRuleAlreadyExists' not in str(exc):
-            raise
-    receipt_constraint = await executor.execute_query(
-        """
-        SHOW CONSTRAINTS YIELD name
-        WHERE name = 'opr_retirement_request_id_unique'
-        RETURN name
-        """
-    )
-    if await query_result_record_count(receipt_constraint) != 1:
-        raise GraphitiError('retirement request ID uniqueness constraint is unavailable')
+        if await query_result_record_count(duplicates):
+            raise GraphitiError(
+                'cannot enforce episode UUID uniqueness while duplicate UUIDs exist'
+            )
+
+        await executor.execute_query('DROP INDEX episode_uuid IF EXISTS')
+        try:
+            await executor.execute_query(
+                'CREATE CONSTRAINT episode_uuid_unique IF NOT EXISTS '
+                'FOR (episode:Episodic) REQUIRE episode.uuid IS UNIQUE'
+            )
+        except ClientError as exc:
+            # Separate service replicas can race this one-time upgrade. Neo4j may
+            # surface the equivalent-rule race despite IF NOT EXISTS; the catalog
+            # verification below is still authoritative.
+            if 'EquivalentSchemaRuleAlreadyExists' not in str(exc):
+                raise
+        constraint = await executor.execute_query(
+            """
+            SHOW CONSTRAINTS YIELD name
+            WHERE name = 'episode_uuid_unique'
+            RETURN name
+            """
+        )
+        if await query_result_record_count(constraint) != 1:
+            raise GraphitiError('episode UUID uniqueness constraint is unavailable')
+
+    if not receipt_constraint_exists:
+        try:
+            await executor.execute_query(
+                'CREATE CONSTRAINT opr_retirement_request_id_unique IF NOT EXISTS '
+                'FOR (receipt:OPRRetirementReceipt) REQUIRE receipt.request_id IS UNIQUE'
+            )
+        except ClientError as exc:
+            if 'EquivalentSchemaRuleAlreadyExists' not in str(exc):
+                raise
+        receipt_constraint = await executor.execute_query(
+            """
+            SHOW CONSTRAINTS YIELD name
+            WHERE name = 'opr_retirement_request_id_unique'
+            RETURN name
+            """
+        )
+        if await query_result_record_count(receipt_constraint) != 1:
+            raise GraphitiError('retirement request ID uniqueness constraint is unavailable')

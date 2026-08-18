@@ -25,10 +25,22 @@ logger = logging.getLogger(__name__)
 
 
 def _conditional_episode_identity_digest(
-    uuid: str, group_id: str, name: str, content: str, source_description: str
+    uuid: str,
+    group_id: str,
+    name: str,
+    content: str,
+    source: str,
+    source_description: str,
 ) -> str:
     canonical = json.dumps(
-        [uuid, group_id, name, hashlib.sha256(content.encode()).hexdigest(), source_description],
+        [
+            uuid,
+            group_id,
+            name,
+            hashlib.sha256(content.encode()).hexdigest(),
+            source,
+            source_description,
+        ],
         ensure_ascii=False,
         separators=(',', ':'),
     )
@@ -143,6 +155,7 @@ class ZepGraphiti(Graphiti):
         group_id: str,
         name: str,
         content: str,
+        source: str,
         source_description: str,
         retirement_request_id: str,
     ) -> bool | None:
@@ -178,7 +191,7 @@ class ZepGraphiti(Graphiti):
                 ),
             )
         identity_digest = _conditional_episode_identity_digest(
-            canonical_uuid, group_id, name, content, source_description
+            canonical_uuid, group_id, name, content, source, source_description
         )
         query_driver = self.driver
         if self.driver.provider == GraphProvider.NEPTUNE:
@@ -237,6 +250,7 @@ class ZepGraphiti(Graphiti):
                     AND episode.group_id = $group_id
                     AND episode.name = $name
                     AND episode.content = $content
+                    AND episode.source = $source
                     AND episode.source_description = $source_description
                 ) OR (
                     receipt.outcome = 'retired'
@@ -267,6 +281,7 @@ class ZepGraphiti(Graphiti):
                 group_id=group_id,
                 name=name,
                 content=content,
+                source=source,
                 source_description=source_description,
                 identity_digest=identity_digest,
             )
@@ -337,6 +352,7 @@ class ZepGraphiti(Graphiti):
                         AND episode.group_id = $group_id
                         AND episode.name = $name
                         AND episode.content = $content
+                        AND episode.source = $source
                         AND episode.source_description = $source_description
                     ) OR (
                         receipt.outcome = 'retired'
@@ -378,6 +394,7 @@ class ZepGraphiti(Graphiti):
                 group_id=group_id,
                 name=name,
                 content=content,
+                source=source,
                 source_description=source_description,
                 identity_digest=identity_digest,
                 retirement_request_id=canonical_request_id,

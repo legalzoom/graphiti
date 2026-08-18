@@ -1,5 +1,6 @@
 from uuid import UUID
 
+from graphiti_core.nodes import EpisodeType
 from pydantic import BaseModel, Field
 
 from graph_service.dto.common import Message
@@ -23,9 +24,9 @@ class DeleteEpisodeIfMatchRequest(BaseModel):
     group_id: str = Field(..., min_length=1, description='The owning graph group')
     name: str = Field(..., description='The exact stored episode name')
     content: str = Field(..., description='The exact stored episode content')
+    source: EpisodeType = Field(..., description='The exact stored episode source type')
     source_description: str = Field(
         ...,
-        min_length=1,
         description='The exact stored producer provenance',
     )
     retirement_request_id: UUID = Field(

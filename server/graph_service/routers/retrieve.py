@@ -15,11 +15,26 @@ from graph_service.dto import (
 from graph_service.protocol import (
     GRAPHITI_RECONCILIATION_GROUP_ID,
     GRAPHITI_RECONCILIATION_PROTOCOL,
+    bearer_token_matches,
     reconciliation_token_matches,
 )
 from graph_service.zep_graphiti import ZepGraphitiDep, get_fact_result_from_edge
 
 router = APIRouter()
+
+
+def _authorize_opr_read(
+    settings: ZepEnvDep,
+    authorization: str | None,
+    group_id: str,
+) -> None:
+    if group_id == GRAPHITI_RECONCILIATION_GROUP_ID and not bearer_token_matches(
+        settings.opr_read_token.get_secret_value(), authorization
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='OPR graph read is not authorized',
+        )
 
 
 def _authorize_reconciliation_listing(
@@ -38,7 +53,20 @@ def _authorize_reconciliation_listing(
 
 
 @router.post('/search', status_code=status.HTTP_200_OK)
-async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
+async def search(
+    query: SearchQuery,
+    graphiti: ZepGraphitiDep,
+    settings: ZepEnvDep,
+    authorization: Annotated[str | None, Header()] = None,
+):
+    # An omitted group list means an unrestricted search, which can include
+    # OPR-owned data and therefore requires the OPR credential too.
+    if (
+        not query.group_ids
+        or query.group_ids == ['']
+        or GRAPHITI_RECONCILIATION_GROUP_ID in query.group_ids
+    ):
+        _authorize_opr_read(settings, authorization, GRAPHITI_RECONCILIATION_GROUP_ID)
     relevant_edges = await graphiti.search(
         group_ids=query.group_ids,
         query=query.query,
@@ -51,8 +79,14 @@ async def search(query: SearchQuery, graphiti: ZepGraphitiDep):
 
 
 @router.get('/entity-edge/{uuid}', status_code=status.HTTP_200_OK)
-async def get_entity_edge(uuid: str, graphiti: ZepGraphitiDep):
+async def get_entity_edge(
+    uuid: str,
+    graphiti: ZepGraphitiDep,
+    settings: ZepEnvDep,
+    authorization: Annotated[str | None, Header()] = None,
+):
     entity_edge = await graphiti.get_entity_edge(uuid)
+    _authorize_opr_read(settings, authorization, entity_edge.group_id)
     return get_fact_result_from_edge(entity_edge)
 
 
@@ -64,17 +98,19 @@ async def get_episodes(
     settings: ZepEnvDep,
     include_retired_for_reconciliation: bool = False,
     x_opr_reconciliation_token: Annotated[str | None, Header()] = None,
+    authorization: Annotated[str | None, Header()] = None,
 ):
     if include_retired_for_reconciliation:
         _authorize_reconciliation_listing(settings, x_opr_reconciliation_token, group_id)
         return await graphiti.retrieve_episodes_for_reconciliation(group_id, last_n)
+    _authorize_opr_read(settings, authorization, group_id)
     episodes = await graphiti.retrieve_episodes(
         group_ids=[group_id], last_n=last_n, reference_time=datetime.now(timezone.utc)
     )
     return episodes
 
 
-@router.get('/episodes/{group_id}/reconciliation/v3', status_code=status.HTTP_200_OK)
+@router.get('/episodes/{group_id}/reconciliation/v4', status_code=status.HTTP_200_OK)
 async def get_episodes_for_reconciliation(
     group_id: str,
     last_n: int,
@@ -102,7 +138,10 @@ async def get_episodes_for_reconciliation(
 async def get_memory(
     request: GetMemoryRequest,
     graphiti: ZepGraphitiDep,
+    settings: ZepEnvDep,
+    authorization: Annotated[str | None, Header()] = None,
 ):
+    _authorize_opr_read(settings, authorization, request.group_id)
     combined_query = compose_query_from_messages(request.messages)
     result = await graphiti.search(
         group_ids=[request.group_id],

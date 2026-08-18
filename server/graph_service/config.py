@@ -25,8 +25,12 @@ class Settings(BaseSettings):
     kuzu_db: str | None = Field(None)
     kuzu_max_concurrent_queries: int | None = Field(None)
     db_backend: str = Field('neo4j')
+    opr_read_token: SecretStr = SecretStr('')
+    opr_write_token: SecretStr = SecretStr('')
     opr_reconciliation_token: SecretStr = SecretStr('')
     opr_retirement_token: SecretStr = SecretStr('')
+    graphiti_admin_token: SecretStr = SecretStr('')
+    graphiti_admin_clear_enabled: bool = False
 
     model_config = SettingsConfigDict(
         env_file='.env',
@@ -35,15 +39,21 @@ class Settings(BaseSettings):
     )
 
     @model_validator(mode='after')
-    def require_distinct_opr_privileged_tokens(self):
-        listing_token = self.opr_reconciliation_token.get_secret_value()
-        retirement_token = self.opr_retirement_token.get_secret_value()
-        if (
-            listing_token
-            and retirement_token
-            and hmac.compare_digest(listing_token, retirement_token)
-        ):
-            raise ValueError('OPR reconciliation and retirement tokens must be distinct')
+    def require_distinct_privileged_tokens(self):
+        tokens = {
+            'OPR_READ_TOKEN': self.opr_read_token.get_secret_value(),
+            'OPR_WRITE_TOKEN': self.opr_write_token.get_secret_value(),
+            'OPR_RECONCILIATION_TOKEN': self.opr_reconciliation_token.get_secret_value(),
+            'OPR_RETIREMENT_TOKEN': self.opr_retirement_token.get_secret_value(),
+            'GRAPHITI_ADMIN_TOKEN': self.graphiti_admin_token.get_secret_value(),
+        }
+        configured = [(name, value) for name, value in tokens.items() if value]
+        for index, (left_name, left_value) in enumerate(configured):
+            for right_name, right_value in configured[index + 1 :]:
+                if hmac.compare_digest(left_value, right_value):
+                    raise ValueError(
+                        f'privileged tokens must be distinct: {left_name} and {right_name}'
+                    )
         return self
 
 

@@ -18,7 +18,7 @@ from graphiti_core.models.nodes.node_db_queries import (
     get_episode_node_save_bulk_query,
     get_episode_node_save_query,
 )
-from graphiti_core.nodes import EpisodicNode
+from graphiti_core.nodes import EpisodeType, EpisodicNode
 from pydantic import SecretStr
 from starlette.responses import JSONResponse
 
@@ -277,6 +277,7 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
         group_id='opr',
         name='curated:test.md',
         content='stored content',
+        source=EpisodeType.message.value,
         source_description='publish',
         retirement_request_id=RETIREMENT_REQUEST_ID,
     )
@@ -296,6 +297,7 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
     assert 'episode.group_id = $group_id' in query
     assert 'episode.name = $name' in query
     assert 'episode.content = $content' in query
+    assert 'episode.source = $source' in query
     assert 'episode.source_description = $source_description' in query
     assert 'coalesce(episode.opr_deleted, false) AS was_deleted' in query
     assert 'coalesce(episode.opr_deleted, false) = false' in query
@@ -309,12 +311,14 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
         'group_id': 'opr',
         'name': 'curated:test.md',
         'content': 'stored content',
+        'source': EpisodeType.message.value,
         'source_description': 'publish',
         'identity_digest': _conditional_episode_identity_digest(
             EPISODE_UUID,
             'opr',
             'curated:test.md',
             'stored content',
+            EpisodeType.message.value,
             'publish',
         ),
         'retirement_request_id': RETIREMENT_REQUEST_ID,
@@ -352,6 +356,7 @@ async def test_conditional_delete_returns_false_on_identity_mismatch():
         group_id='opr',
         name='curated:test.md',
         content='changed content',
+        source=EpisodeType.message.value,
         source_description='publish',
         retirement_request_id=RETIREMENT_REQUEST_ID,
     )
@@ -360,6 +365,40 @@ async def test_conditional_delete_returns_false_on_identity_mismatch():
     query = driver.execute_query.await_args.args[0]
     assert 'MERGE (receipt:OPRRetirementReceipt' in query
     assert "WHEN receipt.outcome = 'pending' THEN 'not_applied'" in query
+
+
+def test_conditional_delete_identity_digest_binds_source_type():
+    message_digest = _conditional_episode_identity_digest(
+        EPISODE_UUID,
+        'opr',
+        'curated:test.md',
+        'stored content',
+        EpisodeType.message.value,
+        'publish',
+    )
+    text_digest = _conditional_episode_identity_digest(
+        EPISODE_UUID,
+        'opr',
+        'curated:test.md',
+        'stored content',
+        EpisodeType.text.value,
+        'publish',
+    )
+
+    assert message_digest != text_digest
+
+
+def test_conditional_delete_request_allows_exact_empty_source_description():
+    request = DeleteEpisodeIfMatchRequest(
+        group_id='opr',
+        name='curated:test.md',
+        content='stored content',
+        source=EpisodeType.message,
+        source_description='',
+        retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
+    )
+
+    assert request.source_description == ''
 
 
 @pytest.mark.asyncio
@@ -377,6 +416,7 @@ async def test_conditional_delete_rejects_malformed_uuid_before_query():
             group_id='opr',
             name='curated:test.md',
             content='stored content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=RETIREMENT_REQUEST_ID,
         )
@@ -410,6 +450,7 @@ async def test_conditional_delete_requires_durable_neptune_search_tombstone():
             group_id='opr',
             name='curated:test.md',
             content='stored content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=RETIREMENT_REQUEST_ID,
         )
@@ -469,6 +510,7 @@ async def test_conditional_delete_retries_pending_neptune_search_fence_then_scru
         group_id='opr',
         name='curated:test.md',
         content='stored content',
+        source=EpisodeType.message.value,
         source_description='publish',
         retirement_request_id=RETIREMENT_REQUEST_ID,
     )
@@ -498,6 +540,7 @@ async def test_neptune_persists_not_applied_receipt_without_foreach():
             group_id='opr',
             name='curated:test.md',
             content='changed content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=RETIREMENT_REQUEST_ID,
         )
@@ -528,6 +571,7 @@ async def test_neptune_receipt_binding_conflict_is_not_not_applied():
             group_id='opr',
             name='curated:test.md',
             content='stored content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=RETIREMENT_REQUEST_ID,
         )
@@ -548,6 +592,7 @@ async def test_conditional_delete_rejects_kuzu_before_query():
             group_id='opr',
             name='curated:test.md',
             content='stored content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=RETIREMENT_REQUEST_ID,
         )
@@ -571,6 +616,7 @@ async def test_conditional_delete_rejects_falkor_without_receipt_uniqueness():
             group_id='opr',
             name='curated:test.md',
             content='stored content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=RETIREMENT_REQUEST_ID,
         )
@@ -587,6 +633,7 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
         group_id='opr',
         name='curated:test.md',
         content='stored content',
+        source=EpisodeType.message,
         source_description='publish',
         retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )
@@ -628,6 +675,7 @@ async def test_conditional_delete_route_rejects_receipt_binding_conflict():
         group_id='opr',
         name='curated:test.md',
         content='stored content',
+        source=EpisodeType.message,
         source_description='publish',
         retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )
@@ -657,6 +705,7 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
         group_id='opr',
         name='curated:test.md',
         content='stored content',
+        source=EpisodeType.message,
         source_description='publish',
         retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )
@@ -689,6 +738,7 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
         group_id='opr',
         name='curated:test.md',
         content='stored content',
+        source=EpisodeType.message.value,
         source_description='publish',
         retirement_request_id=RETIREMENT_REQUEST_ID,
     )
@@ -715,6 +765,7 @@ async def test_conditional_delete_requires_token_and_exact_operation_scope(
         group_id='opr',
         name='curated:test.md',
         content='stored content',
+        source=EpisodeType.message,
         source_description='publish',
         retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )
@@ -745,6 +796,7 @@ async def test_conditional_delete_is_bound_to_opr_group():
         group_id='other-group',
         name='curated:test.md',
         content='stored content',
+        source=EpisodeType.message,
         source_description='publish',
         retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )

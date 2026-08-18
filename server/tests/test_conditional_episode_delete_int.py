@@ -37,7 +37,7 @@ async def test_conditional_delete_rechecks_group_after_waiting_for_writer():
         """
         CREATE (:Episodic {
             uuid: $uuid, group_id: 'opr', name: 'curated:test.md',
-            content: 'stored content', source_description: 'publish'
+            content: 'stored content', source: 'message', source_description: 'publish'
         })
         """,
         uuid=episode_uuid,
@@ -58,6 +58,7 @@ async def test_conditional_delete_rechecks_group_after_waiting_for_writer():
                     group_id='opr',
                     name='curated:test.md',
                     content='stored content',
+                    source=EpisodeType.message.value,
                     source_description='publish',
                     retirement_request_id=retirement_request_id,
                 )
@@ -88,7 +89,7 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
         """
         CREATE (:Episodic {
             uuid: $uuid, group_id: 'opr', name: 'curated:test.md',
-            content: 'stored content', source_description: 'publish'
+            content: 'stored content', source: 'message', source_description: 'publish'
         })
         """,
         uuid=episode_uuid,
@@ -101,6 +102,7 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
             group_id='opr',
             name='curated:test.md',
             content='stored content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=retirement_request_id,
         )
@@ -120,6 +122,7 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
             group_id='opr',
             name='curated:test.md',
             content='stored content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=retirement_request_id,
         )
@@ -129,6 +132,7 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
             group_id='opr',
             name='curated:test.md',
             content='stored content',
+            source=EpisodeType.message.value,
             source_description='publish',
             retirement_request_id=str(uuid4()),
         )
@@ -335,6 +339,7 @@ async def test_falkor_conditional_delete_fails_closed_without_receipt_uniqueness
                 group_id=group_id,
                 name=episode.name,
                 content=episode.content,
+                source=episode.source.value,
                 source_description=episode.source_description,
                 retirement_request_id=retirement_request_id,
             )
