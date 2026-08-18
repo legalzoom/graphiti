@@ -39,7 +39,7 @@ from graphiti_core.edges import (
     create_entity_edge_embeddings,
 )
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
-from graphiti_core.errors import EdgeNotFoundError, NodeNotFoundError
+from graphiti_core.errors import EdgeNotFoundError, NodeGroupMismatchError, NodeNotFoundError
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import (
     get_default_group_id,
@@ -1101,6 +1101,8 @@ class Graphiti:
                 if uuid is not None:
                     with suppress(NodeNotFoundError):
                         episode = await EpisodicNode.get_by_uuid(self.driver, uuid)
+                if episode is not None and episode.group_id != group_id:
+                    raise NodeGroupMismatchError()
                 if episode is None:
                     episode = EpisodicNode(
                         uuid=uuid or str(uuid4()),
@@ -1334,6 +1336,8 @@ class Graphiti:
                     )
                     for episode in bulk_episodes
                 ]
+                if any(episode.group_id != group_id for episode in episodes):
+                    raise NodeGroupMismatchError()
 
                 # Save all episodes
                 await add_nodes_and_edges_bulk(

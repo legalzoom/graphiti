@@ -123,12 +123,18 @@ def test_episode_writers_lock_and_reject_deletion_tombstones(provider: GraphProv
     assert single_query.index('SET n._opr_conditional_delete_lock') < single_query.index(
         'coalesce(n.opr_deleted, false) = false'
     )
+    assert single_query.index('SET n._opr_conditional_delete_lock') < single_query.index(
+        'n.group_id IS NULL OR n.group_id = $group_id'
+    )
 
     bulk_query = get_episode_node_save_bulk_query(provider)
     assert 'MERGE (existing:Episodic {uuid: episode.uuid})' in bulk_query
     assert 'existing.opr_episode_reservation = true' in bulk_query
     assert bulk_query.index('SET existing._opr_conditional_delete_lock') < bulk_query.index(
         'coalesce(candidate.existing.opr_deleted, false) = false'
+    )
+    assert bulk_query.index('SET existing._opr_conditional_delete_lock') < bulk_query.index(
+        'candidate.existing.group_id = candidate.episode.group_id'
     )
 
 
@@ -137,6 +143,7 @@ def test_kuzu_writer_query_remains_compatible_with_its_explicit_schema():
     assert '_opr_conditional_delete_lock' not in query
     assert 'opr_deleted' not in query
     assert 'REMOVE' not in query
+    assert 'n.group_id IS NULL OR n.group_id = $group_id' in query
 
 
 @pytest.mark.asyncio

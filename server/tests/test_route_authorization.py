@@ -5,10 +5,11 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import HTTPException
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.errors import NodeGroupMismatchError
 from pydantic import SecretStr
 
 from graph_service.config import Settings
-from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, SearchQuery
+from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, Message, SearchQuery
 from graph_service.protocol import bearer_token_matches
 from graph_service.routers.ingest import (
     add_entity_node,
@@ -119,6 +120,33 @@ async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue()
 
 
 @pytest.mark.asyncio
+async def test_message_write_rejects_known_cross_group_uuid_before_enqueue():
+    assert_episode_uuid_group = AsyncMock(side_effect=NodeGroupMismatchError())
+    graphiti = cast(
+        ZepGraphiti,
+        SimpleNamespace(assert_episode_uuid_group=assert_episode_uuid_group),
+    )
+    request = AddMessagesRequest(
+        group_id='other',
+        messages=[
+            Message(
+                uuid='opr-owned-episode',
+                name='attempted overwrite',
+                content='content',
+                role_type='user',
+                role=None,
+            )
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await add_messages(request, graphiti, _settings())
+
+    assert exc_info.value.status_code == 409
+    assert_episode_uuid_group.assert_awaited_once_with('opr-owned-episode', 'other')
+
+
+@pytest.mark.asyncio
 async def test_opr_write_requires_write_bearer_but_non_opr_write_remains_compatible():
     save_entity_node = AsyncMock(return_value={'uuid': 'entity'})
     graphiti = cast(ZepGraphiti, SimpleNamespace(save_entity_node=save_entity_node))
@@ -150,10 +178,33 @@ async def test_opr_write_requires_write_bearer_but_non_opr_write_remains_compati
 
     save_entity_node.reset_mock()
     await add_entity_node(
-        AddEntityNodeRequest(uuid='other-entity', group_id='other', name='name', summary='summary'),
+        AddEntityNodeRequest(
+            uuid='other-entity',
+            group_id='other',
+            name='name',
+            summary='summary',
+        ),
         graphiti,
         settings,
     )
+    save_entity_node.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_entity_write_maps_atomic_group_mismatch_to_conflict():
+    save_entity_node = AsyncMock(side_effect=NodeGroupMismatchError())
+    graphiti = cast(ZepGraphiti, SimpleNamespace(save_entity_node=save_entity_node))
+    request = AddEntityNodeRequest(
+        uuid='opr-owned-entity',
+        group_id='other',
+        name='attempted overwrite',
+        summary='summary',
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await add_entity_node(request, graphiti, _settings())
+
+    assert exc_info.value.status_code == 409
     save_entity_node.assert_awaited_once()
 
 

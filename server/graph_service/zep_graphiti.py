@@ -9,7 +9,12 @@ from graphiti_core import Graphiti  # type: ignore
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.record_parsers import episodic_node_from_record
 from graphiti_core.edges import EntityEdge  # type: ignore
-from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeNotFoundError
+from graphiti_core.errors import (
+    EdgeNotFoundError,
+    GroupsEdgesNotFoundError,
+    NodeGroupMismatchError,
+    NodeNotFoundError,
+)
 from graphiti_core.helpers import EPISODE_AOSS_TOMBSTONE_VERSION
 from graphiti_core.llm_client import LLMClient  # type: ignore
 from graphiti_core.models.nodes.node_db_queries import (
@@ -74,6 +79,20 @@ class ZepGraphiti(Graphiti):
         await new_node.generate_name_embedding(self.embedder)
         await new_node.save(self.driver)
         return new_node
+
+    async def assert_episode_uuid_group(self, uuid: str, group_id: str) -> None:
+        """Reject a known cross-group UUID before expensive async ingestion.
+
+        The write query repeats this ownership check after taking the node lock;
+        this read is an early rejection only and is not the race-safety boundary.
+        """
+        query_driver = self.driver.with_database(group_id)
+        try:
+            episode = await EpisodicNode.get_by_uuid(query_driver, uuid)
+        except NodeNotFoundError:
+            return
+        if episode.group_id != group_id:
+            raise NodeGroupMismatchError()
 
     async def retrieve_episodes_for_reconciliation(
         self, group_id: str, last_n: int

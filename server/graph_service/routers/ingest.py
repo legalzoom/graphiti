@@ -7,6 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, status
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.errors import NodeGroupMismatchError
 from graphiti_core.helpers import query_result_record_count
 from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
@@ -121,6 +122,19 @@ async def add_messages(
 ):
     _authorize_opr_write(settings, authorization, request.group_id)
 
+    try:
+        for message in request.messages:
+            if message.uuid:
+                await graphiti.assert_episode_uuid_group(
+                    message.uuid,
+                    request.group_id,
+                )
+    except NodeGroupMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='episode UUID is already owned by another graph group',
+        ) from exc
+
     async def add_messages_task(m: Message):
         await graphiti.add_episode(
             uuid=m.uuid,
@@ -146,12 +160,18 @@ async def add_entity_node(
     authorization: Annotated[str | None, Header()] = None,
 ):
     _authorize_opr_write(settings, authorization, request.group_id)
-    node = await graphiti.save_entity_node(
-        uuid=request.uuid,
-        group_id=request.group_id,
-        name=request.name,
-        summary=request.summary,
-    )
+    try:
+        node = await graphiti.save_entity_node(
+            uuid=request.uuid,
+            group_id=request.group_id,
+            name=request.name,
+            summary=request.summary,
+        )
+    except NodeGroupMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='entity UUID is already owned by another graph group',
+        ) from exc
     return node
 
 

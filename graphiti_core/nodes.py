@@ -31,7 +31,11 @@ from graphiti_core.driver.driver import (
     GraphProvider,
 )
 from graphiti_core.embedder import EmbedderClient
-from graphiti_core.errors import EpisodeTombstonedError, NodeNotFoundError
+from graphiti_core.errors import (
+    EpisodeTombstonedError,
+    NodeGroupMismatchError,
+    NodeNotFoundError,
+)
 from graphiti_core.helpers import (
     EPISODE_AOSS_WRITE_VERSION,
     parse_db_date,
@@ -668,6 +672,9 @@ class EntityNode(Node):
                 get_entity_node_save_query(driver.provider, labels),
                 entity_data=entity_data,
             )
+
+        if await query_result_record_count(result) != 1:
+            raise NodeGroupMismatchError()
 
         if driver.provider == GraphProvider.NEPTUNE:
             driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]

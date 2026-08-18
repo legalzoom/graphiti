@@ -67,6 +67,14 @@ class EpisodeTombstonedError(GraphitiError):
         super().__init__(self.message)
 
 
+class NodeGroupMismatchError(GraphitiError):
+    """Raised when a UUID is already owned by another graph group."""
+
+    def __init__(self):
+        self.message = 'node UUID is already owned by another group'
+        super().__init__(self.message)
+
+
 class SearchRerankerError(GraphitiError):
     """Raised when a node is not found."""
 

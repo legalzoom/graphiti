@@ -58,14 +58,24 @@ async def ensure_episode_uuid_uniqueness(executor: QueryExecutor) -> None:
 async def _ensure_episode_uuid_uniqueness(executor: QueryExecutor) -> None:
     constraints = await executor.execute_query(
         """
-        SHOW CONSTRAINTS YIELD name
-        WHERE name IN ['episode_uuid_unique', 'opr_retirement_request_id_unique']
-        RETURN name
+        SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties
+        WHERE entityType = 'NODE'
+          AND type IN ['UNIQUENESS', 'NODE_PROPERTY_UNIQUENESS', 'NODE_KEY']
+          AND ((labelsOrTypes = ['Episodic'] AND properties = ['uuid'])
+           OR (labelsOrTypes = ['OPRRetirementReceipt']
+               AND properties = ['request_id']))
+        RETURN name, labelsOrTypes, properties
         """
     )
-    existing_constraints = {record['name'] for record in _query_records(constraints)}
-    episode_constraint_exists = 'episode_uuid_unique' in existing_constraints
-    receipt_constraint_exists = 'opr_retirement_request_id_unique' in existing_constraints
+    existing_schemas = {
+        (tuple(record['labelsOrTypes']), tuple(record['properties']))
+        for record in _query_records(constraints)
+    }
+    episode_constraint_exists = (('Episodic',), ('uuid',)) in existing_schemas
+    receipt_constraint_exists = (
+        ('OPRRetirementReceipt',),
+        ('request_id',),
+    ) in existing_schemas
     if episode_constraint_exists and receipt_constraint_exists:
         return
 
@@ -99,9 +109,11 @@ async def _ensure_episode_uuid_uniqueness(executor: QueryExecutor) -> None:
                 raise
         constraint = await executor.execute_query(
             """
-            SHOW CONSTRAINTS YIELD name
-            WHERE name = 'episode_uuid_unique'
-            RETURN name
+            SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties
+            WHERE entityType = 'NODE'
+              AND type IN ['UNIQUENESS', 'NODE_PROPERTY_UNIQUENESS', 'NODE_KEY']
+              AND labelsOrTypes = ['Episodic'] AND properties = ['uuid']
+            RETURN name, labelsOrTypes, properties
             """
         )
         if await query_result_record_count(constraint) != 1:
@@ -118,9 +130,12 @@ async def _ensure_episode_uuid_uniqueness(executor: QueryExecutor) -> None:
                 raise
         receipt_constraint = await executor.execute_query(
             """
-            SHOW CONSTRAINTS YIELD name
-            WHERE name = 'opr_retirement_request_id_unique'
-            RETURN name
+            SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties
+            WHERE entityType = 'NODE'
+              AND type IN ['UNIQUENESS', 'NODE_PROPERTY_UNIQUENESS', 'NODE_KEY']
+              AND labelsOrTypes = ['OPRRetirementReceipt']
+              AND properties = ['request_id']
+            RETURN name, labelsOrTypes, properties
             """
         )
         if await query_result_record_count(receipt_constraint) != 1:
