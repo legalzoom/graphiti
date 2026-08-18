@@ -86,24 +86,19 @@ jobs:
       - name: Set up Depot CLI
         uses: depot/setup-action@15c09a5f77a0840ad4bce955686522a257853461 # v1
 
-      - name: Get latest graphiti-core version from PyPI
+      - name: Resolve the repository-pinned graphiti-core version
         id: graphiti
         run: |
-          # Query PyPI for the latest graphiti-core version with error handling
           set -eo pipefail
-
-          if ! GRAPHITI_VERSION=$(curl -sf https://pypi.org/pypi/graphiti-core/json | python -c "import sys, json; data=json.load(sys.stdin); print(data['info']['version'])"); then
-            echo "Error: Failed to fetch graphiti-core version from PyPI"
-            exit 1
-          fi
-
+          GRAPHITI_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
           if [ -z "$GRAPHITI_VERSION" ]; then
-            echo "Error: Empty version returned from PyPI"
+            echo "Error: Empty graphiti-core version in pyproject.toml"
             exit 1
           fi
-
+          curl --fail --silent --show-error --retry 5 --retry-all-errors \
+            "https://pypi.org/pypi/graphiti-core/${GRAPHITI_VERSION}/json" >/dev/null
           echo "graphiti_version=${GRAPHITI_VERSION}" >> $GITHUB_OUTPUT
-          echo "Latest Graphiti Core version from PyPI: ${GRAPHITI_VERSION}"
+          echo "Pinned Graphiti Core version from PyPI: ${GRAPHITI_VERSION}"
 
       - name: Extract metadata
         id: meta

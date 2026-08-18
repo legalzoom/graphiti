@@ -47,6 +47,7 @@ load_dotenv(_REPO_ROOT / '.env')
 SERVER_DIR = Path(__file__).resolve().parent.parent
 FALKORDB_HOST = os.environ.get('FALKORDB_HOST', 'localhost')
 FALKORDB_PORT = int(os.environ.get('FALKORDB_PORT', '6379'))
+TEST_ADMIN_TOKEN = 'live-server-test-admin-token'
 
 pytestmark = [pytest.mark.integration]
 
@@ -113,6 +114,7 @@ def live_server() -> Iterator[tuple[str, str]]:
         'DB_BACKEND': 'falkordb',
         'FALKORDB_HOST': FALKORDB_HOST,
         'FALKORDB_PORT': str(FALKORDB_PORT),
+        'GRAPHITI_ADMIN_TOKEN': TEST_ADMIN_TOKEN,
         # A fresh logical graph per run isolates the test and keeps a long-lived
         # local FalkorDB from accumulating data across runs.
         'FALKORDB_DATABASE': token,
@@ -240,4 +242,7 @@ def test_ingest_search_delete_e2e(live_server: tuple[str, str]) -> None:
         finally:
             # Always clean up this run's data, even if an assertion above failed.
             with contextlib.suppress(httpx.HTTPError):
-                client.delete(f'/group/{group_id}')
+                client.delete(
+                    f'/group/{group_id}',
+                    headers={'Authorization': f'Bearer {TEST_ADMIN_TOKEN}'},
+                )

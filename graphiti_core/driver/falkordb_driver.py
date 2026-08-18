@@ -111,17 +111,21 @@ class FalkorDriverSession(GraphDriverSession):
     async def run(self, query: str | list, **kwargs: Any) -> Any:
         # FalkorDB does not support argument for Label Set, so it's converted into an array of queries
         if isinstance(query, list):
+            result = None
             for cypher, params in query:
                 params = convert_datetimes_to_strings(params)
                 params = _strip_nul_bytes(params)
-                await self.graph.query(str(cypher), params)  # type: ignore[reportUnknownArgumentType]
+                result = await self.graph.query(  # type: ignore[reportUnknownArgumentType]
+                    str(cypher), params
+                )
+            return result
         else:
             params = dict(kwargs)
             params = convert_datetimes_to_strings(params)
             params = _strip_nul_bytes(params)
-            await self.graph.query(str(query), params)  # type: ignore[reportUnknownArgumentType]
-        # Assuming `graph.query` is async (ideal); otherwise, wrap in executor
-        return None
+            return await self.graph.query(  # type: ignore[reportUnknownArgumentType]
+                str(query), params
+            )
 
 
 class FalkorDriver(GraphDriver):

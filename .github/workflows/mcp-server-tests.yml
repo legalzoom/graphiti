@@ -2,19 +2,25 @@ name: MCP Server Tests
 
 # Live end-to-end tests for the Graphiti MCP server against FalkorDB (the default
 # database) and a real OpenAI model. Runs on PRs and pushes to main that touch the
-# MCP server. The OpenAI key comes from the `development` GitHub environment; fork
-# PRs receive no secrets, so the suite skips itself there (the test module skips
-# when OPENAI_API_KEY is unset).
+# MCP server. The `ci` environment labels this as CI rather than an application
+# deployment. Fork PRs receive no secrets, so the suite skips itself there (the
+# test module skips when OPENAI_API_KEY is unset).
 on:
   push:
     branches: [main]
     paths:
       - "mcp_server/**"
+      - "graphiti_core/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/mcp-server-tests.yml"
   pull_request:
     branches: [main]
     paths:
       - "mcp_server/**"
+      - "graphiti_core/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/mcp-server-tests.yml"
 
 permissions:
@@ -29,7 +35,7 @@ concurrency:
 jobs:
   live-mcp-tests:
     runs-on: ubuntu-latest
-    environment: development
+    environment: ci
     # Insurance against a hung stdio subprocess / uv sync.
     timeout-minutes: 20
     steps:
@@ -47,13 +53,15 @@ jobs:
         with:
           version: "latest"
       - name: Start FalkorDB
-        # Run the database on the host network rather than a `services:` block: on
-        # the depot-ubuntu runner pool bridge-network NAT silently drops packets to
-        # published service-container ports. Readiness is checked via `docker exec`.
+        # Run the database on the host network so readiness checks and tests use the
+        # same endpoint across runner implementations. Readiness uses `docker exec`.
         run: docker run -d --name falkordb --network host falkordb/falkordb:latest
       - name: Install dependencies
         working-directory: mcp_server
         run: uv sync
+      - name: Run Neptune configuration unit tests
+        working-directory: mcp_server
+        run: uv run pytest tests/test_neptune_config.py -m "not integration"
       - name: Wait for FalkorDB
         run: |
           for i in $(seq 1 30); do

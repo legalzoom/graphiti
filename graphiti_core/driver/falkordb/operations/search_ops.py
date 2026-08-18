@@ -406,6 +406,8 @@ class FalkorSearchOperations(SearchOperations):
             YIELD node AS episode, score
             MATCH (e:Episodic)
             WHERE e.uuid = episode.uuid
+              AND coalesce(e.opr_deleted, false) = false
+              AND coalesce(e.opr_episode_reservation, false) = false
             """
             + group_filter_query
             + """

@@ -440,6 +440,8 @@ class NeptuneSearchOperations(SearchOperations):
             UNWIND $ids as i
             MATCH (e:Episodic)
             WHERE e.uuid=i.id
+              AND coalesce(e.opr_deleted, false) = false
+              AND coalesce(e.opr_episode_reservation, false) = false
             RETURN
             """
             + EPISODIC_NODE_RETURN_NEPTUNE

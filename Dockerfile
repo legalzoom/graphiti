@@ -50,10 +50,14 @@ ENV UV_COMPILE_BYTECODE=1 \
 # Create non-root user
 RUN groupadd -r app && useradd -r -d /app -g app app
 
-# Set up the server application first
+# Keep the monorepo layout so server development resolves the exact local core.
+# The release build then replaces it with the same exact PyPI version below.
 WORKDIR /app
-COPY ./server/pyproject.toml ./server/README.md ./server/uv.lock ./
-COPY ./server/graph_service ./graph_service
+COPY ./pyproject.toml ./README.md ./
+COPY ./graphiti_core ./graphiti_core
+COPY ./server/pyproject.toml ./server/README.md ./server/uv.lock ./server/
+COPY ./server/graph_service ./server/graph_service
+WORKDIR /app/server
 
 # Install server dependencies (without graphiti-core from lockfile)
 # Then install graphiti-core from PyPI at the desired version
@@ -66,6 +70,7 @@ COPY ./server/graph_service ./graph_service
 # SOCKET_SCAN_ID (unique per release run) invalidates this layer, and
 # UV_NO_CACHE stops uv serving wheels from the cache mount below.
 ARG INSTALL_FALKORDB=false
+ARG INSTALL_NEPTUNE=false
 ARG SOCKET_FIREWALL_ENABLED=false
 ARG SOCKET_SCAN_ID=
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -87,18 +92,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       UV_CMD="uv"; \
     fi; \
     $UV_CMD sync --frozen --no-dev; \
+    EXTRA=""; \
+    if [ "$INSTALL_FALKORDB" = "true" ]; then EXTRA="[falkordb]"; \
+    elif [ "$INSTALL_NEPTUNE" = "true" ]; then EXTRA="[neptune]"; \
+    fi; \
     if [ -n "$GRAPHITI_VERSION" ]; then \
-        if [ "$INSTALL_FALKORDB" = "true" ]; then \
-            $UV_CMD pip install --upgrade "graphiti-core[falkordb]==$GRAPHITI_VERSION"; \
-        else \
-            $UV_CMD pip install --upgrade "graphiti-core==$GRAPHITI_VERSION"; \
-        fi; \
+        $UV_CMD pip install --upgrade "graphiti-core${EXTRA}==$GRAPHITI_VERSION"; \
     else \
-        if [ "$INSTALL_FALKORDB" = "true" ]; then \
-            $UV_CMD pip install --upgrade "graphiti-core[falkordb]"; \
-        else \
-            $UV_CMD pip install --upgrade graphiti-core; \
-        fi; \
+        $UV_CMD pip install --upgrade "graphiti-core${EXTRA}"; \
     fi
 
 # Change ownership to app user
@@ -106,7 +107,7 @@ RUN chown -R app:app /app
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/server/.venv/bin:$PATH"
 
 # Switch to non-root user
 USER app
