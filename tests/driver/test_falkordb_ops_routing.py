@@ -38,6 +38,7 @@ def _make_falkor_driver(execute_return=None):
     base.provider = GraphProvider.FALKORDB
     base.execute_query = AsyncMock(return_value=execute_return or ([], None, None))
     base.clone = MagicMock(return_value=child)
+    base.with_database = MagicMock(return_value=child)
     return base, child
 
 
@@ -50,7 +51,7 @@ async def test_episode_get_by_group_ids_single_group_routes_to_its_graph():
 
     # Routed: cloned to the group's database, query ran against the clone,
     # never against the base (default_db) driver.
-    base.clone.assert_called_once_with(database='group-a')
+    base.with_database.assert_called_once_with('group-a')
     child.execute_query.assert_awaited_once()
     base.execute_query.assert_not_called()
     assert result == []
@@ -91,13 +92,14 @@ async def test_episode_get_by_group_ids_multi_group_fans_out_per_graph():
         child = MagicMock(spec=GraphDriver)
         child.provider = GraphProvider.FALKORDB
         child.execute_query = AsyncMock(return_value=([], None, None))
-        # Mirror FalkorDriver.clone: re-cloning to the same database returns self,
+        # Mirror GraphDriver.with_database: re-routing a child remains a shallow
+        # copy backed by the same connection and query mock.
         # so the per-group recursion's single-group clone is a no-op.
-        child.clone = MagicMock(return_value=child)
+        child.with_database = MagicMock(return_value=child)
         clones[database] = child
         return child
 
-    base.clone = MagicMock(side_effect=_clone)
+    base.with_database = MagicMock(side_effect=_clone)
 
     await ops.get_by_group_ids(base, ['g1', 'g2', 'g3'])
 
@@ -115,5 +117,5 @@ async def test_get_by_group_ids_empty_group_ids_does_not_route():
 
     await ops.get_by_group_ids(base, [])
 
-    base.clone.assert_not_called()
+    base.with_database.assert_not_called()
     base.execute_query.assert_awaited_once()

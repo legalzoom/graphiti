@@ -32,6 +32,10 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
         case GraphProvider.NEPTUNE:
             return """
                 MERGE (n:Episodic {uuid: $uuid})
+                SET n._opr_conditional_delete_lock = true
+                REMOVE n._opr_conditional_delete_lock
+                WITH n
+                WHERE coalesce(n.opr_deleted, false) = false
                 SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
                 entity_edges: join([x IN coalesce($entity_edges, []) | toString(x) ], '|'), created_at: $created_at, valid_at: $valid_at}
                 RETURN n.uuid AS uuid
@@ -53,6 +57,10 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
         case GraphProvider.FALKORDB:
             return """
                 MERGE (n:Episodic {uuid: $uuid})
+                SET n._opr_conditional_delete_lock = true
+                REMOVE n._opr_conditional_delete_lock
+                WITH n
+                WHERE coalesce(n.opr_deleted, false) = false
                 SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
                 entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at}
                 RETURN n.uuid AS uuid
@@ -60,6 +68,10 @@ def get_episode_node_save_query(provider: GraphProvider) -> str:
         case _:  # Neo4j
             return """
                 MERGE (n:Episodic {uuid: $uuid})
+                SET n._opr_conditional_delete_lock = true
+                REMOVE n._opr_conditional_delete_lock
+                WITH n
+                WHERE coalesce(n.opr_deleted, false) = false
                 SET n = {uuid: $uuid, name: $name, group_id: $group_id, source_description: $source_description, source: $source, content: $content,
                 entity_edges: $entity_edges, created_at: $created_at, valid_at: $valid_at}
                 RETURN n.uuid AS uuid
@@ -71,7 +83,16 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
         case GraphProvider.NEPTUNE:
             return """
                 UNWIND $episodes AS episode
-                MERGE (n:Episodic {uuid: episode.uuid})
+                WITH episode ORDER BY episode.uuid
+                MERGE (existing:Episodic {uuid: episode.uuid})
+                ON CREATE SET existing.opr_episode_reservation = true
+                SET existing._opr_conditional_delete_lock = true
+                REMOVE existing._opr_conditional_delete_lock
+                WITH collect({episode: episode, existing: existing}) AS candidates
+                WHERE all(candidate IN candidates WHERE
+                    coalesce(candidate.existing.opr_deleted, false) = false)
+                UNWIND candidates AS candidate
+                WITH candidate.episode AS episode, candidate.existing AS n
                 SET n = {uuid: episode.uuid, name: episode.name, group_id: episode.group_id, source_description: episode.source_description,
                     source: episode.source, content: episode.content,
                 entity_edges: join([x IN coalesce(episode.entity_edges, []) | toString(x) ], '|'), created_at: episode.created_at, valid_at: episode.valid_at}
@@ -94,7 +115,16 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
         case GraphProvider.FALKORDB:
             return """
                 UNWIND $episodes AS episode
-                MERGE (n:Episodic {uuid: episode.uuid})
+                WITH episode ORDER BY episode.uuid
+                MERGE (existing:Episodic {uuid: episode.uuid})
+                ON CREATE SET existing.opr_episode_reservation = true
+                SET existing._opr_conditional_delete_lock = true
+                REMOVE existing._opr_conditional_delete_lock
+                WITH collect({episode: episode, existing: existing}) AS candidates
+                WHERE all(candidate IN candidates WHERE
+                    coalesce(candidate.existing.opr_deleted, false) = false)
+                UNWIND candidates AS candidate
+                WITH candidate.episode AS episode, candidate.existing AS n
                 SET n = {uuid: episode.uuid, name: episode.name, group_id: episode.group_id, source_description: episode.source_description, source: episode.source, content: episode.content,
                 entity_edges: episode.entity_edges, created_at: episode.created_at, valid_at: episode.valid_at}
                 RETURN n.uuid AS uuid
@@ -102,7 +132,16 @@ def get_episode_node_save_bulk_query(provider: GraphProvider) -> str:
         case _:  # Neo4j
             return """
                 UNWIND $episodes AS episode
-                MERGE (n:Episodic {uuid: episode.uuid})
+                WITH episode ORDER BY episode.uuid
+                MERGE (existing:Episodic {uuid: episode.uuid})
+                ON CREATE SET existing.opr_episode_reservation = true
+                SET existing._opr_conditional_delete_lock = true
+                REMOVE existing._opr_conditional_delete_lock
+                WITH collect({episode: episode, existing: existing}) AS candidates
+                WHERE all(candidate IN candidates WHERE
+                    coalesce(candidate.existing.opr_deleted, false) = false)
+                UNWIND candidates AS candidate
+                WITH candidate.episode AS episode, candidate.existing AS n
                 SET n = {uuid: episode.uuid, name: episode.name, group_id: episode.group_id, source_description: episode.source_description, source: episode.source, content: episode.content,
                 entity_edges: episode.entity_edges, created_at: episode.created_at, valid_at: episode.valid_at}
                 RETURN n.uuid AS uuid

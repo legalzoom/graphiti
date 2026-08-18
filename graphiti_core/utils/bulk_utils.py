@@ -30,8 +30,14 @@ from graphiti_core.driver.driver import (
 )
 from graphiti_core.edges import Edge, EntityEdge, EpisodicEdge, create_entity_edge_embeddings
 from graphiti_core.embedder import EmbedderClient
+from graphiti_core.errors import EpisodeTombstonedError
 from graphiti_core.graphiti_types import GraphitiClients
-from graphiti_core.helpers import normalize_l2, semaphore_gather
+from graphiti_core.helpers import (
+    EPISODE_AOSS_WRITE_VERSION,
+    normalize_l2,
+    query_result_record_count,
+    semaphore_gather,
+)
 from graphiti_core.models.edges.edge_db_queries import (
     get_entity_edge_save_bulk_query,
     get_episodic_edge_save_bulk_query,
@@ -245,7 +251,9 @@ async def add_nodes_and_edges_bulk_tx(
         for edge in episodic_edges:
             await tx.run(episodic_edge_query, **edge.model_dump())
     else:
-        await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
+        result = await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
+        if await query_result_record_count(result) != len(episodes):
+            raise EpisodeTombstonedError()
         await tx.run(
             get_entity_node_save_bulk_query(driver.provider, nodes),
             nodes=nodes,
@@ -262,7 +270,7 @@ async def add_nodes_and_edges_bulk_tx(
     # Sync bulk-written data to AOSS for Neptune full-text search
     if driver.provider == GraphProvider.NEPTUNE:
         if episodes:
-            driver.save_to_aoss(
+            driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'episode_content',
                 [
                     {
@@ -271,12 +279,13 @@ async def add_nodes_and_edges_bulk_tx(
                         'source': e.get('source', ''),
                         'source_description': e.get('source_description', ''),
                         'group_id': e.get('group_id', ''),
+                        '_version': EPISODE_AOSS_WRITE_VERSION,
                     }
                     for e in episodes
                 ],
             )
         if nodes:
-            driver.save_to_aoss(
+            driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'node_name_and_summary',
                 [
                     {
@@ -289,7 +298,7 @@ async def add_nodes_and_edges_bulk_tx(
                 ],
             )
         if edges:
-            driver.save_to_aoss(
+            driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'edge_name_and_fact',
                 [
                     {

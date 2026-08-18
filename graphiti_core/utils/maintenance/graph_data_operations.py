@@ -41,7 +41,15 @@ async def clear_data(driver: GraphDriver, group_ids: list[str] | None = None):
     async with driver.session() as session:
 
         async def delete_all(tx):
-            await tx.run('MATCH (n) DETACH DELETE n')
+            query = 'MATCH (n) DETACH DELETE n'
+            if driver.provider != GraphProvider.KUZU:
+                query = (
+                    'MATCH (n) WITH n ORDER BY n.uuid '
+                    'SET n._opr_conditional_delete_lock = true '
+                    'REMOVE n._opr_conditional_delete_lock '
+                    'WITH n WHERE coalesce(n.opr_deleted, false) = false DETACH DELETE n'
+                )
+            await tx.run(query)
 
         async def delete_group_ids(tx):
             labels = ['Entity', 'Episodic', 'Community']
@@ -49,10 +57,19 @@ async def clear_data(driver: GraphDriver, group_ids: list[str] | None = None):
                 labels.append('RelatesToNode_')
 
             for label in labels:
+                tombstone_guard = (
+                    'WITH n ORDER BY n.uuid '
+                    'SET n._opr_conditional_delete_lock = true '
+                    'REMOVE n._opr_conditional_delete_lock '
+                    'WITH n WHERE coalesce(n.opr_deleted, false) = false'
+                    if driver.provider != GraphProvider.KUZU
+                    else ''
+                )
                 await tx.run(
                     f"""
                     MATCH (n:{label})
                     WHERE n.group_id IN $group_ids
+                    {tombstone_guard}
                     DETACH DELETE n
                     """,
                     group_ids=group_ids,
@@ -97,6 +114,14 @@ async def retrieve_episodes(
             pass
 
     # If saga is provided, retrieve episodes from that saga only
+    tombstone_filter = (
+        ''
+        if driver.provider == GraphProvider.KUZU
+        else (
+            'AND coalesce(e.opr_deleted, false) = false '
+            'AND coalesce(e.opr_episode_reservation, false) = false'
+        )
+    )
     if saga is not None:
         group_id = group_ids[0] if group_ids else None
         source_filter = 'AND e.source = $source' if source is not None else ''
@@ -105,6 +130,7 @@ async def retrieve_episodes(
             f"""
             MATCH (s:Saga {{name: $saga_name, group_id: $group_id}})-[:HAS_EPISODE]->(e:Episodic)
             WHERE e.valid_at <= $reference_time
+            {tombstone_filter}
             {source_filter}
             RETURN
             """
@@ -142,6 +168,7 @@ async def retrieve_episodes(
                                     MATCH (e:Episodic)
                                     WHERE e.valid_at <= $reference_time
                                     """
+        + tombstone_filter
         + query_filter
         + """
         RETURN

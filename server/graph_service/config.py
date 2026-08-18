@@ -2,7 +2,7 @@ from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
 
 
@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     kuzu_db: str | None = Field(None)
     kuzu_max_concurrent_queries: int | None = Field(None)
     db_backend: str = Field('neo4j')
+    opr_reconciliation_token: SecretStr = SecretStr('')
 
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 

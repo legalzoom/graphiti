@@ -59,6 +59,14 @@ class NodeNotFoundError(GraphitiError):
         super().__init__(self.message)
 
 
+class EpisodeTombstonedError(GraphitiError):
+    """Raised when a retired episode UUID is presented to a writer."""
+
+    def __init__(self):
+        self.message = 'episode write blocked by deletion tombstone'
+        super().__init__(self.message)
+
+
 class SearchRerankerError(GraphitiError):
     """Raised when a node is not found."""
 

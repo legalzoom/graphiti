@@ -5,9 +5,9 @@ permissions:
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "server-multi-backend-support"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "server-multi-backend-support"]
 
 jobs:
   pyright:
@@ -41,6 +41,8 @@ jobs:
           uv sync --all-extras
       - name: Run Pyright for graph-service
         shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           cd server
           uv run pyright .

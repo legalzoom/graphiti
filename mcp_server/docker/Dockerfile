@@ -49,7 +49,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /app/mcp
 
 # Accept graphiti-core version as build argument
-ARG GRAPHITI_CORE_VERSION=0.29.1
+ARG GRAPHITI_CORE_VERSION=0.29.4
 ARG SOCKET_FIREWALL_ENABLED=false
 # Unique per release run so enforced builds re-resolve and re-download instead
 # of reusing cached layers, which sfw would never see.
@@ -169,7 +169,7 @@ EOF
 RUN chmod +x /start-services.sh
 
 # Add Docker labels with version information
-ARG MCP_SERVER_VERSION=1.0.2
+ARG MCP_SERVER_VERSION=1.0.3
 ARG BUILD_DATE
 ARG VCS_REF
 LABEL org.opencontainers.image.title="FalkorDB + Graphiti MCP Server" \

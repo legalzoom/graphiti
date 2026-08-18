@@ -1,7 +1,10 @@
+import hmac
 from datetime import datetime, timezone
+from typing import Annotated
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Header, HTTPException, status
 
+from graph_service.config import ZepEnvDep
 from graph_service.dto import (
     GetMemoryRequest,
     GetMemoryResponse,
@@ -34,7 +37,26 @@ async def get_entity_edge(uuid: str, graphiti: ZepGraphitiDep):
 
 
 @router.get('/episodes/{group_id}', status_code=status.HTTP_200_OK)
-async def get_episodes(group_id: str, last_n: int, graphiti: ZepGraphitiDep):
+async def get_episodes(
+    group_id: str,
+    last_n: int,
+    graphiti: ZepGraphitiDep,
+    settings: ZepEnvDep,
+    include_retired_for_reconciliation: bool = False,
+    x_opr_reconciliation_token: Annotated[str | None, Header()] = None,
+):
+    if include_retired_for_reconciliation:
+        expected_token = settings.opr_reconciliation_token.get_secret_value()
+        if not (
+            expected_token
+            and x_opr_reconciliation_token
+            and hmac.compare_digest(expected_token, x_opr_reconciliation_token)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail='retired episode reconciliation is not authorized',
+            )
+        return await graphiti.retrieve_episodes_for_reconciliation(group_id, last_n)
     episodes = await graphiti.retrieve_episodes(
         group_ids=[group_id], last_n=last_n, reference_time=datetime.now(timezone.utc)
     )

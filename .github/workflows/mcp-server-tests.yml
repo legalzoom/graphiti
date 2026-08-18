@@ -7,14 +7,20 @@ name: MCP Server Tests
 # when OPENAI_API_KEY is unset).
 on:
   push:
-    branches: [main]
+    branches: [main, server-multi-backend-support]
     paths:
       - "mcp_server/**"
+      - "graphiti_core/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/mcp-server-tests.yml"
   pull_request:
-    branches: [main]
+    branches: [main, server-multi-backend-support]
     paths:
       - "mcp_server/**"
+      - "graphiti_core/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/mcp-server-tests.yml"
 
 permissions:

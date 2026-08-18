@@ -40,13 +40,23 @@ class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
         group_ids: list[str] | None = None,
     ) -> None:
         if group_ids is None:
-            await executor.execute_query('MATCH (n) DETACH DELETE n')
+            await executor.execute_query(
+                'MATCH (n) WITH n ORDER BY n.uuid '
+                'SET n._opr_conditional_delete_lock = true '
+                'REMOVE n._opr_conditional_delete_lock '
+                'WITH n WHERE coalesce(n.opr_deleted, false) = false DETACH DELETE n'
+            )
         else:
             for label in ['Entity', 'Episodic', 'Community']:
                 await executor.execute_query(
                     f"""
                     MATCH (n:{label})
                     WHERE n.group_id IN $group_ids
+                    WITH n ORDER BY n.uuid
+                    SET n._opr_conditional_delete_lock = true
+                    REMOVE n._opr_conditional_delete_lock
+                    WITH n
+                    WHERE coalesce(n.opr_deleted, false) = false
                     DETACH DELETE n
                     """,
                     group_ids=group_ids,

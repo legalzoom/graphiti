@@ -13,9 +13,9 @@ name: "CodeQL Advanced"
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "server-multi-backend-support" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "server-multi-backend-support" ]
   schedule:
     - cron: '43 1 * * 6'
 
@@ -27,7 +27,10 @@ jobs:
     #   - https://gh.io/supported-runners-and-hardware-resources
     #   - https://gh.io/using-larger-runners (GitHub.com only)
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
-    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    # LegalZoom's GitHub IP allowlist rejects SARIF uploads from the shared
+    # github-hosted runner pool. Depot uses the approved egress path already
+    # used by this repository's test and lint workflows.
+    runs-on: depot-ubuntu-22.04
     permissions:
       # required for all workflows
       security-events: write

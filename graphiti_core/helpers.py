@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import asyncio
+import inspect
 import os
 import re
 from collections.abc import Coroutine
@@ -37,6 +38,39 @@ SAFE_CYPHER_IDENTIFIER_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 USE_PARALLEL_RUNTIME = bool(os.getenv('USE_PARALLEL_RUNTIME', False))
 SEMAPHORE_LIMIT = int(os.getenv('SEMAPHORE_LIMIT', 20))
 DEFAULT_PAGE_LIMIT = 20
+# OpenSearch external versions permanently order ordinary episode writes below
+# deletion tombstones. The high epoch clears any legacy internal document
+# version; equal ordinary versions may be replayed idempotently.
+EPISODE_AOSS_WRITE_VERSION = 1_000_000_000_000_000
+EPISODE_AOSS_TOMBSTONE_VERSION = EPISODE_AOSS_WRITE_VERSION + 1
+
+
+async def query_result_record_count(result: Any) -> int:
+    """Return the record count for each supported driver's query result."""
+    if isinstance(result, tuple):
+        result = result[0]
+    if isinstance(result, list):
+        return len(result)
+
+    records = getattr(result, 'records', None)
+    if records is not None:
+        return len(records)
+
+    result_set = getattr(result, 'result_set', None)
+    if result_set is not None:
+        return len(result_set)
+
+    values = getattr(result, 'values', None)
+    if callable(values):
+        resolved = values()
+        if inspect.isawaitable(resolved):
+            resolved = await resolved
+        if isinstance(resolved, (list, tuple)):
+            return len(resolved)
+        raise TypeError(f'unsupported values result type: {type(resolved).__name__}')
+
+    raise TypeError(f'unsupported query result type: {type(result).__name__}')
+
 
 # Content chunking configuration for entity extraction
 # Density-based chunking: only chunk high-density content (many entities per token)

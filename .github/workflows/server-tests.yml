@@ -9,14 +9,20 @@ name: Server Tests
 # OPENAI_API_KEY is unset).
 on:
   push:
-    branches: [main]
+    branches: [main, server-multi-backend-support]
     paths:
       - "server/**"
+      - "graphiti_core/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/server-tests.yml"
   pull_request:
-    branches: [main]
+    branches: [main, server-multi-backend-support]
     paths:
       - "server/**"
+      - "graphiti_core/**"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/server-tests.yml"
 
 permissions:
@@ -68,6 +74,7 @@ jobs:
       - name: Run live server integration tests
         working-directory: server
         env:
+          PYTHONPATH: ${{ github.workspace }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DB_BACKEND: falkordb
           FALKORDB_HOST: localhost
