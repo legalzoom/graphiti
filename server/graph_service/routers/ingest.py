@@ -8,6 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, FastAPI, Header, HTTPException, status
 from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
+from starlette.responses import JSONResponse
 
 from graph_service.config import ZepEnvDep
 from graph_service.dto import (
@@ -26,6 +27,23 @@ from graph_service.protocol import (
 from graph_service.zep_graphiti import ZepGraphitiDep
 
 logger = logging.getLogger('uvicorn.error')
+
+
+def _authorize_episode_retirement(
+    settings: ZepEnvDep,
+    supplied_token: str | None,
+    operation: str | None,
+    group_id: str,
+) -> None:
+    expected_token = settings.opr_retirement_token.get_secret_value()
+    if not reconciliation_token_matches(expected_token, supplied_token) or (
+        operation != GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE
+        or group_id != GRAPHITI_RECONCILIATION_GROUP_ID
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail='conditional episode retirement is not authorized',
+        )
 
 
 class AsyncWorker:
@@ -123,7 +141,7 @@ async def delete_episode(uuid: str, graphiti: ZepGraphitiDep):
     return Result(message='Episode deleted', success=True)
 
 
-@router.delete('/episode/{uuid}/retire/v2', status_code=status.HTTP_200_OK)
+@router.delete('/episode/{uuid}/retire/v3', status_code=status.HTTP_200_OK)
 async def delete_episode_if_matches(
     uuid: str,
     request: DeleteEpisodeIfMatchRequest,
@@ -132,35 +150,80 @@ async def delete_episode_if_matches(
     x_opr_retirement_token: Annotated[str | None, Header()] = None,
     x_opr_reconciliation_operation: Annotated[str | None, Header()] = None,
 ):
-    expected_token = settings.opr_retirement_token.get_secret_value()
-    if not reconciliation_token_matches(
-        expected_token,
+    _authorize_episode_retirement(
+        settings,
         x_opr_retirement_token,
-    ) or (
-        x_opr_reconciliation_operation != GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE
-        or request.group_id != GRAPHITI_RECONCILIATION_GROUP_ID
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='conditional episode retirement is not authorized',
-        )
+        x_opr_reconciliation_operation,
+        request.group_id,
+    )
     deleted = await graphiti.delete_episodic_node_if_matches(
         uuid,
         group_id=request.group_id,
         name=request.name,
         content=request.content,
         source_description=request.source_description,
+        retirement_request_id=str(request.retirement_request_id),
     )
-    if not deleted:
+    if deleted is None:
         raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Episode retirement request receipt conflicts with durable state',
+        )
+    if deleted is False:
+        return JSONResponse(
             status_code=status.HTTP_412_PRECONDITION_FAILED,
-            detail='Episode identity precondition failed',
+            content={
+                'message': 'Episode identity precondition failed',
+                'success': False,
+                'outcome': 'not_applied',
+                'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
+                'graphiti_core_version': version('graphiti-core'),
+                'retirement_request_id': str(request.retirement_request_id),
+            },
         )
     return {
         'message': 'Episode conditionally deleted',
         'success': True,
+        'outcome': 'retired',
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': version('graphiti-core'),
+        'retirement_request_id': str(request.retirement_request_id),
+    }
+
+
+@router.post('/episode/{uuid}/retirement/v3', status_code=status.HTTP_200_OK)
+async def get_episode_retirement_status(
+    uuid: str,
+    retirement_request_id: str,
+    group_id: str,
+    graphiti: ZepGraphitiDep,
+    settings: ZepEnvDep,
+    x_opr_retirement_token: Annotated[str | None, Header()] = None,
+    x_opr_reconciliation_operation: Annotated[str | None, Header()] = None,
+):
+    _authorize_episode_retirement(
+        settings,
+        x_opr_retirement_token,
+        x_opr_reconciliation_operation,
+        group_id,
+    )
+    outcome = await graphiti.episode_retirement_outcome(
+        uuid,
+        group_id=group_id,
+        retirement_request_id=retirement_request_id,
+    )
+    if outcome is None:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail='Episode retirement receipt is not durable',
+        )
+    return {
+        'message': 'Episode retirement outcome is durable',
+        'success': outcome == 'retired',
+        'outcome': outcome,
+        'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
+        'graphiti_core_version': version('graphiti-core'),
+        'retirement_request_id': retirement_request_id,
     }
 
 

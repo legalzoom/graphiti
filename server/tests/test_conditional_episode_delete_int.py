@@ -6,6 +6,7 @@ from typing import cast
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.driver.neo4j.operations.episode_node_ops import Neo4jEpisodeNodeOperations
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
@@ -31,6 +32,7 @@ async def test_conditional_delete_rechecks_group_after_waiting_for_writer():
     await driver.build_indices_and_constraints()
     service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
     episode_uuid = str(uuid4())
+    retirement_request_id = str(uuid4())
     await driver.execute_query(
         """
         CREATE (:Episodic {
@@ -57,6 +59,7 @@ async def test_conditional_delete_rechecks_group_after_waiting_for_writer():
                     name='curated:test.md',
                     content='stored content',
                     source_description='publish',
+                    retirement_request_id=retirement_request_id,
                 )
             )
             await asyncio.sleep(0.1)
@@ -80,6 +83,7 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
     await driver.build_indices_and_constraints()
     service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
     episode_uuid = str(uuid4())
+    retirement_request_id = str(uuid4())
     await driver.execute_query(
         """
         CREATE (:Episodic {
@@ -98,6 +102,35 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
             name='curated:test.md',
             content='stored content',
             source_description='publish',
+            retirement_request_id=retirement_request_id,
+        )
+
+        assert (
+            await ZepGraphiti.episode_retirement_outcome(
+                service,
+                episode_uuid,
+                group_id='opr',
+                retirement_request_id=retirement_request_id,
+            )
+            == 'retired'
+        )
+        assert await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
+            episode_uuid,
+            group_id='opr',
+            name='curated:test.md',
+            content='stored content',
+            source_description='publish',
+            retirement_request_id=retirement_request_id,
+        )
+        assert not await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
+            episode_uuid,
+            group_id='opr',
+            name='curated:test.md',
+            content='stored content',
+            source_description='publish',
+            retirement_request_id=str(uuid4()),
         )
 
         replacement = EpisodicNode(
@@ -130,6 +163,10 @@ async def test_conditional_delete_tombstone_blocks_same_uuid_recreation():
         assert records == [{'deleted': True, 'group_id': '__opr_deleted__', 'content': ''}]
     finally:
         await driver.execute_query('MATCH (n {uuid: $uuid}) DETACH DELETE n', uuid=episode_uuid)
+        await driver.execute_query(
+            'MATCH (r:OPRRetirementReceipt {request_id: $request_id}) DETACH DELETE r',
+            request_id=retirement_request_id,
+        )
         await driver.close()
 
 
@@ -267,7 +304,7 @@ async def test_legacy_delete_rechecks_tombstone_after_waiting_for_retirement():
 
 
 @pytest.mark.asyncio
-async def test_falkor_conditional_delete_routes_group_and_preserves_tombstone():
+async def test_falkor_conditional_delete_fails_closed_without_receipt_uniqueness():
     group_id = f'conditional{uuid4().hex}'
     base_driver = FalkorDriver(
         host=os.environ.get('FALKORDB_HOST', '127.0.0.1'),
@@ -277,6 +314,7 @@ async def test_falkor_conditional_delete_routes_group_and_preserves_tombstone():
     group_driver = base_driver.with_database(group_id)
     service = cast(ZepGraphiti, SimpleNamespace(driver=base_driver))
     episode_uuid = str(uuid4())
+    retirement_request_id = str(uuid4())
     episode = EpisodicNode(
         uuid=episode_uuid,
         group_id=group_id,
@@ -290,26 +328,17 @@ async def test_falkor_conditional_delete_routes_group_and_preserves_tombstone():
     await episode.save(group_driver)
 
     try:
-        assert not await ZepGraphiti.delete_episodic_node_if_matches(
-            service,
-            episode_uuid,
-            group_id=group_id,
-            name=episode.name,
-            content='changed content',
-            source_description=episode.source_description,
-        )
-        assert await ZepGraphiti.delete_episodic_node_if_matches(
-            service,
-            episode_uuid,
-            group_id=group_id,
-            name=episode.name,
-            content=episode.content,
-            source_description=episode.source_description,
-        )
-
-        await episode.delete(group_driver)
-        with pytest.raises(EpisodeTombstonedError):
-            await episode.save(group_driver)
+        with pytest.raises(HTTPException) as exc_info:
+            await ZepGraphiti.delete_episodic_node_if_matches(
+                service,
+                episode_uuid,
+                group_id=group_id,
+                name=episode.name,
+                content=episode.content,
+                source_description=episode.source_description,
+                retirement_request_id=retirement_request_id,
+            )
+        assert exc_info.value.status_code == 501
         records, _, _ = await group_driver.execute_query(
             """
             MATCH (episode:Episodic {uuid: $uuid})
@@ -319,7 +348,7 @@ async def test_falkor_conditional_delete_routes_group_and_preserves_tombstone():
             """,
             uuid=episode_uuid,
         )
-        assert records == [{'deleted': True, 'group_id': '__opr_deleted__', 'content': ''}]
+        assert records == [{'deleted': False, 'group_id': group_id, 'content': episode.content}]
     finally:
         await group_driver.execute_query(
             'MATCH (n:Episodic {uuid: $uuid}) DETACH DELETE n',

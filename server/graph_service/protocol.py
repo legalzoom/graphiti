@@ -2,7 +2,7 @@
 
 import hmac
 
-GRAPHITI_RECONCILIATION_PROTOCOL = 'opr.graphiti.reconciliation/v2'
+GRAPHITI_RECONCILIATION_PROTOCOL = 'opr.graphiti.reconciliation/v3'
 GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE = 'retire_episode'
 GRAPHITI_RECONCILIATION_GROUP_ID = 'opr'
 

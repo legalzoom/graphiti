@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from pydantic import BaseModel, Field
 
 from graph_service.dto.common import Message
@@ -25,4 +27,8 @@ class DeleteEpisodeIfMatchRequest(BaseModel):
         ...,
         min_length=1,
         description='The exact stored producer provenance',
+    )
+    retirement_request_id: UUID = Field(
+        ...,
+        description='The durable OPR idempotency key for this retirement',
     )

@@ -90,3 +90,21 @@ async def _ensure_episode_uuid_uniqueness(executor: QueryExecutor) -> None:
     )
     if await query_result_record_count(constraint) != 1:
         raise GraphitiError('episode UUID uniqueness constraint is unavailable')
+
+    try:
+        await executor.execute_query(
+            'CREATE CONSTRAINT opr_retirement_request_id_unique IF NOT EXISTS '
+            'FOR (receipt:OPRRetirementReceipt) REQUIRE receipt.request_id IS UNIQUE'
+        )
+    except ClientError as exc:
+        if 'EquivalentSchemaRuleAlreadyExists' not in str(exc):
+            raise
+    receipt_constraint = await executor.execute_query(
+        """
+        SHOW CONSTRAINTS YIELD name
+        WHERE name = 'opr_retirement_request_id_unique'
+        RETURN name
+        """
+    )
+    if await query_result_record_count(receipt_constraint) != 1:
+        raise GraphitiError('retirement request ID uniqueness constraint is unavailable')

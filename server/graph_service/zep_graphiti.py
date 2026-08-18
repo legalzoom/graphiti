@@ -144,7 +144,8 @@ class ZepGraphiti(Graphiti):
         name: str,
         content: str,
         source_description: str,
-    ) -> bool:
+        retirement_request_id: str,
+    ) -> bool | None:
         """Atomically compare the complete episode identity and retire it.
 
         A separate read followed by ``delete_episodic_node`` is unsafe because
@@ -162,67 +163,236 @@ class ZepGraphiti(Graphiti):
         # https://neo4j.com/docs/operations-manual/current/database-internals/concurrent-data-access/
         try:
             canonical_uuid = str(UUID(uuid))
+            canonical_request_id = str(UUID(retirement_request_id))
         except (AttributeError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail='episode UUID is invalid') from exc
-        if self.driver.provider == GraphProvider.KUZU:
+            raise HTTPException(
+                status_code=422,
+                detail='episode or retirement request UUID is invalid',
+            ) from exc
+        if self.driver.provider in {GraphProvider.KUZU, GraphProvider.FALKORDB}:
             raise HTTPException(
                 status_code=501,
-                detail='conditional episode retirement is unsupported by the Kuzu backend',
+                detail=(
+                    'conditional episode retirement requires a backend with '
+                    'request-receipt uniqueness'
+                ),
             )
         identity_digest = _conditional_episode_identity_digest(
             canonical_uuid, group_id, name, content, source_description
         )
         query_driver = self.driver
-        if self.driver.provider == GraphProvider.FALKORDB:
-            # Route to the request graph without constructing a second driver;
-            # FalkorDriver.clone() starts index-initialization work and makes
-            # this one-shot request responsible for another driver's lifecycle.
-            query_driver = self.driver.with_database(group_id)
-
-        records, _, _ = await query_driver.execute_query(
-            """
-            MATCH (episode:Episodic {uuid: $uuid})
-            SET episode._opr_conditional_delete_lock = true
-            REMOVE episode._opr_conditional_delete_lock
-            WITH episode, coalesce(episode.opr_deleted, false) AS was_deleted
-            WHERE (
-                was_deleted = false
-                AND episode.uuid = $uuid
-                AND episode.group_id = $group_id
-                AND episode.name = $name
-                AND episode.content = $content
-                AND episode.source_description = $source_description
-            ) OR (
-                was_deleted = true
-                AND episode.opr_deleted_identity_digest = $identity_digest
+        if self.driver.provider == GraphProvider.NEPTUNE:
+            receipt_node_id = f'opr-retirement-receipt:{canonical_request_id}'
+            receipts, _, _ = await query_driver.execute_query(
+                """
+                MERGE (receipt:OPRRetirementReceipt {`~id`: $receipt_node_id})
+                ON CREATE SET receipt.request_id = $retirement_request_id,
+                              receipt.episode_uuid = $uuid,
+                              receipt.group_id = $group_id,
+                              receipt.identity_digest = $identity_digest,
+                              receipt.outcome = 'pending',
+                              receipt.opr_deleted = true
+                SET receipt._opr_conditional_delete_lock = true
+                REMOVE receipt._opr_conditional_delete_lock
+                RETURN receipt.request_id = $retirement_request_id
+                       AND receipt.episode_uuid = $uuid
+                       AND receipt.group_id = $group_id
+                       AND receipt.identity_digest = $identity_digest AS bound,
+                       receipt.outcome AS outcome
+                """,
+                receipt_node_id=receipt_node_id,
+                retirement_request_id=canonical_request_id,
+                uuid=canonical_uuid,
+                group_id=group_id,
+                identity_digest=identity_digest,
             )
-            OPTIONAL MATCH (episode)-[relationship]-()
-            DELETE relationship
-            WITH DISTINCT episode, was_deleted
-            SET episode.opr_deleted = true,
-                episode.opr_deleted_group_id = $group_id,
-                episode.opr_deleted_identity_digest = $identity_digest,
-                episode.opr_generation = CASE
-                    WHEN was_deleted THEN coalesce(episode.opr_generation, 1)
-                    ELSE coalesce(episode.opr_generation, 0) + 1
-                END,
-                episode.opr_aoss_fenced = CASE
-                    WHEN was_deleted THEN coalesce(episode.opr_aoss_fenced, false)
-                    ELSE false
-                END
-            RETURN $uuid AS uuid, episode.opr_aoss_fenced AS aoss_fenced
-            """,
-            uuid=canonical_uuid,
-            group_id=group_id,
-            name=name,
-            content=content,
-            source_description=source_description,
-            identity_digest=identity_digest,
-        )
-        if not records:
-            return False
+            if not receipts or receipts[0].get('bound') is not True:
+                return None
+            receipt_outcome = receipts[0].get('outcome')
+            if receipt_outcome == 'not_applied':
+                return False
+            if receipt_outcome not in {'pending', 'retired'}:
+                return None
 
-        aoss_fenced = bool(records[0].get('aoss_fenced', False))
+            records, _, _ = await query_driver.execute_query(
+                """
+                MATCH (receipt:OPRRetirementReceipt {`~id`: $receipt_node_id})
+                SET receipt._opr_conditional_delete_lock = true
+                REMOVE receipt._opr_conditional_delete_lock
+                WITH receipt
+                WHERE receipt.request_id = $retirement_request_id
+                  AND receipt.episode_uuid = $uuid
+                  AND receipt.group_id = $group_id
+                  AND receipt.identity_digest = $identity_digest
+                  AND receipt.outcome <> 'not_applied'
+                MATCH (episode:Episodic {uuid: $uuid})
+                SET episode._opr_conditional_delete_lock = true
+                REMOVE episode._opr_conditional_delete_lock
+                WITH receipt, episode,
+                     coalesce(episode.opr_deleted, false) AS was_deleted
+                WHERE (
+                    receipt.outcome = 'pending'
+                    AND coalesce(episode.opr_deleted, false) = false
+                    AND episode.uuid = $uuid
+                    AND episode.group_id = $group_id
+                    AND episode.name = $name
+                    AND episode.content = $content
+                    AND episode.source_description = $source_description
+                ) OR (
+                    receipt.outcome = 'retired'
+                    AND coalesce(episode.opr_deleted, false) = true
+                    AND episode.opr_deleted_identity_digest = $identity_digest
+                    AND episode.opr_retirement_request_id = $retirement_request_id
+                )
+                SET receipt.outcome = 'retired',
+                    episode.opr_deleted = true,
+                    episode.opr_deleted_group_id = $group_id,
+                    episode.opr_deleted_identity_digest = $identity_digest,
+                    episode.opr_retirement_request_id = $retirement_request_id,
+                    episode.opr_generation = CASE
+                        WHEN was_deleted THEN coalesce(episode.opr_generation, 1)
+                        ELSE coalesce(episode.opr_generation, 0) + 1
+                    END,
+                    episode.opr_aoss_fenced = CASE
+                        WHEN was_deleted THEN coalesce(episode.opr_aoss_fenced, false)
+                        ELSE false
+                    END
+                RETURN receipt.outcome AS outcome,
+                       true AS applied,
+                       coalesce(episode.opr_aoss_fenced, false) AS aoss_fenced
+                """,
+                receipt_node_id=receipt_node_id,
+                retirement_request_id=canonical_request_id,
+                uuid=canonical_uuid,
+                group_id=group_id,
+                name=name,
+                content=content,
+                source_description=source_description,
+                identity_digest=identity_digest,
+            )
+            if not records:
+                decisions, _, _ = await query_driver.execute_query(
+                    """
+                    MATCH (receipt:OPRRetirementReceipt {`~id`: $receipt_node_id})
+                    SET receipt._opr_conditional_delete_lock = true
+                    REMOVE receipt._opr_conditional_delete_lock
+                    WITH receipt
+                    WHERE receipt.request_id = $retirement_request_id
+                      AND receipt.episode_uuid = $uuid
+                      AND receipt.group_id = $group_id
+                      AND receipt.identity_digest = $identity_digest
+                    SET receipt.outcome = CASE
+                        WHEN receipt.outcome = 'pending' THEN 'not_applied'
+                        ELSE receipt.outcome
+                    END
+                    RETURN receipt.outcome AS outcome
+                    """,
+                    receipt_node_id=receipt_node_id,
+                    retirement_request_id=canonical_request_id,
+                    uuid=canonical_uuid,
+                    group_id=group_id,
+                    identity_digest=identity_digest,
+                )
+                if not decisions:
+                    return None
+                decided_outcome = decisions[0].get('outcome')
+                if decided_outcome == 'not_applied':
+                    return False
+                if decided_outcome != 'retired':
+                    return None
+                aoss_fenced = False
+            else:
+                aoss_fenced = bool(records[0].get('aoss_fenced', False))
+        else:
+            records, _, _ = await query_driver.execute_query(
+                """
+            MERGE (receipt:OPRRetirementReceipt {
+                request_id: $retirement_request_id
+            })
+            ON CREATE SET receipt.episode_uuid = $uuid,
+                          receipt.group_id = $group_id,
+                          receipt.identity_digest = $identity_digest,
+                          receipt.outcome = 'pending',
+                          receipt.opr_deleted = true
+            SET receipt._opr_conditional_delete_lock = true
+            REMOVE receipt._opr_conditional_delete_lock
+            WITH receipt
+            WHERE receipt.episode_uuid = $uuid
+              AND receipt.group_id = $group_id
+              AND receipt.identity_digest = $identity_digest
+            OPTIONAL MATCH (episode:Episodic {uuid: $uuid})
+            FOREACH (_ IN CASE WHEN episode IS NULL THEN [] ELSE [1] END |
+                SET episode._opr_conditional_delete_lock = true
+            )
+            FOREACH (_ IN CASE WHEN episode IS NULL THEN [] ELSE [1] END |
+                SET episode._opr_conditional_delete_lock = NULL
+            )
+            WITH receipt, episode,
+                 coalesce(episode.opr_deleted, false) AS was_deleted,
+                 receipt.outcome <> 'not_applied' AND episode IS NOT NULL AND (
+                    (
+                        receipt.outcome = 'pending'
+                        AND coalesce(episode.opr_deleted, false) = false
+                        AND episode.uuid = $uuid
+                        AND episode.group_id = $group_id
+                        AND episode.name = $name
+                        AND episode.content = $content
+                        AND episode.source_description = $source_description
+                    ) OR (
+                        receipt.outcome = 'retired'
+                        AND coalesce(episode.opr_deleted, false) = true
+                        AND episode.opr_deleted_identity_digest = $identity_digest
+                        AND episode.opr_retirement_request_id = $retirement_request_id
+                    )
+                 ) AS can_apply
+            SET receipt.outcome = CASE
+                WHEN can_apply THEN 'retired'
+                WHEN receipt.outcome = 'pending' THEN 'not_applied'
+                ELSE receipt.outcome
+            END
+            OPTIONAL MATCH (episode)-[relationship]-()
+            FOREACH (_ IN CASE
+                WHEN can_apply AND relationship IS NOT NULL THEN [1] ELSE [] END |
+                DELETE relationship
+            )
+            FOREACH (_ IN CASE WHEN can_apply THEN [1] ELSE [] END |
+                SET episode.opr_deleted = true,
+                    episode.opr_deleted_group_id = $group_id,
+                    episode.opr_deleted_identity_digest = $identity_digest,
+                    episode.opr_retirement_request_id = $retirement_request_id,
+                    episode.opr_generation = CASE
+                        WHEN was_deleted THEN coalesce(episode.opr_generation, 1)
+                        ELSE coalesce(episode.opr_generation, 0) + 1
+                    END,
+                    episode.opr_aoss_fenced = CASE
+                        WHEN was_deleted THEN coalesce(episode.opr_aoss_fenced, false)
+                        ELSE false
+                    END
+            )
+            RETURN receipt.outcome AS outcome,
+                   can_apply AS applied,
+                   coalesce(episode.opr_aoss_fenced, false) AS aoss_fenced
+                """,
+                uuid=canonical_uuid,
+                group_id=group_id,
+                name=name,
+                content=content,
+                source_description=source_description,
+                identity_digest=identity_digest,
+                retirement_request_id=canonical_request_id,
+            )
+            if not records:
+                return None
+            outcome = records[0].get('outcome')
+            applied = bool(records[0].get('applied', False))
+            if outcome == 'not_applied':
+                return False
+            if outcome != 'retired' or not applied:
+                raise HTTPException(
+                    status_code=503,
+                    detail='episode retirement receipt is inconsistent',
+                )
+            aoss_fenced = bool(records[0].get('aoss_fenced', False))
         if self.driver.provider == GraphProvider.NEPTUNE and not aoss_fenced:
             indexed = self.driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'episode_content',
@@ -255,6 +425,9 @@ class ZepGraphiti(Graphiti):
             WITH episode
             WHERE coalesce(episode.opr_deleted, false) = true
               AND episode.opr_deleted_identity_digest = $identity_digest
+            OPTIONAL MATCH (episode)-[relationship]-()
+            DELETE relationship
+            WITH DISTINCT episode
             SET episode.opr_aoss_fenced = true,
                 episode.group_id = '__opr_deleted__',
                 episode.name = '__opr_deleted__',
@@ -273,6 +446,131 @@ class ZepGraphiti(Graphiti):
                 detail='episode tombstone finalization is not durable',
             )
         return True
+
+    async def episode_retirement_outcome(
+        self,
+        uuid: str,
+        *,
+        group_id: str,
+        retirement_request_id: str,
+    ) -> str | None:
+        """Return a durable request-bound ``retired`` or ``not_applied`` receipt.
+
+        The transient write makes this a writer-endpoint mutation query rather
+        than a potentially lagging replica read. The provider-specific receipt
+        is uniquely keyed and its terminal outcome is serialized with the
+        episode identity decision, so this is an idempotency receipt rather
+        than a generic absence check.
+        """
+        try:
+            canonical_uuid = str(UUID(uuid))
+            canonical_request_id = str(UUID(retirement_request_id))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail='episode or retirement request UUID is invalid',
+            ) from exc
+        if self.driver.provider in {GraphProvider.KUZU, GraphProvider.FALKORDB}:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    'episode retirement status requires a backend with request-receipt uniqueness'
+                ),
+            )
+        query_driver = self.driver
+        if self.driver.provider == GraphProvider.NEPTUNE:
+            receipt_node_id = f'opr-retirement-receipt:{canonical_request_id}'
+            receipts, _, _ = await query_driver.execute_query(
+                """
+                MATCH (receipt:OPRRetirementReceipt {`~id`: $receipt_node_id})
+                SET receipt._opr_conditional_delete_lock = true
+                REMOVE receipt._opr_conditional_delete_lock
+                WITH receipt
+                WHERE receipt.request_id = $retirement_request_id
+                  AND receipt.episode_uuid = $uuid
+                  AND receipt.group_id = $group_id
+                SET receipt.outcome = CASE
+                    WHEN receipt.outcome = 'pending' THEN 'not_applied'
+                    ELSE receipt.outcome
+                END
+                RETURN true AS bound,
+                       receipt.outcome AS outcome
+                """,
+                receipt_node_id=receipt_node_id,
+                uuid=canonical_uuid,
+                group_id=group_id,
+                retirement_request_id=canonical_request_id,
+            )
+            if not receipts or receipts[0].get('bound') is not True:
+                return None
+            outcome = receipts[0].get('outcome')
+            if outcome == 'not_applied':
+                return 'not_applied'
+            if outcome != 'retired':
+                return None
+            records, _, _ = await query_driver.execute_query(
+                """
+                MATCH (receipt:OPRRetirementReceipt {`~id`: $receipt_node_id})
+                SET receipt._opr_conditional_delete_lock = true
+                REMOVE receipt._opr_conditional_delete_lock
+                WITH receipt
+                WHERE receipt.request_id = $retirement_request_id
+                  AND receipt.episode_uuid = $uuid
+                  AND receipt.group_id = $group_id
+                  AND receipt.outcome = 'retired'
+                MATCH (episode:Episodic {uuid: $uuid})
+                SET episode._opr_conditional_delete_lock = true
+                REMOVE episode._opr_conditional_delete_lock
+                RETURN coalesce(episode.opr_deleted, false) = true
+                       AND episode.opr_deleted_group_id = $group_id
+                       AND episode.opr_retirement_request_id = $retirement_request_id
+                       AND coalesce(episode.opr_aoss_fenced, false) = true AS durable
+                """,
+                receipt_node_id=receipt_node_id,
+                uuid=canonical_uuid,
+                group_id=group_id,
+                retirement_request_id=canonical_request_id,
+            )
+            if records and records[0].get('durable') is True:
+                return 'retired'
+            return None
+        records, _, _ = await query_driver.execute_query(
+            """
+            MATCH (receipt:OPRRetirementReceipt {
+                request_id: $retirement_request_id
+            })
+            SET receipt._opr_conditional_delete_lock = true
+            REMOVE receipt._opr_conditional_delete_lock
+            WITH receipt
+            WHERE receipt.episode_uuid = $uuid
+              AND receipt.group_id = $group_id
+            OPTIONAL MATCH (episode:Episodic {uuid: $uuid})
+            FOREACH (_ IN CASE WHEN episode IS NULL THEN [] ELSE [1] END |
+                SET episode._opr_conditional_delete_lock = true
+            )
+            FOREACH (_ IN CASE WHEN episode IS NULL THEN [] ELSE [1] END |
+                SET episode._opr_conditional_delete_lock = NULL
+            )
+            RETURN receipt.outcome AS outcome,
+                   receipt.outcome = 'retired'
+                   AND episode IS NOT NULL
+                   AND coalesce(episode.opr_deleted, false) = true
+                   AND episode.opr_deleted_group_id = $group_id
+                   AND episode.opr_retirement_request_id = $retirement_request_id
+                   AND coalesce(episode.opr_aoss_fenced, false) = true AS durable
+            """,
+            uuid=canonical_uuid,
+            group_id=group_id,
+            retirement_request_id=canonical_request_id,
+        )
+        if not records:
+            return None
+        outcome = records[0].get('outcome')
+        if outcome == 'not_applied':
+            return 'not_applied'
+        if outcome == 'retired' and records[0].get('durable') is True:
+            return 'retired'
+        return None
 
 
 def _create_graphiti_client(settings: ZepEnvDep) -> ZepGraphiti:

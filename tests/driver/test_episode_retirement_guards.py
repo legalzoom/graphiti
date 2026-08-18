@@ -44,6 +44,8 @@ async def test_neo4j_episode_uuid_constraint_replaces_range_index_sequentially()
             ([], None, None),
             ([], None, None),
             ([{'name': 'episode_uuid_unique'}], None, None),
+            ([], None, None),
+            ([{'name': 'opr_retirement_request_id_unique'}], None, None),
         ]
     )
     executor = cast(
@@ -58,6 +60,8 @@ async def test_neo4j_episode_uuid_constraint_replaces_range_index_sequentially()
     assert queries[1] == 'DROP INDEX episode_uuid IF EXISTS'
     assert queries[2].startswith('CREATE CONSTRAINT episode_uuid_unique')
     assert "name = 'episode_uuid_unique'" in queries[3]
+    assert queries[4].startswith('CREATE CONSTRAINT opr_retirement_request_id_unique')
+    assert "name = 'opr_retirement_request_id_unique'" in queries[5]
 
 
 @pytest.mark.asyncio

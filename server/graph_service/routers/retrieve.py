@@ -74,7 +74,7 @@ async def get_episodes(
     return episodes
 
 
-@router.get('/episodes/{group_id}/reconciliation/v2', status_code=status.HTTP_200_OK)
+@router.get('/episodes/{group_id}/reconciliation/v3', status_code=status.HTTP_200_OK)
 async def get_episodes_for_reconciliation(
     group_id: str,
     last_n: int,

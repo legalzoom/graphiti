@@ -1,6 +1,8 @@
+import json
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -18,6 +20,7 @@ from graphiti_core.models.nodes.node_db_queries import (
 )
 from graphiti_core.nodes import EpisodicNode
 from pydantic import SecretStr
+from starlette.responses import JSONResponse
 
 from graph_service.config import Settings
 from graph_service.dto import DeleteEpisodeIfMatchRequest
@@ -25,11 +28,15 @@ from graph_service.protocol import (
     GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE,
     GRAPHITI_RECONCILIATION_PROTOCOL,
 )
-from graph_service.routers.ingest import delete_episode_if_matches
+from graph_service.routers.ingest import (
+    delete_episode_if_matches,
+    get_episode_retirement_status,
+)
 from graph_service.routers.retrieve import get_episodes, get_episodes_for_reconciliation
 from graph_service.zep_graphiti import ZepGraphiti, _conditional_episode_identity_digest
 
 EPISODE_UUID = '11111111-1111-4111-8111-111111111111'
+RETIREMENT_REQUEST_ID = '22222222-2222-4222-8222-222222222222'
 
 
 def test_privileged_listing_and_retirement_tokens_must_be_distinct():
@@ -247,7 +254,17 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
         provider=GraphProvider.NEO4J,
         execute_query=AsyncMock(
             side_effect=[
-                ([{'uuid': EPISODE_UUID, 'aoss_fenced': False}], None, None),
+                (
+                    [
+                        {
+                            'outcome': 'retired',
+                            'applied': True,
+                            'aoss_fenced': False,
+                        }
+                    ],
+                    None,
+                    None,
+                ),
                 ([{'uuid': EPISODE_UUID}], None, None),
             ]
         ),
@@ -261,6 +278,7 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
         name='curated:test.md',
         content='stored content',
         source_description='publish',
+        retirement_request_id=RETIREMENT_REQUEST_ID,
     )
 
     assert deleted is True
@@ -271,14 +289,16 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
     assert query.index('SET episode._opr_conditional_delete_lock') < query.index(
         'episode.name = $name'
     )
-    assert 'REMOVE episode._opr_conditional_delete_lock' in query
+    assert 'SET episode._opr_conditional_delete_lock = NULL' in query
+    assert 'MERGE (receipt:OPRRetirementReceipt' in query
+    assert "THEN 'not_applied'" in query
     assert 'episode.uuid = $uuid' in query
     assert 'episode.group_id = $group_id' in query
     assert 'episode.name = $name' in query
     assert 'episode.content = $content' in query
     assert 'episode.source_description = $source_description' in query
     assert 'coalesce(episode.opr_deleted, false) AS was_deleted' in query
-    assert 'was_deleted = false' in query
+    assert 'coalesce(episode.opr_deleted, false) = false' in query
     assert 'episode.opr_deleted_identity_digest = $identity_digest' in query
     assert 'DELETE relationship' in query
     assert 'episode.opr_deleted = true' in query
@@ -297,6 +317,7 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
             'stored content',
             'publish',
         ),
+        'retirement_request_id': RETIREMENT_REQUEST_ID,
     }
     finalize_query = final_call.args[0]
     assert 'episode.opr_deleted_identity_digest = $identity_digest' in finalize_query
@@ -309,7 +330,19 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
 async def test_conditional_delete_returns_false_on_identity_mismatch():
     driver = SimpleNamespace(
         provider=GraphProvider.NEO4J,
-        execute_query=AsyncMock(return_value=([], None, None)),
+        execute_query=AsyncMock(
+            return_value=(
+                [
+                    {
+                        'outcome': 'not_applied',
+                        'applied': False,
+                        'aoss_fenced': False,
+                    }
+                ],
+                None,
+                None,
+            )
+        ),
     )
     service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
 
@@ -320,9 +353,13 @@ async def test_conditional_delete_returns_false_on_identity_mismatch():
         name='curated:test.md',
         content='changed content',
         source_description='publish',
+        retirement_request_id=RETIREMENT_REQUEST_ID,
     )
 
     assert deleted is False
+    query = driver.execute_query.await_args.args[0]
+    assert 'MERGE (receipt:OPRRetirementReceipt' in query
+    assert "WHEN receipt.outcome = 'pending' THEN 'not_applied'" in query
 
 
 @pytest.mark.asyncio
@@ -341,6 +378,7 @@ async def test_conditional_delete_rejects_malformed_uuid_before_query():
             name='curated:test.md',
             content='stored content',
             source_description='publish',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
         )
 
     assert exc_info.value.status_code == 422
@@ -352,7 +390,14 @@ async def test_conditional_delete_requires_durable_neptune_search_tombstone():
     driver = SimpleNamespace(
         provider=GraphProvider.NEPTUNE,
         execute_query=AsyncMock(
-            return_value=([{'uuid': EPISODE_UUID, 'aoss_fenced': False}], None, None)
+            side_effect=[
+                ([{'bound': True, 'outcome': 'pending'}], None, None),
+                (
+                    [{'outcome': 'retired', 'applied': True, 'aoss_fenced': False}],
+                    None,
+                    None,
+                ),
+            ]
         ),
         save_to_aoss=MagicMock(return_value=0),
     )
@@ -366,10 +411,18 @@ async def test_conditional_delete_requires_durable_neptune_search_tombstone():
             name='curated:test.md',
             content='stored content',
             source_description='publish',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
         )
 
     assert exc_info.value.status_code == 503
-    assert driver.execute_query.await_count == 1
+    assert driver.execute_query.await_count == 2
+    admission_query = driver.execute_query.await_args_list[0].args[0]
+    mutation_query = driver.execute_query.await_args_list[1].args[0]
+    assert 'FOREACH' not in admission_query + mutation_query
+    assert '{`~id`: $receipt_node_id}' in admission_query
+    assert driver.execute_query.await_args_list[0].kwargs['receipt_node_id'] == (
+        f'opr-retirement-receipt:{RETIREMENT_REQUEST_ID}'
+    )
     driver.save_to_aoss.assert_called_once_with(
         'episode_content',
         [
@@ -391,7 +444,18 @@ async def test_conditional_delete_retries_pending_neptune_search_fence_then_scru
         provider=GraphProvider.NEPTUNE,
         execute_query=AsyncMock(
             side_effect=[
-                ([{'uuid': EPISODE_UUID, 'aoss_fenced': False}], None, None),
+                ([{'bound': True, 'outcome': 'pending'}], None, None),
+                (
+                    [
+                        {
+                            'outcome': 'retired',
+                            'applied': True,
+                            'aoss_fenced': False,
+                        }
+                    ],
+                    None,
+                    None,
+                ),
                 ([{'uuid': EPISODE_UUID}], None, None),
             ]
         ),
@@ -406,10 +470,70 @@ async def test_conditional_delete_retries_pending_neptune_search_fence_then_scru
         name='curated:test.md',
         content='stored content',
         source_description='publish',
+        retirement_request_id=RETIREMENT_REQUEST_ID,
     )
 
-    assert driver.execute_query.await_count == 2
-    assert driver.execute_query.await_args_list[1].kwargs['entity_edges'] == ''
+    assert driver.execute_query.await_count == 3
+    assert driver.execute_query.await_args_list[2].kwargs['entity_edges'] == ''
+
+
+@pytest.mark.asyncio
+async def test_neptune_persists_not_applied_receipt_without_foreach():
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEPTUNE,
+        execute_query=AsyncMock(
+            side_effect=[
+                ([{'bound': True, 'outcome': 'pending'}], None, None),
+                ([], None, None),
+                ([{'outcome': 'not_applied'}], None, None),
+            ]
+        ),
+    )
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    assert (
+        await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            name='curated:test.md',
+            content='changed content',
+            source_description='publish',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+        is False
+    )
+    assert driver.execute_query.await_count == 3
+    assert all('FOREACH' not in call.args[0] for call in driver.execute_query.await_args_list)
+    assert all(
+        call.kwargs['receipt_node_id'] == f'opr-retirement-receipt:{RETIREMENT_REQUEST_ID}'
+        for call in driver.execute_query.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_neptune_receipt_binding_conflict_is_not_not_applied():
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEPTUNE,
+        execute_query=AsyncMock(
+            return_value=([{'bound': False, 'outcome': 'pending'}], None, None)
+        ),
+    )
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    assert (
+        await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            name='curated:test.md',
+            content='stored content',
+            source_description='publish',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+        is None
+    )
+    assert driver.execute_query.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -425,6 +549,7 @@ async def test_conditional_delete_rejects_kuzu_before_query():
             name='curated:test.md',
             content='stored content',
             source_description='publish',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
         )
 
     assert exc_info.value.status_code == 501
@@ -432,34 +557,26 @@ async def test_conditional_delete_rejects_kuzu_before_query():
 
 
 @pytest.mark.asyncio
-async def test_conditional_delete_routes_falkor_to_requested_group_graph():
-    group_driver = SimpleNamespace(
-        execute_query=AsyncMock(
-            side_effect=[
-                ([{'uuid': EPISODE_UUID, 'aoss_fenced': False}], None, None),
-                ([{'uuid': EPISODE_UUID}], None, None),
-            ]
-        )
-    )
+async def test_conditional_delete_rejects_falkor_without_receipt_uniqueness():
     driver = SimpleNamespace(
         provider=GraphProvider.FALKORDB,
-        with_database=MagicMock(return_value=group_driver),
         execute_query=AsyncMock(),
     )
     service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
 
-    assert await ZepGraphiti.delete_episodic_node_if_matches(
-        service,
-        EPISODE_UUID,
-        group_id='opr',
-        name='curated:test.md',
-        content='stored content',
-        source_description='publish',
-    )
+    with pytest.raises(HTTPException) as exc_info:
+        await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            name='curated:test.md',
+            content='stored content',
+            source_description='publish',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
 
-    driver.with_database.assert_called_once_with('opr')
+    assert exc_info.value.status_code == 501
     driver.execute_query.assert_not_awaited()
-    assert group_driver.execute_query.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -471,6 +588,48 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
         name='curated:test.md',
         content='stored content',
         source_description='publish',
+        retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
+    )
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr('graph_service.routers.ingest.version', lambda _name: '0.29.4')
+        response = cast(
+            JSONResponse,
+            await delete_episode_if_matches(
+                'episode-id',
+                request,
+                graphiti,
+                settings,
+                x_opr_retirement_token='retire-secret',
+                x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+            ),
+        )
+
+    assert response.status_code == 412
+    assert json.loads(bytes(response.body)) == {
+        'message': 'Episode identity precondition failed',
+        'success': False,
+        'outcome': 'not_applied',
+        'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
+        'graphiti_core_version': '0.29.4',
+        'retirement_request_id': RETIREMENT_REQUEST_ID,
+    }
+
+
+@pytest.mark.asyncio
+async def test_conditional_delete_route_rejects_receipt_binding_conflict():
+    graphiti = MagicMock()
+    graphiti.delete_episodic_node_if_matches = AsyncMock(return_value=None)
+    request = DeleteEpisodeIfMatchRequest(
+        group_id='opr',
+        name='curated:test.md',
+        content='stored content',
+        source_description='publish',
+        retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )
     settings = cast(
         Settings,
@@ -479,7 +638,7 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
 
     with pytest.raises(HTTPException) as exc_info:
         await delete_episode_if_matches(
-            'episode-id',
+            EPISODE_UUID,
             request,
             graphiti,
             settings,
@@ -487,7 +646,7 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
         )
 
-    assert exc_info.value.status_code == 412
+    assert exc_info.value.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -499,6 +658,7 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
         name='curated:test.md',
         content='stored content',
         source_description='publish',
+        retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )
     settings = cast(
         Settings,
@@ -519,8 +679,10 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
     assert result == {
         'message': 'Episode conditionally deleted',
         'success': True,
+        'outcome': 'retired',
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': '0.29.4',
+        'retirement_request_id': RETIREMENT_REQUEST_ID,
     }
     graphiti.delete_episodic_node_if_matches.assert_awaited_once_with(
         'episode-id',
@@ -528,6 +690,7 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
         name='curated:test.md',
         content='stored content',
         source_description='publish',
+        retirement_request_id=RETIREMENT_REQUEST_ID,
     )
 
 
@@ -553,6 +716,7 @@ async def test_conditional_delete_requires_token_and_exact_operation_scope(
         name='curated:test.md',
         content='stored content',
         source_description='publish',
+        retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )
     settings = cast(
         Settings,
@@ -582,6 +746,7 @@ async def test_conditional_delete_is_bound_to_opr_group():
         name='curated:test.md',
         content='stored content',
         source_description='publish',
+        retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
     )
     settings = cast(
         Settings,
@@ -600,3 +765,173 @@ async def test_conditional_delete_is_bound_to_opr_group():
 
     assert exc_info.value.status_code == 403
     graphiti.delete_episodic_node_if_matches.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retirement_status_is_bound_to_matching_durable_request():
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEO4J,
+        execute_query=AsyncMock(
+            return_value=([{'outcome': 'retired', 'durable': True}], None, None)
+        ),
+    )
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    assert (
+        await ZepGraphiti.episode_retirement_outcome(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+        == 'retired'
+    )
+
+    query = driver.execute_query.await_args.args[0]
+    assert query.index('SET episode._opr_conditional_delete_lock') < query.index(
+        'episode.opr_retirement_request_id = $retirement_request_id'
+    )
+    assert 'coalesce(episode.opr_aoss_fenced, false) = true' in query
+    assert driver.execute_query.await_args.kwargs == {
+        'uuid': EPISODE_UUID,
+        'group_id': 'opr',
+        'retirement_request_id': RETIREMENT_REQUEST_ID,
+    }
+
+
+@pytest.mark.asyncio
+async def test_neptune_retirement_status_uses_unique_receipt_id_without_foreach():
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEPTUNE,
+        execute_query=AsyncMock(
+            side_effect=[
+                ([{'bound': True, 'outcome': 'retired'}], None, None),
+                ([{'durable': True}], None, None),
+            ]
+        ),
+    )
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    assert (
+        await ZepGraphiti.episode_retirement_outcome(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+        == 'retired'
+    )
+    assert driver.execute_query.await_count == 2
+    assert all('FOREACH' not in call.args[0] for call in driver.execute_query.await_args_list)
+    assert all(
+        call.kwargs['receipt_node_id'] == f'opr-retirement-receipt:{RETIREMENT_REQUEST_ID}'
+        for call in driver.execute_query.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_neptune_retirement_status_cancels_crashed_pending_admission():
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEPTUNE,
+        execute_query=AsyncMock(
+            return_value=([{'bound': True, 'outcome': 'not_applied'}], None, None)
+        ),
+    )
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    assert (
+        await ZepGraphiti.episode_retirement_outcome(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+        == 'not_applied'
+    )
+    query = driver.execute_query.await_args.args[0]
+    assert "WHEN receipt.outcome = 'pending' THEN 'not_applied'" in query
+    assert query.index('SET receipt._opr_conditional_delete_lock') < query.index(
+        "WHEN receipt.outcome = 'pending' THEN 'not_applied'"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('provider', [GraphProvider.KUZU, GraphProvider.FALKORDB])
+async def test_retirement_status_rejects_backend_without_receipt_uniqueness(
+    provider: GraphProvider,
+):
+    driver = SimpleNamespace(provider=provider, execute_query=AsyncMock())
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await ZepGraphiti.episode_retirement_outcome(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+
+    assert exc_info.value.status_code == 501
+    driver.execute_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retirement_status_route_returns_request_bound_receipt():
+    graphiti = MagicMock()
+    graphiti.episode_retirement_outcome = AsyncMock(return_value='retired')
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr('graph_service.routers.ingest.version', lambda _name: '0.29.4')
+        result = await get_episode_retirement_status(
+            EPISODE_UUID,
+            RETIREMENT_REQUEST_ID,
+            'opr',
+            graphiti,
+            settings,
+            x_opr_retirement_token='retire-secret',
+            x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+        )
+
+    assert result == {
+        'message': 'Episode retirement outcome is durable',
+        'success': True,
+        'outcome': 'retired',
+        'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
+        'graphiti_core_version': '0.29.4',
+        'retirement_request_id': RETIREMENT_REQUEST_ID,
+    }
+    graphiti.episode_retirement_outcome.assert_awaited_once_with(
+        EPISODE_UUID,
+        group_id='opr',
+        retirement_request_id=RETIREMENT_REQUEST_ID,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retirement_status_route_returns_durable_not_applied_receipt():
+    graphiti = MagicMock()
+    graphiti.episode_retirement_outcome = AsyncMock(return_value='not_applied')
+    settings = cast(
+        Settings,
+        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr('graph_service.routers.ingest.version', lambda _name: '0.29.4')
+        result = await get_episode_retirement_status(
+            EPISODE_UUID,
+            RETIREMENT_REQUEST_ID,
+            'opr',
+            graphiti,
+            settings,
+            x_opr_retirement_token='retire-secret',
+            x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
+        )
+
+    assert result['success'] is False
+    assert result['outcome'] == 'not_applied'
+    assert result['retirement_request_id'] == RETIREMENT_REQUEST_ID
