@@ -17,6 +17,7 @@ from graph_service.protocol import (
     GRAPHITI_RECONCILIATION_PROTOCOL,
     bearer_token_matches,
     reconciliation_token_matches,
+    writer_fleet_epoch_sha256,
 )
 from graph_service.zep_graphiti import ZepGraphitiDep, get_fact_result_from_edge
 
@@ -40,11 +41,17 @@ def _authorize_opr_read(
 def _authorize_reconciliation_listing(
     settings: ZepEnvDep,
     supplied_token: str | None,
+    supplied_writer_fleet_epoch: str | None,
     group_id: str,
 ) -> None:
     expected_token = settings.opr_reconciliation_token.get_secret_value()
-    if group_id != GRAPHITI_RECONCILIATION_GROUP_ID or not reconciliation_token_matches(
-        expected_token, supplied_token
+    expected_writer_fleet_epoch = settings.opr_writer_fleet_epoch.get_secret_value()
+    if (
+        group_id != GRAPHITI_RECONCILIATION_GROUP_ID
+        or not reconciliation_token_matches(expected_token, supplied_token)
+        or not reconciliation_token_matches(
+            expected_writer_fleet_epoch, supplied_writer_fleet_epoch
+        )
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -105,13 +112,14 @@ async def get_episodes(
     return episodes
 
 
-@router.get('/episodes/{group_id}/reconciliation/v4', status_code=status.HTTP_200_OK)
+@router.get('/episodes/{group_id}/reconciliation/v5', status_code=status.HTTP_200_OK)
 async def get_episodes_for_reconciliation(
     group_id: str,
     last_n: int,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
     x_opr_reconciliation_token: Annotated[str | None, Header()] = None,
+    x_opr_writer_fleet_epoch: Annotated[str | None, Header()] = None,
 ):
     """Return the privileged ledger with an in-band capability attestation.
 
@@ -120,11 +128,19 @@ async def get_episodes_for_reconciliation(
     exact listing response, so a load balancer cannot split capability proof
     and destructive audit across different pods.
     """
-    _authorize_reconciliation_listing(settings, x_opr_reconciliation_token, group_id)
+    _authorize_reconciliation_listing(
+        settings,
+        x_opr_reconciliation_token,
+        x_opr_writer_fleet_epoch,
+        group_id,
+    )
     episodes = await graphiti.retrieve_episodes_for_reconciliation(group_id, last_n)
     return {
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': version('graphiti-core'),
+        'writer_fleet_epoch_sha256': writer_fleet_epoch_sha256(
+            settings.opr_writer_fleet_epoch.get_secret_value()
+        ),
         'episodes': episodes,
     }
 

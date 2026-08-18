@@ -39,6 +39,8 @@ from graph_service.zep_graphiti import ZepGraphiti, _conditional_episode_identit
 
 EPISODE_UUID = '11111111-1111-4111-8111-111111111111'
 RETIREMENT_REQUEST_ID = '22222222-2222-4222-8222-222222222222'
+WRITER_FLEET_EPOCH = 'writer-fleet-epoch-secret-0123456789abcdef'
+WRITER_FLEET_EPOCH_SHA256 = hashlib.sha256(WRITER_FLEET_EPOCH.encode()).hexdigest()
 
 
 def test_privileged_listing_and_retirement_tokens_must_be_distinct():
@@ -70,7 +72,10 @@ async def test_dedicated_reconciliation_listing_attests_same_response(monkeypatc
     )
     settings = cast(
         Settings,
-        SimpleNamespace(opr_reconciliation_token=SecretStr('reconcile-secret')),
+        SimpleNamespace(
+            opr_reconciliation_token=SecretStr('reconcile-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
     monkeypatch.setattr('graph_service.routers.retrieve.version', lambda _name: '0.29.4')
 
@@ -80,11 +85,13 @@ async def test_dedicated_reconciliation_listing_attests_same_response(monkeypatc
         graphiti,
         settings,
         x_opr_reconciliation_token='reconcile-secret',
+        x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
     )
 
     assert result == {
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': '0.29.4',
+        'writer_fleet_epoch_sha256': WRITER_FLEET_EPOCH_SHA256,
         'episodes': [episode],
     }
 
@@ -98,7 +105,10 @@ async def test_reconciliation_listing_is_bound_to_opr_group():
     )
     settings = cast(
         Settings,
-        SimpleNamespace(opr_reconciliation_token=SecretStr('reconcile-secret')),
+        SimpleNamespace(
+            opr_reconciliation_token=SecretStr('reconcile-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -108,6 +118,39 @@ async def test_reconciliation_listing_is_bound_to_opr_group():
             graphiti,
             settings,
             x_opr_reconciliation_token='reconcile-secret',
+            x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
+        )
+
+    assert exc_info.value.status_code == 403
+    reconciliation_listing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('writer_fleet_epoch', [None, '', 'wrong-epoch'])
+async def test_reconciliation_listing_requires_exact_writer_fleet_epoch(
+    writer_fleet_epoch: str | None,
+):
+    reconciliation_listing = AsyncMock(return_value=[])
+    graphiti = cast(
+        ZepGraphiti,
+        SimpleNamespace(retrieve_episodes_for_reconciliation=reconciliation_listing),
+    )
+    settings = cast(
+        Settings,
+        SimpleNamespace(
+            opr_reconciliation_token=SecretStr('reconcile-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_episodes_for_reconciliation(
+            'opr',
+            20,
+            graphiti,
+            settings,
+            x_opr_reconciliation_token='reconcile-secret',
+            x_opr_writer_fleet_epoch=writer_fleet_epoch,
         )
 
     assert exc_info.value.status_code == 403
@@ -591,8 +634,8 @@ async def test_neptune_receipt_binding_conflict_is_not_not_applied():
 @pytest.mark.parametrize('provider', [GraphProvider.NEO4J, GraphProvider.NEPTUNE])
 @pytest.mark.parametrize(
     'legacy_protocol',
-    [None, 'opr.graphiti.reconciliation/v3'],
-    ids=['missing-protocol', 'v3-protocol'],
+    [None, 'opr.graphiti.reconciliation/v3', 'opr.graphiti.reconciliation/v4'],
+    ids=['missing-protocol', 'v3-protocol', 'v4-protocol'],
 )
 async def test_conditional_delete_rejects_legacy_receipt_protocol(
     provider: GraphProvider,
@@ -692,7 +735,10 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
     )
     settings = cast(
         Settings,
-        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+        SimpleNamespace(
+            opr_retirement_token=SecretStr('retire-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -705,6 +751,7 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
                 graphiti,
                 settings,
                 x_opr_retirement_token='retire-secret',
+                x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
                 x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
             ),
         )
@@ -716,6 +763,7 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
         'outcome': 'not_applied',
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': '0.29.4',
+        'writer_fleet_epoch_sha256': WRITER_FLEET_EPOCH_SHA256,
         'retirement_request_id': RETIREMENT_REQUEST_ID,
     }
 
@@ -734,7 +782,10 @@ async def test_conditional_delete_route_rejects_receipt_binding_conflict():
     )
     settings = cast(
         Settings,
-        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+        SimpleNamespace(
+            opr_retirement_token=SecretStr('retire-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -744,6 +795,7 @@ async def test_conditional_delete_route_rejects_receipt_binding_conflict():
             graphiti,
             settings,
             x_opr_retirement_token='retire-secret',
+            x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
         )
 
@@ -764,7 +816,10 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
     )
     settings = cast(
         Settings,
-        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+        SimpleNamespace(
+            opr_retirement_token=SecretStr('retire-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -775,6 +830,7 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
             graphiti,
             settings,
             x_opr_retirement_token='retire-secret',
+            x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
         )
 
@@ -784,6 +840,7 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
         'outcome': 'retired',
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': '0.29.4',
+        'writer_fleet_epoch_sha256': WRITER_FLEET_EPOCH_SHA256,
         'retirement_request_id': RETIREMENT_REQUEST_ID,
     }
     graphiti.delete_episodic_node_if_matches.assert_awaited_once_with(
@@ -824,7 +881,10 @@ async def test_conditional_delete_requires_token_and_exact_operation_scope(
     )
     settings = cast(
         Settings,
-        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+        SimpleNamespace(
+            opr_retirement_token=SecretStr('retire-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -834,7 +894,46 @@ async def test_conditional_delete_requires_token_and_exact_operation_scope(
             graphiti,
             settings,
             x_opr_retirement_token=token,
+            x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=operation,
+        )
+
+    assert exc_info.value.status_code == 403
+    graphiti.delete_episodic_node_if_matches.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('writer_fleet_epoch', [None, '', 'wrong-epoch'])
+async def test_conditional_delete_requires_exact_writer_fleet_epoch(
+    writer_fleet_epoch: str | None,
+):
+    graphiti = MagicMock()
+    graphiti.delete_episodic_node_if_matches = AsyncMock(return_value=True)
+    request = DeleteEpisodeIfMatchRequest(
+        group_id='opr',
+        name='curated:test.md',
+        content='stored content',
+        source=EpisodeType.message,
+        source_description='publish',
+        retirement_request_id=UUID(RETIREMENT_REQUEST_ID),
+    )
+    settings = cast(
+        Settings,
+        SimpleNamespace(
+            opr_retirement_token=SecretStr('retire-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await delete_episode_if_matches(
+            EPISODE_UUID,
+            request,
+            graphiti,
+            settings,
+            x_opr_retirement_token='retire-secret',
+            x_opr_writer_fleet_epoch=writer_fleet_epoch,
+            x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
         )
 
     assert exc_info.value.status_code == 403
@@ -855,7 +954,10 @@ async def test_conditional_delete_is_bound_to_opr_group():
     )
     settings = cast(
         Settings,
-        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+        SimpleNamespace(
+            opr_retirement_token=SecretStr('retire-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -865,6 +967,7 @@ async def test_conditional_delete_is_bound_to_opr_group():
             graphiti,
             settings,
             x_opr_retirement_token='retire-secret',
+            x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
         )
 
@@ -1007,8 +1110,8 @@ async def test_neptune_retirement_status_cancels_pending_only_when_episode_is_ab
 @pytest.mark.parametrize('provider', [GraphProvider.NEO4J, GraphProvider.NEPTUNE])
 @pytest.mark.parametrize(
     'legacy_protocol',
-    [None, 'opr.graphiti.reconciliation/v3'],
-    ids=['missing-protocol', 'v3-protocol'],
+    [None, 'opr.graphiti.reconciliation/v3', 'opr.graphiti.reconciliation/v4'],
+    ids=['missing-protocol', 'v3-protocol', 'v4-protocol'],
 )
 async def test_retirement_status_rejects_legacy_receipt_protocol_before_resolution(
     provider: GraphProvider,
@@ -1072,7 +1175,10 @@ async def test_retirement_status_route_returns_request_bound_receipt():
     graphiti.episode_retirement_outcome = AsyncMock(return_value='retired')
     settings = cast(
         Settings,
-        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+        SimpleNamespace(
+            opr_retirement_token=SecretStr('retire-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -1084,6 +1190,7 @@ async def test_retirement_status_route_returns_request_bound_receipt():
             graphiti,
             settings,
             x_opr_retirement_token='retire-secret',
+            x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
         )
 
@@ -1093,6 +1200,7 @@ async def test_retirement_status_route_returns_request_bound_receipt():
         'outcome': 'retired',
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': '0.29.4',
+        'writer_fleet_epoch_sha256': WRITER_FLEET_EPOCH_SHA256,
         'retirement_request_id': RETIREMENT_REQUEST_ID,
     }
     graphiti.episode_retirement_outcome.assert_awaited_once_with(
@@ -1108,7 +1216,10 @@ async def test_retirement_status_route_returns_durable_not_applied_receipt():
     graphiti.episode_retirement_outcome = AsyncMock(return_value='not_applied')
     settings = cast(
         Settings,
-        SimpleNamespace(opr_retirement_token=SecretStr('retire-secret')),
+        SimpleNamespace(
+            opr_retirement_token=SecretStr('retire-secret'),
+            opr_writer_fleet_epoch=SecretStr(WRITER_FLEET_EPOCH),
+        ),
     )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
@@ -1120,9 +1231,11 @@ async def test_retirement_status_route_returns_durable_not_applied_receipt():
             graphiti,
             settings,
             x_opr_retirement_token='retire-secret',
+            x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
         )
 
     assert result['success'] is False
     assert result['outcome'] == 'not_applied'
+    assert result['writer_fleet_epoch_sha256'] == WRITER_FLEET_EPOCH_SHA256
     assert result['retirement_request_id'] == RETIREMENT_REQUEST_ID

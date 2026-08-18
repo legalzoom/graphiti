@@ -27,6 +27,7 @@ from graph_service.protocol import (
     GRAPHITI_RECONCILIATION_PROTOCOL,
     bearer_token_matches,
     reconciliation_token_matches,
+    writer_fleet_epoch_sha256,
 )
 from graph_service.zep_graphiti import ZepGraphitiDep
 
@@ -58,13 +59,21 @@ def _authorize_graphiti_admin(settings: ZepEnvDep, authorization: str | None) ->
 def _authorize_episode_retirement(
     settings: ZepEnvDep,
     supplied_token: str | None,
+    supplied_writer_fleet_epoch: str | None,
     operation: str | None,
     group_id: str,
 ) -> None:
     expected_token = settings.opr_retirement_token.get_secret_value()
-    if not reconciliation_token_matches(expected_token, supplied_token) or (
-        operation != GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE
-        or group_id != GRAPHITI_RECONCILIATION_GROUP_ID
+    expected_writer_fleet_epoch = settings.opr_writer_fleet_epoch.get_secret_value()
+    if (
+        not reconciliation_token_matches(expected_token, supplied_token)
+        or not reconciliation_token_matches(
+            expected_writer_fleet_epoch, supplied_writer_fleet_epoch
+        )
+        or (
+            operation != GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE
+            or group_id != GRAPHITI_RECONCILIATION_GROUP_ID
+        )
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -223,7 +232,7 @@ async def delete_episode(
         )
     # Keep the group check and deletion in one mutation query. A separate
     # lookup followed by the legacy UUID-only delete would reintroduce the
-    # exact TOCTOU window that the v4 OPR retirement protocol closes.
+    # exact TOCTOU window that the v5 OPR retirement protocol closes.
     lock_clause = """
         SET episode._opr_conditional_delete_lock = true
         REMOVE episode._opr_conditional_delete_lock
@@ -251,18 +260,20 @@ async def delete_episode(
     return Result(message='Episode deleted', success=True)
 
 
-@router.delete('/episode/{uuid}/retire/v4', status_code=status.HTTP_200_OK)
+@router.delete('/episode/{uuid}/retire/v5', status_code=status.HTTP_200_OK)
 async def delete_episode_if_matches(
     uuid: str,
     request: DeleteEpisodeIfMatchRequest,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
     x_opr_retirement_token: Annotated[str | None, Header()] = None,
+    x_opr_writer_fleet_epoch: Annotated[str | None, Header()] = None,
     x_opr_reconciliation_operation: Annotated[str | None, Header()] = None,
 ):
     _authorize_episode_retirement(
         settings,
         x_opr_retirement_token,
+        x_opr_writer_fleet_epoch,
         x_opr_reconciliation_operation,
         request.group_id,
     )
@@ -289,6 +300,9 @@ async def delete_episode_if_matches(
                 'outcome': 'not_applied',
                 'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
                 'graphiti_core_version': version('graphiti-core'),
+                'writer_fleet_epoch_sha256': writer_fleet_epoch_sha256(
+                    settings.opr_writer_fleet_epoch.get_secret_value()
+                ),
                 'retirement_request_id': str(request.retirement_request_id),
             },
         )
@@ -298,11 +312,14 @@ async def delete_episode_if_matches(
         'outcome': 'retired',
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': version('graphiti-core'),
+        'writer_fleet_epoch_sha256': writer_fleet_epoch_sha256(
+            settings.opr_writer_fleet_epoch.get_secret_value()
+        ),
         'retirement_request_id': str(request.retirement_request_id),
     }
 
 
-@router.post('/episode/{uuid}/retirement/v4', status_code=status.HTTP_200_OK)
+@router.post('/episode/{uuid}/retirement/v5', status_code=status.HTTP_200_OK)
 async def get_episode_retirement_status(
     uuid: str,
     retirement_request_id: str,
@@ -310,11 +327,13 @@ async def get_episode_retirement_status(
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
     x_opr_retirement_token: Annotated[str | None, Header()] = None,
+    x_opr_writer_fleet_epoch: Annotated[str | None, Header()] = None,
     x_opr_reconciliation_operation: Annotated[str | None, Header()] = None,
 ):
     _authorize_episode_retirement(
         settings,
         x_opr_retirement_token,
+        x_opr_writer_fleet_epoch,
         x_opr_reconciliation_operation,
         group_id,
     )
@@ -334,6 +353,9 @@ async def get_episode_retirement_status(
         'outcome': outcome,
         'reconciliation_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
         'graphiti_core_version': version('graphiti-core'),
+        'writer_fleet_epoch_sha256': writer_fleet_epoch_sha256(
+            settings.opr_writer_fleet_epoch.get_secret_value()
+        ),
         'retirement_request_id': retirement_request_id,
     }
 

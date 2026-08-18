@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     opr_write_token: SecretStr = SecretStr('')
     opr_reconciliation_token: SecretStr = SecretStr('')
     opr_retirement_token: SecretStr = SecretStr('')
+    opr_writer_fleet_epoch: SecretStr = SecretStr('')
     graphiti_admin_token: SecretStr = SecretStr('')
     graphiti_admin_clear_enabled: bool = False
 
@@ -40,11 +41,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode='after')
     def require_distinct_privileged_tokens(self):
+        writer_fleet_epoch = self.opr_writer_fleet_epoch.get_secret_value()
+        if writer_fleet_epoch and len(writer_fleet_epoch.encode('utf-8')) < 32:
+            raise ValueError('OPR_WRITER_FLEET_EPOCH must be at least 32 bytes')
         tokens = {
             'OPR_READ_TOKEN': self.opr_read_token.get_secret_value(),
             'OPR_WRITE_TOKEN': self.opr_write_token.get_secret_value(),
             'OPR_RECONCILIATION_TOKEN': self.opr_reconciliation_token.get_secret_value(),
             'OPR_RETIREMENT_TOKEN': self.opr_retirement_token.get_secret_value(),
+            'OPR_WRITER_FLEET_EPOCH': writer_fleet_epoch,
             'GRAPHITI_ADMIN_TOKEN': self.graphiti_admin_token.get_secret_value(),
         }
         configured = [(name, value) for name, value in tokens.items() if value]

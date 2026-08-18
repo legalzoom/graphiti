@@ -30,6 +30,7 @@ def _settings(
     admin_token: str = 'admin-secret',
     reconciliation_token: str = 'reconcile-secret',
     retirement_token: str = 'retire-secret',
+    writer_fleet_epoch: str = 'writer-fleet-epoch-secret-0123456789abcdef',
     clear_enabled: bool = False,
 ) -> Settings:
     return cast(
@@ -40,6 +41,7 @@ def _settings(
             graphiti_admin_token=SecretStr(admin_token),
             opr_reconciliation_token=SecretStr(reconciliation_token),
             opr_retirement_token=SecretStr(retirement_token),
+            opr_writer_fleet_epoch=SecretStr(writer_fleet_epoch),
             graphiti_admin_clear_enabled=clear_enabled,
         ),
     )
@@ -56,12 +58,17 @@ def _bearer(token: str) -> str:
         ('opr_read_token', 'opr_reconciliation_token'),
         ('opr_read_token', 'opr_retirement_token'),
         ('opr_read_token', 'graphiti_admin_token'),
+        ('opr_read_token', 'opr_writer_fleet_epoch'),
         ('opr_write_token', 'opr_reconciliation_token'),
         ('opr_write_token', 'opr_retirement_token'),
         ('opr_write_token', 'graphiti_admin_token'),
+        ('opr_write_token', 'opr_writer_fleet_epoch'),
         ('opr_reconciliation_token', 'opr_retirement_token'),
         ('opr_reconciliation_token', 'graphiti_admin_token'),
+        ('opr_reconciliation_token', 'opr_writer_fleet_epoch'),
         ('opr_retirement_token', 'graphiti_admin_token'),
+        ('opr_retirement_token', 'opr_writer_fleet_epoch'),
+        ('graphiti_admin_token', 'opr_writer_fleet_epoch'),
     ],
 )
 def test_all_configured_privileged_tokens_must_be_distinct(left: str, right: str):
@@ -71,6 +78,18 @@ def test_all_configured_privileged_tokens_must_be_distinct(left: str, right: str
     with pytest.raises(ValueError, match='privileged tokens must be distinct') as exc_info:
         Settings.model_validate(values)
 
+    assert sentinel not in str(exc_info.value)
+
+
+def test_writer_fleet_epoch_requires_256_bit_minimum_without_leaking_input():
+    sentinel = 'short-fleet-epoch-secret'
+    with pytest.raises(ValueError, match='at least 32 bytes') as exc_info:
+        Settings.model_validate(
+            {
+                'openai_api_key': 'test',
+                'opr_writer_fleet_epoch': sentinel,
+            }
+        )
     assert sentinel not in str(exc_info.value)
 
 
