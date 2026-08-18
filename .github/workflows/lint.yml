@@ -30,9 +30,9 @@ name: Lint with Ruff
 # approval-gated `pull_request` trigger in their own workflows.
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "server-multi-backend-support"]
   pull_request_target:
-    branches: ["main"]
+    branches: ["main", "server-multi-backend-support"]
 
 # Cancel superseded lint runs on the same PR/branch to save runner time now that
 # every fork push triggers a run automatically.

@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from importlib.metadata import version
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -26,4 +27,7 @@ app.include_router(ingest.router)
 
 @app.get('/healthcheck')
 async def healthcheck():
-    return JSONResponse(content={'status': 'healthy'}, status_code=200)
+    return JSONResponse(
+        content={'status': 'healthy', 'graphiti_core_version': version('graphiti-core')},
+        status_code=200,
+    )

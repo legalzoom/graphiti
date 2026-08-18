@@ -22,7 +22,8 @@ from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.operations.episode_node_ops import EpisodeNodeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
 from graphiti_core.driver.record_parsers import episodic_node_from_record
-from graphiti_core.errors import NodeNotFoundError
+from graphiti_core.errors import EpisodeTombstonedError, NodeNotFoundError
+from graphiti_core.helpers import query_result_record_count
 from graphiti_core.models.nodes.node_db_queries import (
     EPISODIC_NODE_RETURN,
     get_episode_node_save_query,
@@ -52,9 +53,11 @@ class KuzuEpisodeNodeOperations(EpisodeNodeOperations):
             'source': node.source.value,
         }
         if tx is not None:
-            await tx.run(query, **params)
+            result = await tx.run(query, **params)
         else:
-            await executor.execute_query(query, **params)
+            result = await executor.execute_query(query, **params)
+        if await query_result_record_count(result) != 1:
+            raise EpisodeTombstonedError()
 
         logger.debug(f'Saved Episode to Graph: {node.uuid}')
 

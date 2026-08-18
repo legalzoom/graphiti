@@ -38,7 +38,7 @@ from graphiti_core.edges import (
     create_entity_edge_embeddings,
 )
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
-from graphiti_core.errors import EdgeNotFoundError, NodeNotFoundError
+from graphiti_core.errors import EdgeNotFoundError, NodeGroupMismatchError, NodeNotFoundError
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import (
     get_default_group_id,
@@ -1110,6 +1110,8 @@ class Graphiti:
                         valid_at=reference_time,
                     )
                 )
+                if episode.group_id != group_id:
+                    raise NodeGroupMismatchError()
 
                 # Create default edge type map
                 edge_type_map_default = (
@@ -1331,6 +1333,8 @@ class Graphiti:
                     )
                     for episode in bulk_episodes
                 ]
+                if any(episode.group_id != group_id for episode in episodes):
+                    raise NodeGroupMismatchError()
 
                 # Save all episodes
                 await add_nodes_and_edges_bulk(

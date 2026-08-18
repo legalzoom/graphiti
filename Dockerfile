@@ -50,10 +50,14 @@ ENV UV_COMPILE_BYTECODE=1 \
 # Create non-root user
 RUN groupadd -r app && useradd -r -d /app -g app app
 
-# Set up the server application first
+# Keep the monorepo layout so server development resolves the exact local core.
+# The release build then replaces it with the same exact PyPI version below.
 WORKDIR /app
-COPY ./server/pyproject.toml ./server/README.md ./server/uv.lock ./
-COPY ./server/graph_service ./graph_service
+COPY ./pyproject.toml ./README.md ./
+COPY ./graphiti_core ./graphiti_core
+COPY ./server/pyproject.toml ./server/README.md ./server/uv.lock ./server/
+COPY ./server/graph_service ./server/graph_service
+WORKDIR /app/server
 
 # Install server dependencies (without graphiti-core from lockfile)
 # Then install graphiti-core from PyPI at the desired version
@@ -106,7 +110,7 @@ RUN chown -R app:app /app
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/server/.venv/bin:$PATH"
 
 # Switch to non-root user
 USER app

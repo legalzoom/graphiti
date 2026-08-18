@@ -1092,7 +1092,15 @@ async def get_status() -> StatusResponse:
 @mcp.custom_route('/health', methods=['GET'])
 async def health_check(request) -> JSONResponse:
     """Health check endpoint for Docker and load balancers."""
-    return JSONResponse({'status': 'healthy', 'service': 'graphiti-mcp'})
+    from importlib.metadata import version
+
+    return JSONResponse(
+        {
+            'status': 'healthy',
+            'service': 'graphiti-mcp',
+            'graphiti_core_version': version('graphiti-core'),
+        }
+    )
 
 
 async def initialize_server() -> ServerConfig:

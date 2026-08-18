@@ -30,8 +30,13 @@ from graphiti_core.driver.driver import (
 )
 from graphiti_core.edges import Edge, EntityEdge, EpisodicEdge, create_entity_edge_embeddings
 from graphiti_core.embedder import EmbedderClient
+from graphiti_core.errors import EpisodeTombstonedError
 from graphiti_core.graphiti_types import GraphitiClients
-from graphiti_core.helpers import normalize_l2, semaphore_gather
+from graphiti_core.helpers import (
+    normalize_l2,
+    query_result_record_count,
+    semaphore_gather,
+)
 from graphiti_core.models.edges.edge_db_queries import (
     get_entity_edge_save_bulk_query,
     get_episodic_edge_save_bulk_query,
@@ -245,7 +250,9 @@ async def add_nodes_and_edges_bulk_tx(
         for edge in episodic_edges:
             await tx.run(episodic_edge_query, **edge.model_dump())
     else:
-        await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
+        result = await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
+        if await query_result_record_count(result) != len(episodes):
+            raise EpisodeTombstonedError()
         await tx.run(
             get_entity_node_save_bulk_query(driver.provider, nodes),
             nodes=nodes,

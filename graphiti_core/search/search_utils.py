@@ -902,6 +902,8 @@ async def episode_fulltext_search(
                 UNWIND $ids as i
                 MATCH (e:Episodic)
                 WHERE e.uuid=i.uuid
+                  AND coalesce(e.opr_deleted, false) = false
+                  AND coalesce(e.opr_episode_reservation, false) = false
             RETURN
                     e.content AS content,
                     e.created_at AS created_at,
@@ -932,6 +934,8 @@ async def episode_fulltext_search(
             YIELD node AS episode, score
             MATCH (e:Episodic)
             WHERE e.uuid = episode.uuid
+              AND coalesce(e.opr_deleted, false) = false
+              AND coalesce(e.opr_episode_reservation, false) = false
             """
             + group_filter_query
             + """

@@ -22,7 +22,8 @@ from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.kuzu.operations.record_parsers import parse_kuzu_entity_node
 from graphiti_core.driver.operations.entity_node_ops import EntityNodeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
-from graphiti_core.errors import NodeNotFoundError
+from graphiti_core.errors import NodeGroupMismatchError, NodeNotFoundError
+from graphiti_core.helpers import query_result_record_count
 from graphiti_core.models.nodes.node_db_queries import (
     get_entity_node_return_query,
     get_entity_node_save_query,
@@ -55,9 +56,11 @@ class KuzuEntityNodeOperations(EntityNodeOperations):
         query = get_entity_node_save_query(GraphProvider.KUZU, '')
 
         if tx is not None:
-            await tx.run(query, **params)
+            result = await tx.run(query, **params)
         else:
-            await executor.execute_query(query, **params)
+            result = await executor.execute_query(query, **params)
+        if await query_result_record_count(result) != 1:
+            raise NodeGroupMismatchError()
 
         logger.debug(f'Saved Node to Graph: {node.uuid}')
 

@@ -18,6 +18,10 @@ import logging
 from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.neo4j.schema import (
+    delete_standalone_indexes,
+    ensure_episode_uuid_uniqueness,
+)
 from graphiti_core.driver.operations.graph_ops import GraphMaintenanceOperations
 from graphiti_core.driver.operations.graph_utils import Neighbor, label_propagation
 from graphiti_core.driver.query_executor import QueryExecutor
@@ -40,13 +44,23 @@ class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
         group_ids: list[str] | None = None,
     ) -> None:
         if group_ids is None:
-            await executor.execute_query('MATCH (n) DETACH DELETE n')
+            await executor.execute_query(
+                'MATCH (n) WITH n ORDER BY n.uuid '
+                'SET n._opr_conditional_delete_lock = true '
+                'REMOVE n._opr_conditional_delete_lock '
+                'WITH n WHERE coalesce(n.opr_deleted, false) = false DETACH DELETE n'
+            )
         else:
             for label in ['Entity', 'Episodic', 'Community']:
                 await executor.execute_query(
                     f"""
                     MATCH (n:{label})
                     WHERE n.group_id IN $group_ids
+                    WITH n ORDER BY n.uuid
+                    SET n._opr_conditional_delete_lock = true
+                    REMOVE n._opr_conditional_delete_lock
+                    WITH n
+                    WHERE coalesce(n.opr_deleted, false) = false
                     DETACH DELETE n
                     """,
                     group_ids=group_ids,
@@ -60,6 +74,8 @@ class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
         if delete_existing:
             await self.delete_all_indexes(executor)
 
+        await ensure_episode_uuid_uniqueness(executor)
+
         range_indices = get_range_indices(GraphProvider.NEO4J)
         fulltext_indices = get_fulltext_indices(GraphProvider.NEO4J)
         index_queries = range_indices + fulltext_indices
@@ -70,7 +86,7 @@ class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
         self,
         executor: QueryExecutor,
     ) -> None:
-        await executor.execute_query('CALL db.indexes() YIELD name DROP INDEX name')
+        await delete_standalone_indexes(executor)
 
     async def get_community_clusters(
         self,

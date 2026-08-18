@@ -5,14 +5,14 @@ permissions:
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "server-multi-backend-support"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "server-multi-backend-support"]
 
 jobs:
   pyright:
     runs-on: ubuntu-latest
-    environment: development
+    environment: ci
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Setup Socket Firewall wrapper
@@ -41,6 +41,8 @@ jobs:
           uv sync --all-extras
       - name: Run Pyright for graph-service
         shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           cd server
           uv run pyright .

@@ -32,6 +32,8 @@ def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
             'CREATE INDEX FOR (n:Entity) ON (n.uuid, n.group_id, n.name, n.created_at)',
             # Episodic node
             'CREATE INDEX FOR (n:Episodic) ON (n.uuid, n.group_id, n.created_at, n.valid_at)',
+            # OPR retirement receipt
+            'CREATE INDEX FOR (n:OPRRetirementReceipt) ON (n.request_id)',
             # Community node
             'CREATE INDEX FOR (n:Community) ON (n.uuid)',
             # Saga node
@@ -53,7 +55,6 @@ def get_range_indices(provider: GraphProvider) -> list[LiteralString]:
 
     return [
         'CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)',
-        'CREATE INDEX episode_uuid IF NOT EXISTS FOR (n:Episodic) ON (n.uuid)',
         'CREATE INDEX community_uuid IF NOT EXISTS FOR (n:Community) ON (n.uuid)',
         'CREATE INDEX saga_uuid IF NOT EXISTS FOR (n:Saga) ON (n.uuid)',
         'CREATE INDEX relation_uuid IF NOT EXISTS FOR ()-[e:RELATES_TO]-() ON (e.uuid)',

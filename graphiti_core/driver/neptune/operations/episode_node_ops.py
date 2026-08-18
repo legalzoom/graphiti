@@ -22,7 +22,8 @@ from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.operations.episode_node_ops import EpisodeNodeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
 from graphiti_core.driver.record_parsers import episodic_node_from_record
-from graphiti_core.errors import NodeNotFoundError
+from graphiti_core.errors import EpisodeTombstonedError, NodeNotFoundError
+from graphiti_core.helpers import query_result_record_count
 from graphiti_core.models.nodes.node_db_queries import (
     EPISODIC_NODE_RETURN_NEPTUNE,
     get_episode_node_save_bulk_query,
@@ -53,9 +54,11 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
             'source': node.source.value,
         }
         if tx is not None:
-            await tx.run(query, **params)
+            result = await tx.run(query, **params)
         else:
-            await executor.execute_query(query, **params)
+            result = await executor.execute_query(query, **params)
+        if await query_result_record_count(result) != 1:
+            raise EpisodeTombstonedError()
 
         logger.debug(f'Saved Episode to Graph: {node.uuid}')
 
@@ -73,11 +76,21 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
             ep.pop('labels', None)
             episodes.append(ep)
 
+        if not episodes:
+            return
+        if len(episodes) > batch_size:
+            raise ValueError(
+                'Neptune atomic episode batches cannot exceed batch_size; '
+                'split the request before calling save_bulk'
+            )
+
         query = get_episode_node_save_bulk_query(GraphProvider.NEPTUNE)
         if tx is not None:
-            await tx.run(query, episodes=episodes)
+            result = await tx.run(query, episodes=episodes)
         else:
-            await executor.execute_query(query, episodes=episodes)
+            result = await executor.execute_query(query, episodes=episodes)
+        if await query_result_record_count(result) != len(episodes):
+            raise EpisodeTombstonedError()
 
     async def delete(
         self,
@@ -86,8 +99,11 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
         tx: Transaction | None = None,
     ) -> None:
         query = """
-            MATCH (n {uuid: $uuid})
-            WHERE n:Entity OR n:Episodic OR n:Community
+            MATCH (n:Episodic {uuid: $uuid})
+            SET n._opr_conditional_delete_lock = true
+            REMOVE n._opr_conditional_delete_lock
+            WITH n
+            WHERE coalesce(n.opr_deleted, false) = false
             DETACH DELETE n
         """
         if tx is not None:
@@ -106,6 +122,11 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
     ) -> None:
         query = """
             MATCH (n:Episodic {group_id: $group_id})
+            WITH n ORDER BY n.uuid
+            SET n._opr_conditional_delete_lock = true
+            REMOVE n._opr_conditional_delete_lock
+            WITH n
+            WHERE coalesce(n.opr_deleted, false) = false
             DETACH DELETE n
         """
         if tx is not None:
@@ -123,6 +144,11 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
         query = """
             MATCH (n:Episodic)
             WHERE n.uuid IN $uuids
+            WITH n ORDER BY n.uuid
+            SET n._opr_conditional_delete_lock = true
+            REMOVE n._opr_conditional_delete_lock
+            WITH n
+            WHERE coalesce(n.opr_deleted, false) = false
             DETACH DELETE n
         """
         if tx is not None:
@@ -138,6 +164,8 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
         query = (
             """
             MATCH (e:Episodic {uuid: $uuid})
+            WHERE coalesce(e.opr_deleted, false) = false
+              AND coalesce(e.opr_episode_reservation, false) = false
             RETURN
             """
             + EPISODIC_NODE_RETURN_NEPTUNE
@@ -157,6 +185,8 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
             """
             MATCH (e:Episodic)
             WHERE e.uuid IN $uuids
+              AND coalesce(e.opr_deleted, false) = false
+              AND coalesce(e.opr_episode_reservation, false) = false
             RETURN DISTINCT
             """
             + EPISODIC_NODE_RETURN_NEPTUNE
@@ -177,6 +207,8 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
             """
             MATCH (e:Episodic)
             WHERE e.group_id IN $group_ids
+              AND coalesce(e.opr_deleted, false) = false
+              AND coalesce(e.opr_episode_reservation, false) = false
             """
             + cursor_clause
             + """
@@ -204,6 +236,8 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
         query = (
             """
             MATCH (e:Episodic)-[r:MENTIONS]->(n:Entity {uuid: $entity_node_uuid})
+            WHERE coalesce(e.opr_deleted, false) = false
+              AND coalesce(e.opr_episode_reservation, false) = false
             RETURN DISTINCT
             """
             + EPISODIC_NODE_RETURN_NEPTUNE
@@ -226,6 +260,8 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
                 """
                 MATCH (s:Saga {name: $saga_name, group_id: $group_id})-[:HAS_EPISODE]->(e:Episodic)
                 WHERE e.valid_at <= $reference_time
+                  AND coalesce(e.opr_deleted, false) = false
+                  AND coalesce(e.opr_episode_reservation, false) = false
                 """
                 + source_clause
                 + """
@@ -252,6 +288,8 @@ class NeptuneEpisodeNodeOperations(EpisodeNodeOperations):
                 """
                 MATCH (e:Episodic)
                 WHERE e.valid_at <= $reference_time
+                  AND coalesce(e.opr_deleted, false) = false
+                  AND coalesce(e.opr_episode_reservation, false) = false
                 """
                 + group_clause
                 + source_clause
