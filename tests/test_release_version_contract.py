@@ -1,7 +1,9 @@
+import importlib
 import re
+import sys
 from pathlib import Path
 
-import tomllib
+tomllib = importlib.import_module('tomllib' if sys.version_info >= (3, 11) else 'tomli')
 
 ROOT = Path(__file__).resolve().parents[1]
 
