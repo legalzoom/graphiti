@@ -649,6 +649,18 @@ def _create_graphiti_client(settings: ZepEnvDep) -> ZepGraphiti:
             database=settings.falkordb_database or 'default_db',  # type: ignore
         )
         return ZepGraphiti(graph_driver=driver)  # type: ignore
+    elif settings.db_backend == 'neptune':
+        from graphiti_core.driver.neptune_driver import NeptuneDriver
+
+        if not settings.neptune_host or not settings.aoss_host:
+            raise ValueError('NEPTUNE_HOST and AOSS_HOST are required when db_backend is "neptune"')
+        driver = NeptuneDriver(  # type: ignore
+            host=settings.neptune_host,
+            aoss_host=settings.aoss_host,
+            port=settings.neptune_port or 8182,
+            aoss_port=settings.aoss_port or 443,
+        )
+        return ZepGraphiti(graph_driver=driver)  # type: ignore
     else:
         # Validate Neo4j settings are present
         if not all([settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password]):

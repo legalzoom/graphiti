@@ -32,3 +32,21 @@ def test_mcp_image_defaults_match_release_projects():
     compose = (ROOT / 'mcp_server/docker/docker-compose.yml').read_text()
     assert f'GRAPHITI_CORE_VERSION:-{core_version}' in compose
     assert f'MCP_SERVER_VERSION:-{mcp_version}' in compose
+
+
+def test_neptune_release_images_install_the_required_core_extra():
+    server_dockerfile = (ROOT / 'Dockerfile').read_text()
+    server_release_workflow = (ROOT / '.github/workflows/release-server-container.yml').read_text()
+    standalone_dockerfile = (ROOT / 'mcp_server/docker/Dockerfile.standalone').read_text()
+    mcp_server_source = (ROOT / 'mcp_server/src/graphiti_mcp_server.py').read_text()
+
+    assert 'ARG INSTALL_NEPTUNE=false' in server_dockerfile
+    assert 'elif [ "$INSTALL_NEPTUNE" = "true" ]; then EXTRA="[neptune]"' in server_dockerfile
+    assert 'INSTALL_NEPTUNE=true' in server_release_workflow
+    assert (
+        'graphiti-core[neo4j,falkordb,neptune]==${GRAPHITI_CORE_VERSION}' in standalone_dockerfile
+    )
+    assert 'RUN echo "${GRAPHITI_CORE_VERSION}" > /app/mcp/.graphiti-core-version' in (
+        standalone_dockerfile
+    )
+    assert "Path('/app/mcp/.graphiti-core-version')" in mcp_server_source

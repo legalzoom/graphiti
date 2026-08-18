@@ -70,6 +70,7 @@ WORKDIR /app/server
 # SOCKET_SCAN_ID (unique per release run) invalidates this layer, and
 # UV_NO_CACHE stops uv serving wheels from the cache mount below.
 ARG INSTALL_FALKORDB=false
+ARG INSTALL_NEPTUNE=false
 ARG SOCKET_FIREWALL_ENABLED=false
 ARG SOCKET_SCAN_ID=
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -91,18 +92,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       UV_CMD="uv"; \
     fi; \
     $UV_CMD sync --frozen --no-dev; \
+    EXTRA=""; \
+    if [ "$INSTALL_FALKORDB" = "true" ]; then EXTRA="[falkordb]"; \
+    elif [ "$INSTALL_NEPTUNE" = "true" ]; then EXTRA="[neptune]"; \
+    fi; \
     if [ -n "$GRAPHITI_VERSION" ]; then \
-        if [ "$INSTALL_FALKORDB" = "true" ]; then \
-            $UV_CMD pip install --upgrade "graphiti-core[falkordb]==$GRAPHITI_VERSION"; \
-        else \
-            $UV_CMD pip install --upgrade "graphiti-core==$GRAPHITI_VERSION"; \
-        fi; \
+        $UV_CMD pip install --upgrade "graphiti-core${EXTRA}==$GRAPHITI_VERSION"; \
     else \
-        if [ "$INSTALL_FALKORDB" = "true" ]; then \
-            $UV_CMD pip install --upgrade "graphiti-core[falkordb]"; \
-        else \
-            $UV_CMD pip install --upgrade graphiti-core; \
-        fi; \
+        $UV_CMD pip install --upgrade "graphiti-core${EXTRA}"; \
     fi
 
 # Change ownership to app user

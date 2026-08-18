@@ -229,29 +229,29 @@ async def edge_fulltext_search(
             for r in res['hits']['hits']:
                 input_ids.append({'id': r['_source']['uuid'], 'score': r['_score']})
 
-            # Match the edge ids and return the values
+            neptune_filter = ''
+            if filter_queries:
+                neptune_filter = ' AND ' + (' AND '.join(filter_queries))
+
             query = (
                 """
-                                UNWIND $ids as id
-                                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-                                WHERE e.group_id IN $group_ids 
-                                AND id(e)=id 
-                                """
-                + filter_query
+                UNWIND $ids as id
+                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+                WHERE e.uuid = id.id
+                """
+                + neptune_filter
                 + """
-                AND id(e)=id
                 WITH e, id.score as score, startNode(e) AS n, endNode(e) AS m
                 RETURN
                 """
                 + get_entity_edge_return_query(GraphProvider.NEPTUNE)
                 + """
                 ORDER BY score DESC LIMIT $limit
-                            """
+                """
             )
 
             records, _, _ = await driver.execute_query(
                 query,
-                query=fuzzy_query,
                 ids=input_ids,
                 limit=limit,
                 routing_='r',
@@ -718,7 +718,7 @@ async def node_similarity_search(
                                                                                                                                                                 UNWIND $ids as i
                                                                                                                                                                 MATCH (n:Entity)
                                                                                                                                                                 WHERE id(n)=i.id
-                                                                                                                                                                RETURN 
+                                                                                                                                                                RETURN
                                                                                                                                                                 """
                 + get_entity_node_return_query(driver.provider)
                 + """
@@ -897,11 +897,11 @@ async def episode_fulltext_search(
             for r in res['hits']['hits']:
                 input_ids.append({'id': r['_source']['uuid'], 'score': r['_score']})
 
-            # Match the edge ides and return the values
+            # Match the episode nodes by uuid
             query = """
                 UNWIND $ids as i
                 MATCH (e:Episodic)
-                WHERE e.uuid=i.uuid
+                WHERE e.uuid=i.id
                   AND coalesce(e.opr_deleted, false) = false
                   AND coalesce(e.opr_episode_reservation, false) = false
             RETURN
@@ -913,7 +913,7 @@ async def episode_fulltext_search(
                     e.group_id AS group_id,
                     e.source_description AS source_description,
                     e.source AS source,
-                    e.entity_edges AS entity_edges
+                    split(e.entity_edges, "|") AS entity_edges
                 ORDER BY i.score DESC
                 LIMIT $limit
             """
@@ -1065,8 +1065,10 @@ async def community_similarity_search(
     query_params: dict[str, Any] = {}
 
     group_filter_query: LiteralString = ''
+    neptune_group_filter_query: LiteralString = ''
     if group_ids is not None:
         group_filter_query += ' WHERE c.group_id IN $group_ids'
+        neptune_group_filter_query += ' WHERE n.group_id IN $group_ids'
         query_params['group_ids'] = group_ids
 
     if driver.provider == GraphProvider.NEPTUNE:
@@ -1074,7 +1076,7 @@ async def community_similarity_search(
             """
                                                                                                                                     MATCH (n:Community)
                                                                                                                                     """
-            + group_filter_query
+            + neptune_group_filter_query
             + """
             RETURN DISTINCT id(n) as id, n.name_embedding as embedding
             """

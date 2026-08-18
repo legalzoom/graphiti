@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import logging
+from contextlib import suppress
 from datetime import datetime
 from time import time
 from uuid import uuid4
@@ -1096,10 +1097,15 @@ class Graphiti:
                 )
 
                 # Get or create episode
-                episode = (
-                    await EpisodicNode.get_by_uuid(self.driver, uuid)
-                    if uuid is not None
-                    else EpisodicNode(
+                episode = None
+                if uuid is not None:
+                    with suppress(NodeNotFoundError):
+                        episode = await EpisodicNode.get_by_uuid(self.driver, uuid)
+                if episode is not None and episode.group_id != group_id:
+                    raise NodeGroupMismatchError()
+                if episode is None:
+                    episode = EpisodicNode(
+                        uuid=uuid or str(uuid4()),
                         name=name,
                         group_id=group_id,
                         labels=[],
@@ -1109,9 +1115,6 @@ class Graphiti:
                         created_at=now,
                         valid_at=reference_time,
                     )
-                )
-                if episode.group_id != group_id:
-                    raise NodeGroupMismatchError()
 
                 # Create default edge type map
                 edge_type_map_default = (

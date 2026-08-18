@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [main, server-multi-backend-support]
+    branches: [main]
   pull_request:
-    branches: [main, server-multi-backend-support]
+    branches: [main]
 
 permissions:
   contents: read
@@ -55,6 +55,7 @@ jobs:
           uv sync --extra dev
           uv run pytest \
             tests/test_conditional_episode_delete.py \
+            tests/test_neptune_config.py \
             tests/test_route_authorization.py \
             -m "not integration"
       - name: Run conditional-write driver unit tests
@@ -82,13 +83,10 @@ jobs:
         with:
           version: "latest"
       - name: Start databases
-        # Run the databases ourselves on the host network rather than via a GitHub
-        # Actions `services:` block. On the depot-ubuntu runner pool, bridge-network
-        # NAT silently drops packets to published service-container ports, so the job
-        # host can't reach a `services:` container (connect black-holes -> the wait step
-        # times out with exit 124). `services:` always uses bridge networking and can't
-        # be overridden, so we use `docker run --network host` instead. Readiness is
-        # checked via `docker exec`, which doesn't depend on host->container networking.
+        # Run the databases on the host network so readiness checks and tests use the
+        # same endpoints across runner implementations. GitHub Actions `services:`
+        # always uses bridge networking and cannot be overridden. Readiness is checked
+        # via `docker exec`, which does not depend on host-to-container networking.
         run: |
           docker run -d --name falkordb --network host falkordb/falkordb:latest
           docker run -d --name neo4j --network host \

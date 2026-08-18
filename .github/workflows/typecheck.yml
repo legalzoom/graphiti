@@ -5,9 +5,9 @@ permissions:
 
 on:
   push:
-    branches: ["main", "server-multi-backend-support"]
+    branches: ["main"]
   pull_request:
-    branches: ["main", "server-multi-backend-support"]
+    branches: ["main"]
 
 jobs:
   pyright:

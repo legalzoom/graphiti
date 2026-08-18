@@ -235,7 +235,8 @@ class GraphitiService:
 
             # Initialize Graphiti client with appropriate driver
             try:
-                if self.config.database.provider.lower() == 'falkordb':
+                db_provider = self.config.database.provider.lower()
+                if db_provider == 'falkordb':
                     # For FalkorDB, create a FalkorDriver instance directly
                     from graphiti_core.driver.falkordb_driver import FalkorDriver
 
@@ -249,6 +250,23 @@ class GraphitiService:
 
                     self.client = Graphiti(
                         graph_driver=falkor_driver,
+                        llm_client=llm_client,
+                        embedder=embedder_client,
+                        cross_encoder=cross_encoder_client,
+                        max_coroutines=self.semaphore_limit,
+                    )
+                elif db_provider == 'neptune':
+                    from graphiti_core.driver.neptune_driver import NeptuneDriver
+
+                    neptune_driver = NeptuneDriver(
+                        host=db_config['host'],
+                        aoss_host=db_config['aoss_host'],
+                        port=db_config['port'],
+                        aoss_port=db_config['aoss_port'],
+                    )
+
+                    self.client = Graphiti(
+                        graph_driver=neptune_driver,
                         llm_client=llm_client,
                         embedder=embedder_client,
                         cross_encoder=cross_encoder_client,
@@ -279,6 +297,17 @@ class GraphitiService:
                             f'To start FalkorDB:\n'
                             f'  - Using Docker Compose: cd mcp_server && docker compose up\n'
                             f'  - Or run FalkorDB manually: docker run -p 6379:6379 falkordb/falkordb\n\n'
+                            f'{"=" * 70}\n'
+                        ) from db_error
+                    elif db_provider.lower() == 'neptune':
+                        raise RuntimeError(
+                            f'\n{"=" * 70}\n'
+                            f'Database Connection Error: Neptune is not accessible\n'
+                            f'{"=" * 70}\n\n'
+                            f'Neptune at {db_config.get("host", "unknown")} is not accessible.\n'
+                            f'AOSS at {db_config.get("aoss_host", "unknown")} is not accessible.\n\n'
+                            f'Ensure your Neptune cluster and AOSS collection are running\n'
+                            f'and that your AWS credentials / IAM role are configured.\n\n'
                             f'{"=" * 70}\n'
                         ) from db_error
                     elif db_provider.lower() == 'neo4j':
@@ -1150,7 +1179,7 @@ async def initialize_server() -> ServerConfig:
     )
     parser.add_argument(
         '--database-provider',
-        choices=['neo4j', 'falkordb'],
+        choices=['neo4j', 'falkordb', 'neptune'],
         help='Database provider to use',
     )
 
@@ -1211,10 +1240,15 @@ async def initialize_server() -> ServerConfig:
         logger.info(f'  - Graphiti Core: {graphiti_version}')
     except Exception:
         # Check for Docker-stored version file
-        version_file = Path('/app/.graphiti-core-version')
-        if version_file.exists():
-            graphiti_version = version_file.read_text().strip()
-            logger.info(f'  - Graphiti Core: {graphiti_version}')
+        version_files = (
+            Path('/app/mcp/.graphiti-core-version'),
+            Path('/app/.graphiti-core-version'),
+        )
+        for version_file in version_files:
+            if version_file.exists():
+                graphiti_version = version_file.read_text().strip()
+                logger.info(f'  - Graphiti Core: {graphiti_version}')
+                break
         else:
             logger.info('  - Graphiti Core: version unavailable')
 
@@ -1277,7 +1311,7 @@ async def run_mcp_server():
         logger.info('  Transport: HTTP (streamable)')
 
         # Show FalkorDB Browser UI access if enabled
-        if os.environ.get('BROWSER', '1') == '1':
+        if config.database.provider.lower() == 'falkordb' and os.environ.get('BROWSER', '1') == '1':
             logger.info(f'  FalkorDB Browser UI: http://{display_host}:3000/')
 
         logger.info('=' * 60)

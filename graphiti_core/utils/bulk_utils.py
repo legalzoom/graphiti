@@ -33,6 +33,7 @@ from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import EpisodeTombstonedError
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import (
+    EPISODE_AOSS_WRITE_VERSION,
     normalize_l2,
     query_result_record_count,
     semaphore_gather,
@@ -265,6 +266,50 @@ async def add_nodes_and_edges_bulk_tx(
             get_entity_edge_save_bulk_query(driver.provider),
             entity_edges=edges,
         )
+
+    # Sync bulk-written data to AOSS for Neptune full-text search
+    if driver.provider == GraphProvider.NEPTUNE:
+        if episodes:
+            driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+                'episode_content',
+                [
+                    {
+                        'uuid': e['uuid'],
+                        'content': e.get('content', ''),
+                        'source': e.get('source', ''),
+                        'source_description': e.get('source_description', ''),
+                        'group_id': e.get('group_id', ''),
+                        '_version': EPISODE_AOSS_WRITE_VERSION,
+                    }
+                    for e in episodes
+                ],
+            )
+        if nodes:
+            driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+                'node_name_and_summary',
+                [
+                    {
+                        'uuid': n['uuid'],
+                        'name': n['name'],
+                        'summary': n.get('summary', ''),
+                        'group_id': n.get('group_id', ''),
+                    }
+                    for n in nodes
+                ],
+            )
+        if edges:
+            driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+                'edge_name_and_fact',
+                [
+                    {
+                        'uuid': e['uuid'],
+                        'name': e['name'],
+                        'fact': e.get('fact', ''),
+                        'group_id': e.get('group_id', ''),
+                    }
+                    for e in edges
+                ],
+            )
 
 
 async def extract_nodes_and_edges_bulk(

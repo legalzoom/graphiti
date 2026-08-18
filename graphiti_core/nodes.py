@@ -37,6 +37,7 @@ from graphiti_core.errors import (
     NodeNotFoundError,
 )
 from graphiti_core.helpers import (
+    EPISODE_AOSS_WRITE_VERSION,
     parse_db_date,
     query_result_record_count,
     validate_node_labels,
@@ -392,6 +393,21 @@ class EpisodicNode(Node):
         if await query_result_record_count(result) != 1:
             raise EpisodeTombstonedError()
 
+        if driver.provider == GraphProvider.NEPTUNE:
+            driver.save_to_aoss(  # pyright: ignore reportAttributeAccessIssue
+                'episode_content',
+                [
+                    {
+                        'uuid': self.uuid,
+                        'content': self.content,
+                        'source': self.source.value,
+                        'source_description': self.source_description,
+                        'group_id': self.group_id,
+                        '_version': EPISODE_AOSS_WRITE_VERSION,
+                    }
+                ],
+            )
+
         logger.debug(f'Saved Node to Graph: {self.uuid}')
 
         return result
@@ -659,6 +675,20 @@ class EntityNode(Node):
 
         if await query_result_record_count(result) != 1:
             raise NodeGroupMismatchError()
+
+        if driver.provider == GraphProvider.NEPTUNE:
+            driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+                'node_name_and_summary',
+                [
+                    {
+                        'uuid': self.uuid,
+                        'name': self.name,
+                        'summary': self.summary,
+                        'group_id': self.group_id,
+                    }
+                ],
+            )
+
         logger.debug(f'Saved Node to Graph: {self.uuid}')
 
         return result
