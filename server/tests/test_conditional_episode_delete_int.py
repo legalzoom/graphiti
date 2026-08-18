@@ -342,7 +342,7 @@ async def test_falkor_conditional_delete_fails_closed_without_receipt_uniqueness
         records, _, _ = await group_driver.execute_query(
             """
             MATCH (episode:Episodic {uuid: $uuid})
-            RETURN episode.opr_deleted AS deleted,
+            RETURN coalesce(episode.opr_deleted, false) AS deleted,
                    episode.group_id AS group_id,
                    episode.content AS content
             """,

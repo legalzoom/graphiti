@@ -350,6 +350,7 @@ class ZepGraphiti(Graphiti):
                 WHEN receipt.outcome = 'pending' THEN 'not_applied'
                 ELSE receipt.outcome
             END
+            WITH receipt, episode, was_deleted, can_apply
             OPTIONAL MATCH (episode)-[relationship]-()
             FOREACH (_ IN CASE
                 WHEN can_apply AND relationship IS NOT NULL THEN [1] ELSE [] END |
