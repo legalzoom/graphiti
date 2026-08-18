@@ -528,6 +528,9 @@ class ZepGraphiti(Graphiti):
         query_driver = self.driver
         if self.driver.provider == GraphProvider.NEPTUNE:
             receipt_node_id = f'opr-retirement-receipt:{canonical_request_id}'
+            # Neptune cannot use FOREACH for a conditional write. Alias the
+            # present episode as the second lock target, or the already-locked
+            # receipt on absence, so the decision stays in one writer query.
             receipts, _, _ = await query_driver.execute_query(
                 """
                 MATCH (receipt:OPRRetirementReceipt {`~id`: $receipt_node_id})
@@ -538,12 +541,24 @@ class ZepGraphiti(Graphiti):
                   AND receipt.episode_uuid = $uuid
                   AND receipt.group_id = $group_id
                   AND receipt.protocol = $receipt_protocol
+                OPTIONAL MATCH (episode:Episodic {uuid: $uuid})
+                WITH receipt, episode,
+                     CASE WHEN episode IS NULL THEN receipt ELSE episode END AS decision_lock
+                SET decision_lock._opr_conditional_delete_lock = true
+                REMOVE decision_lock._opr_conditional_delete_lock
+                WITH receipt, episode
                 SET receipt.outcome = CASE
-                    WHEN receipt.outcome = 'pending' THEN 'not_applied'
+                    WHEN receipt.outcome = 'pending' AND episode IS NULL THEN 'not_applied'
                     ELSE receipt.outcome
                 END
                 RETURN true AS bound,
-                       receipt.outcome AS outcome
+                       receipt.outcome AS outcome,
+                       receipt.outcome = 'retired'
+                       AND episode IS NOT NULL
+                       AND coalesce(episode.opr_deleted, false) = true
+                       AND episode.opr_deleted_group_id = $group_id
+                       AND episode.opr_retirement_request_id = $retirement_request_id
+                       AND coalesce(episode.opr_aoss_fenced, false) = true AS durable
                 """,
                 receipt_node_id=receipt_node_id,
                 uuid=canonical_uuid,
@@ -556,34 +571,7 @@ class ZepGraphiti(Graphiti):
             outcome = receipts[0].get('outcome')
             if outcome == 'not_applied':
                 return 'not_applied'
-            if outcome != 'retired':
-                return None
-            records, _, _ = await query_driver.execute_query(
-                """
-                MATCH (receipt:OPRRetirementReceipt {`~id`: $receipt_node_id})
-                SET receipt._opr_conditional_delete_lock = true
-                REMOVE receipt._opr_conditional_delete_lock
-                WITH receipt
-                WHERE receipt.request_id = $retirement_request_id
-                  AND receipt.episode_uuid = $uuid
-                  AND receipt.group_id = $group_id
-                  AND receipt.protocol = $receipt_protocol
-                  AND receipt.outcome = 'retired'
-                MATCH (episode:Episodic {uuid: $uuid})
-                SET episode._opr_conditional_delete_lock = true
-                REMOVE episode._opr_conditional_delete_lock
-                RETURN coalesce(episode.opr_deleted, false) = true
-                       AND episode.opr_deleted_group_id = $group_id
-                       AND episode.opr_retirement_request_id = $retirement_request_id
-                       AND coalesce(episode.opr_aoss_fenced, false) = true AS durable
-                """,
-                receipt_node_id=receipt_node_id,
-                uuid=canonical_uuid,
-                group_id=group_id,
-                retirement_request_id=canonical_request_id,
-                receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
-            )
-            if records and records[0].get('durable') is True:
+            if outcome == 'retired' and receipts[0].get('durable') is True:
                 return 'retired'
             return None
         records, _, _ = await query_driver.execute_query(

@@ -903,10 +903,11 @@ async def test_neptune_retirement_status_uses_unique_receipt_id_without_foreach(
     driver = SimpleNamespace(
         provider=GraphProvider.NEPTUNE,
         execute_query=AsyncMock(
-            side_effect=[
-                ([{'bound': True, 'outcome': 'retired'}], None, None),
-                ([{'durable': True}], None, None),
-            ]
+            return_value=(
+                [{'bound': True, 'outcome': 'retired', 'durable': True}],
+                None,
+                None,
+            ),
         ),
     )
     service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
@@ -920,20 +921,61 @@ async def test_neptune_retirement_status_uses_unique_receipt_id_without_foreach(
         )
         == 'retired'
     )
-    assert driver.execute_query.await_count == 2
-    assert all('FOREACH' not in call.args[0] for call in driver.execute_query.await_args_list)
-    assert all(
-        call.kwargs['receipt_node_id'] == f'opr-retirement-receipt:{RETIREMENT_REQUEST_ID}'
-        for call in driver.execute_query.await_args_list
+    assert driver.execute_query.await_count == 1
+    query = driver.execute_query.await_args.args[0]
+    assert 'FOREACH' not in query
+    assert (
+        driver.execute_query.await_args.kwargs['receipt_node_id']
+        == f'opr-retirement-receipt:{RETIREMENT_REQUEST_ID}'
+    )
+    assert query.index('SET receipt._opr_conditional_delete_lock') < query.index(
+        'OPTIONAL MATCH (episode:Episodic {uuid: $uuid})'
+    )
+    assert query.index('OPTIONAL MATCH (episode:Episodic {uuid: $uuid})') < query.index(
+        'SET decision_lock._opr_conditional_delete_lock'
+    )
+    assert query.index('SET decision_lock._opr_conditional_delete_lock') < query.index(
+        'SET receipt.outcome = CASE'
     )
 
 
 @pytest.mark.asyncio
-async def test_neptune_retirement_status_cancels_crashed_pending_admission():
+async def test_neptune_retirement_status_leaves_pending_when_episode_is_present():
     driver = SimpleNamespace(
         provider=GraphProvider.NEPTUNE,
         execute_query=AsyncMock(
-            return_value=([{'bound': True, 'outcome': 'not_applied'}], None, None)
+            return_value=(
+                [{'bound': True, 'outcome': 'pending', 'durable': False}],
+                None,
+                None,
+            )
+        ),
+    )
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    assert (
+        await ZepGraphiti.episode_retirement_outcome(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+        is None
+    )
+    query = driver.execute_query.await_args.args[0]
+    assert "receipt.outcome = 'pending' AND episode IS NULL" in query
+
+
+@pytest.mark.asyncio
+async def test_neptune_retirement_status_cancels_pending_only_when_episode_is_absent():
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEPTUNE,
+        execute_query=AsyncMock(
+            return_value=(
+                [{'bound': True, 'outcome': 'not_applied', 'durable': False}],
+                None,
+                None,
+            )
         ),
     )
     service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
@@ -948,9 +990,9 @@ async def test_neptune_retirement_status_cancels_crashed_pending_admission():
         == 'not_applied'
     )
     query = driver.execute_query.await_args.args[0]
-    assert "WHEN receipt.outcome = 'pending' THEN 'not_applied'" in query
+    assert "WHEN receipt.outcome = 'pending' AND episode IS NULL THEN 'not_applied'" in query
     assert query.index('SET receipt._opr_conditional_delete_lock') < query.index(
-        "WHEN receipt.outcome = 'pending' THEN 'not_applied'"
+        "WHEN receipt.outcome = 'pending' AND episode IS NULL THEN 'not_applied'"
     )
 
 
@@ -988,11 +1030,7 @@ async def test_retirement_status_rejects_legacy_receipt_protocol_before_resoluti
     assert driver.execute_query.await_count == 1
     query = driver.execute_query.await_args.args[0]
     assert 'receipt.protocol = $receipt_protocol' in query
-    first_effect_after_binding = (
-        "WHEN receipt.outcome = 'pending' THEN 'not_applied'"
-        if provider == GraphProvider.NEPTUNE
-        else 'OPTIONAL MATCH (episode:Episodic {uuid: $uuid})'
-    )
+    first_effect_after_binding = 'OPTIONAL MATCH (episode:Episodic {uuid: $uuid})'
     assert query.index('receipt.protocol = $receipt_protocol') < query.index(
         first_effect_after_binding
     )
