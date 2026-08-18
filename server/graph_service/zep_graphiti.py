@@ -20,8 +20,12 @@ from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 
 from graph_service.config import ZepEnvDep
 from graph_service.dto import FactResult
+from graph_service.protocol import GRAPHITI_RECONCILIATION_PROTOCOL
 
 logger = logging.getLogger(__name__)
+
+_CONDITIONAL_EPISODE_IDENTITY_DOMAIN = 'opr:conditional-episode-delete:v2'
+_RETIREMENT_RECEIPT_PROTOCOL = GRAPHITI_RECONCILIATION_PROTOCOL
 
 
 def _conditional_episode_identity_digest(
@@ -44,7 +48,9 @@ def _conditional_episode_identity_digest(
         ensure_ascii=False,
         separators=(',', ':'),
     )
-    return hashlib.sha256(f'opr:conditional-episode-delete:v1\0{canonical}'.encode()).hexdigest()
+    return hashlib.sha256(
+        f'{_CONDITIONAL_EPISODE_IDENTITY_DOMAIN}\0{canonical}'.encode()
+    ).hexdigest()
 
 
 class ZepGraphiti(Graphiti):
@@ -203,6 +209,7 @@ class ZepGraphiti(Graphiti):
                               receipt.episode_uuid = $uuid,
                               receipt.group_id = $group_id,
                               receipt.identity_digest = $identity_digest,
+                              receipt.protocol = $receipt_protocol,
                               receipt.outcome = 'pending',
                               receipt.opr_deleted = true
                 SET receipt._opr_conditional_delete_lock = true
@@ -210,7 +217,8 @@ class ZepGraphiti(Graphiti):
                 RETURN receipt.request_id = $retirement_request_id
                        AND receipt.episode_uuid = $uuid
                        AND receipt.group_id = $group_id
-                       AND receipt.identity_digest = $identity_digest AS bound,
+                       AND receipt.identity_digest = $identity_digest
+                       AND receipt.protocol = $receipt_protocol AS bound,
                        receipt.outcome AS outcome
                 """,
                 receipt_node_id=receipt_node_id,
@@ -218,6 +226,7 @@ class ZepGraphiti(Graphiti):
                 uuid=canonical_uuid,
                 group_id=group_id,
                 identity_digest=identity_digest,
+                receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
             )
             if not receipts or receipts[0].get('bound') is not True:
                 return None
@@ -237,6 +246,7 @@ class ZepGraphiti(Graphiti):
                   AND receipt.episode_uuid = $uuid
                   AND receipt.group_id = $group_id
                   AND receipt.identity_digest = $identity_digest
+                  AND receipt.protocol = $receipt_protocol
                   AND receipt.outcome <> 'not_applied'
                 MATCH (episode:Episodic {uuid: $uuid})
                 SET episode._opr_conditional_delete_lock = true
@@ -284,6 +294,7 @@ class ZepGraphiti(Graphiti):
                 source=source,
                 source_description=source_description,
                 identity_digest=identity_digest,
+                receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
             )
             if not records:
                 decisions, _, _ = await query_driver.execute_query(
@@ -296,6 +307,7 @@ class ZepGraphiti(Graphiti):
                       AND receipt.episode_uuid = $uuid
                       AND receipt.group_id = $group_id
                       AND receipt.identity_digest = $identity_digest
+                      AND receipt.protocol = $receipt_protocol
                     SET receipt.outcome = CASE
                         WHEN receipt.outcome = 'pending' THEN 'not_applied'
                         ELSE receipt.outcome
@@ -307,6 +319,7 @@ class ZepGraphiti(Graphiti):
                     uuid=canonical_uuid,
                     group_id=group_id,
                     identity_digest=identity_digest,
+                    receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
                 )
                 if not decisions:
                     return None
@@ -327,6 +340,7 @@ class ZepGraphiti(Graphiti):
             ON CREATE SET receipt.episode_uuid = $uuid,
                           receipt.group_id = $group_id,
                           receipt.identity_digest = $identity_digest,
+                          receipt.protocol = $receipt_protocol,
                           receipt.outcome = 'pending',
                           receipt.opr_deleted = true
             SET receipt._opr_conditional_delete_lock = true
@@ -335,6 +349,7 @@ class ZepGraphiti(Graphiti):
             WHERE receipt.episode_uuid = $uuid
               AND receipt.group_id = $group_id
               AND receipt.identity_digest = $identity_digest
+              AND receipt.protocol = $receipt_protocol
             OPTIONAL MATCH (episode:Episodic {uuid: $uuid})
             FOREACH (_ IN CASE WHEN episode IS NULL THEN [] ELSE [1] END |
                 SET episode._opr_conditional_delete_lock = true
@@ -398,6 +413,7 @@ class ZepGraphiti(Graphiti):
                 source_description=source_description,
                 identity_digest=identity_digest,
                 retirement_request_id=canonical_request_id,
+                receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
             )
             if not records:
                 return None
@@ -437,6 +453,17 @@ class ZepGraphiti(Graphiti):
         entity_edges: str | list[str] = '' if self.driver.provider == GraphProvider.NEPTUNE else []
         finalized, _, _ = await query_driver.execute_query(
             """
+            MATCH (receipt:OPRRetirementReceipt {
+                request_id: $retirement_request_id
+            })
+            SET receipt._opr_conditional_delete_lock = true
+            REMOVE receipt._opr_conditional_delete_lock
+            WITH receipt
+            WHERE receipt.episode_uuid = $uuid
+              AND receipt.group_id = $group_id
+              AND receipt.identity_digest = $identity_digest
+              AND receipt.protocol = $receipt_protocol
+              AND receipt.outcome = 'retired'
             MATCH (episode:Episodic {uuid: $uuid})
             SET episode._opr_conditional_delete_lock = true
             REMOVE episode._opr_conditional_delete_lock
@@ -455,7 +482,10 @@ class ZepGraphiti(Graphiti):
             RETURN $uuid AS uuid
             """,
             uuid=canonical_uuid,
+            group_id=group_id,
             identity_digest=identity_digest,
+            retirement_request_id=canonical_request_id,
+            receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
             entity_edges=entity_edges,
         )
         if not finalized:
@@ -507,6 +537,7 @@ class ZepGraphiti(Graphiti):
                 WHERE receipt.request_id = $retirement_request_id
                   AND receipt.episode_uuid = $uuid
                   AND receipt.group_id = $group_id
+                  AND receipt.protocol = $receipt_protocol
                 SET receipt.outcome = CASE
                     WHEN receipt.outcome = 'pending' THEN 'not_applied'
                     ELSE receipt.outcome
@@ -518,6 +549,7 @@ class ZepGraphiti(Graphiti):
                 uuid=canonical_uuid,
                 group_id=group_id,
                 retirement_request_id=canonical_request_id,
+                receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
             )
             if not receipts or receipts[0].get('bound') is not True:
                 return None
@@ -535,6 +567,7 @@ class ZepGraphiti(Graphiti):
                 WHERE receipt.request_id = $retirement_request_id
                   AND receipt.episode_uuid = $uuid
                   AND receipt.group_id = $group_id
+                  AND receipt.protocol = $receipt_protocol
                   AND receipt.outcome = 'retired'
                 MATCH (episode:Episodic {uuid: $uuid})
                 SET episode._opr_conditional_delete_lock = true
@@ -548,6 +581,7 @@ class ZepGraphiti(Graphiti):
                 uuid=canonical_uuid,
                 group_id=group_id,
                 retirement_request_id=canonical_request_id,
+                receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
             )
             if records and records[0].get('durable') is True:
                 return 'retired'
@@ -562,6 +596,7 @@ class ZepGraphiti(Graphiti):
             WITH receipt
             WHERE receipt.episode_uuid = $uuid
               AND receipt.group_id = $group_id
+              AND receipt.protocol = $receipt_protocol
             OPTIONAL MATCH (episode:Episodic {uuid: $uuid})
             FOREACH (_ IN CASE WHEN episode IS NULL THEN [] ELSE [1] END |
                 SET episode._opr_conditional_delete_lock = true
@@ -580,6 +615,7 @@ class ZepGraphiti(Graphiti):
             uuid=canonical_uuid,
             group_id=group_id,
             retirement_request_id=canonical_request_id,
+            receipt_protocol=_RETIREMENT_RECEIPT_PROTOCOL,
         )
         if not records:
             return None

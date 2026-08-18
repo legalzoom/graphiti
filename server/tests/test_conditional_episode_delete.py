@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 from typing import cast
@@ -292,6 +293,7 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
     )
     assert 'SET episode._opr_conditional_delete_lock = NULL' in query
     assert 'MERGE (receipt:OPRRetirementReceipt' in query
+    assert 'receipt.protocol = $receipt_protocol' in query
     assert "THEN 'not_applied'" in query
     assert 'episode.uuid = $uuid' in query
     assert 'episode.group_id = $group_id' in query
@@ -322,8 +324,11 @@ async def test_conditional_delete_locks_compares_then_finalizes_tombstone():
             'publish',
         ),
         'retirement_request_id': RETIREMENT_REQUEST_ID,
+        'receipt_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
     }
     finalize_query = final_call.args[0]
+    assert 'MATCH (receipt:OPRRetirementReceipt' in finalize_query
+    assert 'receipt.protocol = $receipt_protocol' in finalize_query
     assert 'episode.opr_deleted_identity_digest = $identity_digest' in finalize_query
     assert "episode.group_id = '__opr_deleted__'" in finalize_query
     assert "episode.content = ''" in finalize_query
@@ -386,6 +391,37 @@ def test_conditional_delete_identity_digest_binds_source_type():
     )
 
     assert message_digest != text_digest
+
+
+def test_conditional_delete_identity_digest_rejects_legacy_domain():
+    content_digest = hashlib.sha256(b'stored content').hexdigest()
+    canonical = json.dumps(
+        [
+            EPISODE_UUID,
+            'opr',
+            'curated:test.md',
+            content_digest,
+            EpisodeType.message.value,
+            'publish',
+        ],
+        ensure_ascii=False,
+        separators=(',', ':'),
+    )
+    legacy_digest = hashlib.sha256(
+        f'opr:conditional-episode-delete:v1\0{canonical}'.encode()
+    ).hexdigest()
+
+    assert (
+        _conditional_episode_identity_digest(
+            EPISODE_UUID,
+            'opr',
+            'curated:test.md',
+            'stored content',
+            EpisodeType.message.value,
+            'publish',
+        )
+        != legacy_digest
+    )
 
 
 def test_conditional_delete_request_allows_exact_empty_source_description():
@@ -578,6 +614,52 @@ async def test_neptune_receipt_binding_conflict_is_not_not_applied():
         is None
     )
     assert driver.execute_query.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('provider', [GraphProvider.NEO4J, GraphProvider.NEPTUNE])
+@pytest.mark.parametrize(
+    'legacy_protocol',
+    [None, 'opr.graphiti.reconciliation/v3'],
+    ids=['missing-protocol', 'v3-protocol'],
+)
+async def test_conditional_delete_rejects_legacy_receipt_protocol(
+    provider: GraphProvider,
+    legacy_protocol: str | None,
+):
+    async def execute_query(_query: str, **params):
+        assert legacy_protocol != params['receipt_protocol']
+        existing_receipt_result = (
+            [{'bound': False, 'outcome': 'retired'}] if provider == GraphProvider.NEPTUNE else []
+        )
+        return existing_receipt_result, None, None
+
+    driver = SimpleNamespace(
+        provider=provider,
+        execute_query=AsyncMock(side_effect=execute_query),
+    )
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    assert (
+        await ZepGraphiti.delete_episodic_node_if_matches(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            name='curated:test.md',
+            content='stored content',
+            source=EpisodeType.message.value,
+            source_description='publish',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+        is None
+    )
+
+    assert driver.execute_query.await_count == 1
+    query = driver.execute_query.await_args.args[0]
+    assert 'receipt.protocol = $receipt_protocol' in query
+    assert driver.execute_query.await_args.kwargs['receipt_protocol'] == (
+        GRAPHITI_RECONCILIATION_PROTOCOL
+    )
 
 
 @pytest.mark.asyncio
@@ -848,6 +930,7 @@ async def test_retirement_status_is_bound_to_matching_durable_request():
         'uuid': EPISODE_UUID,
         'group_id': 'opr',
         'retirement_request_id': RETIREMENT_REQUEST_ID,
+        'receipt_protocol': GRAPHITI_RECONCILIATION_PROTOCOL,
     }
 
 
@@ -904,6 +987,53 @@ async def test_neptune_retirement_status_cancels_crashed_pending_admission():
     assert "WHEN receipt.outcome = 'pending' THEN 'not_applied'" in query
     assert query.index('SET receipt._opr_conditional_delete_lock') < query.index(
         "WHEN receipt.outcome = 'pending' THEN 'not_applied'"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('provider', [GraphProvider.NEO4J, GraphProvider.NEPTUNE])
+@pytest.mark.parametrize(
+    'legacy_protocol',
+    [None, 'opr.graphiti.reconciliation/v3'],
+    ids=['missing-protocol', 'v3-protocol'],
+)
+async def test_retirement_status_rejects_legacy_receipt_protocol_before_resolution(
+    provider: GraphProvider,
+    legacy_protocol: str | None,
+):
+    async def execute_query(_query: str, **params):
+        assert legacy_protocol != params['receipt_protocol']
+        return [], None, None
+
+    driver = SimpleNamespace(
+        provider=provider,
+        execute_query=AsyncMock(side_effect=execute_query),
+    )
+    service = cast(ZepGraphiti, SimpleNamespace(driver=driver))
+
+    assert (
+        await ZepGraphiti.episode_retirement_outcome(
+            service,
+            EPISODE_UUID,
+            group_id='opr',
+            retirement_request_id=RETIREMENT_REQUEST_ID,
+        )
+        is None
+    )
+
+    assert driver.execute_query.await_count == 1
+    query = driver.execute_query.await_args.args[0]
+    assert 'receipt.protocol = $receipt_protocol' in query
+    first_effect_after_binding = (
+        "WHEN receipt.outcome = 'pending' THEN 'not_applied'"
+        if provider == GraphProvider.NEPTUNE
+        else 'OPTIONAL MATCH (episode:Episodic {uuid: $uuid})'
+    )
+    assert query.index('receipt.protocol = $receipt_protocol') < query.index(
+        first_effect_after_binding
+    )
+    assert driver.execute_query.await_args.kwargs['receipt_protocol'] == (
+        GRAPHITI_RECONCILIATION_PROTOCOL
     )
 
 
