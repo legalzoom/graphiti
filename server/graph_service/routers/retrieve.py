@@ -157,6 +157,7 @@ async def get_memory(
     result = await graphiti.search(
         group_ids=[request.group_id],
         query=combined_query,
+        center_node_uuid=request.center_node_uuid,
         num_results=request.max_facts,
     )
     facts = [get_fact_result_from_edge(edge) for edge in result]

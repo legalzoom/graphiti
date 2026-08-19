@@ -9,7 +9,13 @@ from graphiti_core.errors import NodeGroupMismatchError
 from pydantic import SecretStr
 
 from graph_service.config import Settings
-from graph_service.dto import AddEntityNodeRequest, AddMessagesRequest, Message, SearchQuery
+from graph_service.dto import (
+    AddEntityNodeRequest,
+    AddMessagesRequest,
+    GetMemoryRequest,
+    Message,
+    SearchQuery,
+)
 from graph_service.protocol import bearer_token_matches
 from graph_service.routers.ingest import (
     add_entity_node,
@@ -19,7 +25,7 @@ from graph_service.routers.ingest import (
     delete_episode,
     delete_group,
 )
-from graph_service.routers.retrieve import get_episodes, search
+from graph_service.routers.retrieve import get_episodes, get_memory, search
 from graph_service.zep_graphiti import ZepGraphiti
 
 
@@ -299,6 +305,39 @@ async def test_search_requires_opr_bearer_for_explicit_or_unrestricted_group_acc
     graphiti_search.reset_mock()
     await search(SearchQuery(query='query', group_ids=['other']), graphiti, settings)
     graphiti_search.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_memory_forwards_center_node_uuid_to_node_distance_search():
+    graphiti_search = AsyncMock(return_value=[])
+    graphiti = cast(ZepGraphiti, SimpleNamespace(search=graphiti_search))
+    request = GetMemoryRequest(
+        group_id='opr',
+        max_facts=7,
+        center_node_uuid='repo-entity-node',
+        messages=[
+            Message(
+                content='review context query',
+                role_type='user',
+                role=None,
+            )
+        ],
+    )
+
+    response = await get_memory(
+        request,
+        graphiti,
+        _settings(),
+        authorization=_bearer('opr-read-secret'),
+    )
+
+    assert response.facts == []
+    graphiti_search.assert_awaited_once_with(
+        group_ids=['opr'],
+        query='user(): review context query\n',
+        center_node_uuid='repo-entity-node',
+        num_results=7,
+    )
 
 
 @pytest.mark.asyncio
