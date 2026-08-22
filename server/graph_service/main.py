@@ -31,8 +31,8 @@ async def healthcheck():
         content={
             'status': 'healthy',
             'graphiti_core_version': version('graphiti-core'),
-            'ingest_queue_depth': ingest.async_worker.queue.qsize(),
-            'ingest_queue_maxsize': ingest.async_worker.queue.maxsize,
+            'ingest_queue_depth': ingest.async_worker.depth,
+            'ingest_queue_maxsize': ingest.async_worker.capacity,
         },
         status_code=200,
     )

@@ -2,7 +2,7 @@
 
 `graph_service.routers.ingest` resolves `INGEST_QUEUE_MAXSIZE` at import time:
 the module-level `async_worker` singleton needs a bound queue size to
-construct itself, and the application code applies no default for it -- an
+construct itself, and the application code applies no default for it. An
 unset value is a deploy-time misconfiguration, not something to paper over
 (see `_required_positive_int_env` in that module).
 

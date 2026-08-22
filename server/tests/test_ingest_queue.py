@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import cast
@@ -127,8 +128,8 @@ async def test_stop_drops_unprocessed_queue_items_documented_restart_loss(monkey
     """Pins the existing restart-loss behavior; this PR does not fix it.
 
     An in-memory queue cannot survive a pod restart. The OPR outbox producer
-    is durable and retries, so this loss is recovered by the caller -- but the
-    drop itself must still be logged, not silent.
+    is durable and retries, so this loss is recovered by the caller. The drop
+    itself must still be logged, not silent.
     """
     worker = AsyncWorker(maxsize=5)
     monkeypatch.setattr(ingest, 'async_worker', worker)
@@ -140,6 +141,34 @@ async def test_stop_drops_unprocessed_queue_items_documented_restart_loss(monkey
 
     assert worker.queue.qsize() == 0
     assert any('Dropping 3 unprocessed job' in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stop_counts_a_job_interrupted_mid_flight_as_dropped(monkeypatch, caplog):
+    """A job the worker had already dequeued is invisible to `queue.qsize()`.
+
+    If `stop()` only counted what is still sitting in the queue, cancelling
+    the worker while it is inside `await job()` would undercount the drop by
+    exactly the in-flight job, understating what a restart actually loses.
+    """
+    started_processing = asyncio.Event()
+    finish_processing = asyncio.Event()
+
+    async def slow_job():
+        started_processing.set()
+        await finish_processing.wait()
+
+    worker = AsyncWorker(maxsize=5)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    worker.queue.put_nowait(slow_job)
+    await worker.start()
+    await started_processing.wait()
+    assert worker.queue.qsize() == 0  # dequeued into the worker, not sitting in the queue
+
+    with caplog.at_level('WARNING'):
+        await worker.stop()
+
+    assert any('Dropping 1 unprocessed job' in record.message for record in caplog.records)
 
 
 @pytest.mark.asyncio

@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import os
+from collections.abc import Callable, Coroutine
 from contextlib import asynccontextmanager
 from functools import partial
 from importlib.metadata import version
-from typing import Annotated
+from typing import Annotated, Any
 
+from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, Header, HTTPException, status
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.errors import NodeGroupMismatchError
@@ -34,19 +36,33 @@ from graph_service.zep_graphiti import ZepGraphitiDep
 
 logger = logging.getLogger(__name__)
 
+# graph_service.config.Settings resolves its own fields from a local .env file
+# via pydantic-settings, which parses that file directly and never populates
+# os.environ. The plain os.environ read below would otherwise only ever see
+# INGEST_QUEUE_MAXSIZE when it is exported in the real process environment
+# (true in CI and in production), not when it only lives in a local .env
+# file. load_dotenv() closes that gap the same way tests/test_live_falkordb_int.py
+# already does for local runs, without overriding a real, already-exported
+# environment variable.
+load_dotenv()
+
 # The worker drains one job at a time (see AsyncWorker.worker below), so a job
 # that is mid-flight when a caller is rejected may still take several seconds
-# to clear (an episode add is an LLM round trip, not a cheap local write).
-# This is a hint, not a promise of drain time -- callers should back off with
-# jitter rather than hammer on exactly this cadence.
+# to clear: an episode add is an LLM round trip, not a cheap local write. This
+# is a hint, not a promise of drain time. Callers should back off with jitter
+# rather than hammer on exactly this cadence.
 INGEST_QUEUE_RETRY_AFTER_SECONDS = 5
+
+# A queued job: a zero-argument callable returning a coroutine, produced by
+# `partial(add_messages_task, m)` below.
+Job = Callable[[], Coroutine[Any, Any, None]]
 
 
 def _required_positive_int_env(name: str) -> int:
     """Read a required positive-integer environment variable.
 
     No default is applied. An unset or malformed value is a deploy-time
-    misconfiguration -- it must fail the process at startup, not silently pick
+    misconfiguration: it must fail the process at startup, not silently pick
     a number nobody chose.
     """
     raw = os.environ.get(name)
@@ -113,16 +129,33 @@ def _authorize_episode_retirement(
 
 class AsyncWorker:
     def __init__(self, maxsize: int | None = None):
-        self.queue: asyncio.Queue = asyncio.Queue(
+        self.queue: asyncio.Queue[Job] = asyncio.Queue(
             maxsize=maxsize if maxsize is not None else INGEST_QUEUE_MAXSIZE
         )
         self.task: asyncio.Task | None = None
+        # True exactly while `worker()` is inside `await job()`. A job in this
+        # state has already left the queue (so `queue.qsize()` cannot count
+        # it) but has not finished, so it still needs to be counted as
+        # dropped if shutdown interrupts it.
+        self._job_in_flight = False
+
+    @property
+    def depth(self) -> int:
+        return self.queue.qsize()
+
+    @property
+    def capacity(self) -> int:
+        return self.queue.maxsize
 
     async def worker(self):
         while True:
             try:
                 job = await self.queue.get()
-                await job()
+                self._job_in_flight = True
+                try:
+                    await job()
+                finally:
+                    self._job_in_flight = False
             except asyncio.CancelledError:
                 break
 
@@ -130,14 +163,20 @@ class AsyncWorker:
         self.task = asyncio.create_task(self.worker())
 
     async def stop(self):
+        # Capture before requesting cancellation: cancelling a task that is
+        # inside `await job()` runs that job's `finally` (above) as part of
+        # unwinding, which clears the flag before this coroutine resumes.
+        # Checking it now, rather than after `await self.task`, is what makes
+        # a job interrupted mid-flight actually get counted below.
+        job_in_flight = self._job_in_flight
         if self.task:
             self.task.cancel()
             await self.task
-        dropped = self.queue.qsize()
+        dropped = self.queue.qsize() + (1 if job_in_flight else 0)
         if dropped:
             # The queue is in-memory only: this is the known, accepted
-            # restart-loss behavior (durable retry lives in the OPR outbox
-            # producer, not here). Not silent -- logged so an operator sees
+            # restart-loss behavior. Durable retry lives in the OPR outbox
+            # producer, not here. Not silent: logged so an operator sees
             # exactly how many jobs a restart discarded.
             logger.warning(
                 f'Dropping {dropped} unprocessed job(s) from the in-memory ingest '
@@ -207,8 +246,8 @@ async def add_messages(
         )
 
     def _queue_full_response() -> JSONResponse:
-        depth = async_worker.queue.qsize()
-        maxsize = async_worker.queue.maxsize
+        depth = async_worker.depth
+        maxsize = async_worker.capacity
         logger.warning(
             f'Rejecting message batch for group_id={request.group_id!r}: '
             f'ingest queue is full (depth={depth}, maxsize={maxsize}). '
@@ -228,13 +267,13 @@ async def add_messages(
 
     # Reject the whole batch, not just the messages past the limit. Enqueueing
     # some of a batch and then telling the caller to retry the whole batch
-    # would requeue those already-accepted messages a second time on retry;
-    # messages without a caller-supplied uuid have no dedup key, so a partial
+    # would requeue those already-accepted messages a second time on retry.
+    # Messages without a caller-supplied uuid have no dedup key, so a partial
     # enqueue here would become a duplicate episode there. No `await` runs
     # between this check and the final `put_nowait` below, so nothing else on
     # this event loop can change queue occupancy in between: the check and the
     # enqueue are effectively one atomic step.
-    if async_worker.queue.qsize() + len(request.messages) > async_worker.queue.maxsize:
+    if async_worker.depth + len(request.messages) > async_worker.capacity:
         return _queue_full_response()
 
     for m in request.messages:
