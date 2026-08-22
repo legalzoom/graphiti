@@ -49,6 +49,7 @@ def test_privileged_listing_and_retirement_tokens_must_be_distinct():
         Settings.model_validate(
             {
                 'openai_api_key': 'test',
+                'ingest_queue_maxsize': 1000,
                 'opr_reconciliation_token': sentinel,
                 'opr_retirement_token': sentinel,
             }

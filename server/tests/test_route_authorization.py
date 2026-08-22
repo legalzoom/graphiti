@@ -80,7 +80,12 @@ def _bearer(token: str) -> str:
 )
 def test_all_configured_privileged_tokens_must_be_distinct(left: str, right: str):
     sentinel = 'same-secret-that-must-not-appear'
-    values = {'openai_api_key': 'test', left: sentinel, right: sentinel}
+    values = {
+        'openai_api_key': 'test',
+        'ingest_queue_maxsize': 1000,
+        left: sentinel,
+        right: sentinel,
+    }
 
     with pytest.raises(ValueError, match='privileged tokens must be distinct') as exc_info:
         Settings.model_validate(values)
@@ -94,6 +99,7 @@ def test_writer_fleet_epoch_requires_256_bit_minimum_without_leaking_input():
         Settings.model_validate(
             {
                 'openai_api_key': 'test',
+                'ingest_queue_maxsize': 1000,
                 'opr_writer_fleet_epoch': sentinel,
             }
         )

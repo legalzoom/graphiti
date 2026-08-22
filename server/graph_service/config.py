@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     opr_writer_fleet_epoch: SecretStr = SecretStr('')
     graphiti_admin_token: SecretStr = SecretStr('')
     graphiti_admin_clear_enabled: bool = False
+    ingest_queue_maxsize: int = Field(gt=0)
 
     model_config = SettingsConfigDict(
         env_file='.env',

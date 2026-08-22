@@ -1,18 +1,21 @@
 """Shared test-collection setup for the graph-service test suite.
 
-`graph_service.routers.ingest` resolves `INGEST_QUEUE_MAXSIZE` at import time:
-the module-level `async_worker` singleton needs a bound queue size to
-construct itself, and the application code applies no default for it. An
-unset value is a deploy-time misconfiguration, not something to paper over
-(see `_required_positive_int_env` in that module).
-
-Several test files import handler functions straight from
-`graph_service.routers.ingest`, which triggers that import-time resolution
-during collection. Give the test environment an explicit value here, the same
-way CI sets `SEMAPHORE_LIMIT` explicitly for the live server suite, without
-touching every test file individually.
+`graph_service.routers.ingest.async_worker` is a module-level singleton that
+starts unconfigured: it only gets a bound queue size from
+`Settings.ingest_queue_maxsize` when the app's lifespan runs (see
+`AsyncWorker.configure` in that module). A handful of tests call the real
+`add_messages` handler directly, without spinning up the app or monkeypatching
+`ingest.async_worker`, so they need the shared singleton configured before
+they run. This fixture does that the same way production does: by calling
+`configure()`, not by exporting an environment variable for import-time code
+to read.
 """
 
-import os
+import pytest
 
-os.environ.setdefault('INGEST_QUEUE_MAXSIZE', '1000')
+from graph_service.routers import ingest
+
+
+@pytest.fixture(autouse=True)
+def _configure_shared_ingest_queue():
+    ingest.async_worker.configure(1000)

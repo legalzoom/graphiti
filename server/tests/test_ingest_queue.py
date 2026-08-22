@@ -5,6 +5,8 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import FastAPI
+from pydantic import ValidationError
 from starlette.responses import JSONResponse
 
 import graph_service.main as graph_service_main
@@ -13,6 +15,12 @@ from graph_service.dto import AddMessagesRequest, Message, Result
 from graph_service.routers import ingest
 from graph_service.routers.ingest import AsyncWorker, add_messages
 from graph_service.zep_graphiti import ZepGraphiti
+
+
+def _settings_values(**overrides) -> dict:
+    values = {'openai_api_key': 'test-key', 'ingest_queue_maxsize': 1000}
+    values.update(overrides)
+    return values
 
 
 def _settings() -> Settings:
@@ -57,9 +65,7 @@ async def test_enqueue_up_to_maxsize_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_request_past_maxsize_gets_503_with_retry_after_and_does_not_grow_queue(
-    monkeypatch,
-):
+async def test_request_past_maxsize_gets_503_and_does_not_grow_queue(monkeypatch):
     worker = AsyncWorker(maxsize=2)
     monkeypatch.setattr(ingest, 'async_worker', worker)
     await add_messages(_request(2), _graphiti(), _settings())
@@ -69,7 +75,7 @@ async def test_request_past_maxsize_gets_503_with_retry_after_and_does_not_grow_
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 503
-    assert response.headers['Retry-After'] == str(ingest.INGEST_QUEUE_RETRY_AFTER_SECONDS)
+    assert 'Retry-After' not in response.headers
     body = _json_body(response)
     assert body == {
         'success': False,
@@ -184,20 +190,45 @@ async def test_healthcheck_exposes_ingest_queue_depth_and_maxsize(monkeypatch):
     assert body['ingest_queue_maxsize'] == 5
 
 
-def test_required_positive_int_env_rejects_missing_value(monkeypatch):
-    monkeypatch.delenv('INGEST_QUEUE_MAXSIZE', raising=False)
-    with pytest.raises(RuntimeError, match='INGEST_QUEUE_MAXSIZE'):
-        ingest._required_positive_int_env('INGEST_QUEUE_MAXSIZE')
+def test_settings_requires_ingest_queue_maxsize():
+    values = _settings_values()
+    del values['ingest_queue_maxsize']
+    with pytest.raises(ValidationError, match='ingest_queue_maxsize'):
+        Settings.model_validate(values)
 
 
-def test_required_positive_int_env_rejects_non_integer_value(monkeypatch):
-    monkeypatch.setenv('INGEST_QUEUE_MAXSIZE', 'not-an-int')
-    with pytest.raises(RuntimeError, match='INGEST_QUEUE_MAXSIZE'):
-        ingest._required_positive_int_env('INGEST_QUEUE_MAXSIZE')
+def test_settings_rejects_non_integer_ingest_queue_maxsize():
+    with pytest.raises(ValidationError, match='ingest_queue_maxsize'):
+        Settings.model_validate(_settings_values(ingest_queue_maxsize='not-an-int'))
 
 
-@pytest.mark.parametrize('value', ['0', '-1'])
-def test_required_positive_int_env_rejects_zero_or_negative_value(monkeypatch, value):
-    monkeypatch.setenv('INGEST_QUEUE_MAXSIZE', value)
-    with pytest.raises(RuntimeError, match='INGEST_QUEUE_MAXSIZE'):
-        ingest._required_positive_int_env('INGEST_QUEUE_MAXSIZE')
+@pytest.mark.parametrize('value', [0, -1])
+def test_settings_rejects_non_positive_ingest_queue_maxsize(value):
+    with pytest.raises(ValidationError, match='ingest_queue_maxsize'):
+        Settings.model_validate(_settings_values(ingest_queue_maxsize=value))
+
+
+def test_async_worker_unconfigured_use_raises_instead_of_falling_back():
+    """No configure() call means no assumed queue size, not an unbounded one."""
+    worker = AsyncWorker()
+
+    with pytest.raises(RuntimeError, match='configure'):
+        _ = worker.depth
+
+
+@pytest.mark.asyncio
+async def test_lifespan_configures_async_worker_from_settings(monkeypatch):
+    """The worker's bound size comes from Settings at startup, not import time."""
+    settings = Settings.model_validate(_settings_values(ingest_queue_maxsize=7))
+    monkeypatch.setattr(ingest, 'get_settings', lambda: settings)
+    worker = AsyncWorker()
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+
+    async with ingest.lifespan(cast(FastAPI, SimpleNamespace())):
+        assert worker.capacity == 7
+        assert worker.task is not None
+        # Let the worker task actually take its first turn before the context
+        # exits and cancels it; cancelling a task before it has ever run once
+        # raises CancelledError straight through `await self.task` instead of
+        # letting `worker()`'s own try/except handle it.
+        await asyncio.sleep(0)

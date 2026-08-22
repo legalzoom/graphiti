@@ -1,13 +1,11 @@
 import asyncio
 import logging
-import os
 from collections.abc import Callable, Coroutine
 from contextlib import asynccontextmanager
 from functools import partial
 from importlib.metadata import version
 from typing import Annotated, Any
 
-from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, Header, HTTPException, status
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.errors import NodeGroupMismatchError
@@ -16,7 +14,7 @@ from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 from starlette.responses import JSONResponse
 
-from graph_service.config import ZepEnvDep
+from graph_service.config import ZepEnvDep, get_settings
 from graph_service.dto import (
     AddEntityNodeRequest,
     AddMessagesRequest,
@@ -36,48 +34,9 @@ from graph_service.zep_graphiti import ZepGraphitiDep
 
 logger = logging.getLogger(__name__)
 
-# graph_service.config.Settings resolves its own fields from a local .env file
-# via pydantic-settings, which parses that file directly and never populates
-# os.environ. The plain os.environ read below would otherwise only ever see
-# INGEST_QUEUE_MAXSIZE when it is exported in the real process environment
-# (true in CI and in production), not when it only lives in a local .env
-# file. load_dotenv() closes that gap the same way tests/test_live_falkordb_int.py
-# already does for local runs, without overriding a real, already-exported
-# environment variable.
-load_dotenv()
-
-# The worker drains one job at a time (see AsyncWorker.worker below), so a job
-# that is mid-flight when a caller is rejected may still take several seconds
-# to clear: an episode add is an LLM round trip, not a cheap local write. This
-# is a hint, not a promise of drain time. Callers should back off with jitter
-# rather than hammer on exactly this cadence.
-INGEST_QUEUE_RETRY_AFTER_SECONDS = 5
-
 # A queued job: a zero-argument callable returning a coroutine, produced by
 # `partial(add_messages_task, m)` below.
 Job = Callable[[], Coroutine[Any, Any, None]]
-
-
-def _required_positive_int_env(name: str) -> int:
-    """Read a required positive-integer environment variable.
-
-    No default is applied. An unset or malformed value is a deploy-time
-    misconfiguration: it must fail the process at startup, not silently pick
-    a number nobody chose.
-    """
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == '':
-        raise RuntimeError(f'{name} must be set to a positive integer')
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f'{name} must be a positive integer, got {raw!r}') from exc
-    if value <= 0:
-        raise RuntimeError(f'{name} must be a positive integer, got {raw!r}')
-    return value
-
-
-INGEST_QUEUE_MAXSIZE = _required_positive_int_env('INGEST_QUEUE_MAXSIZE')
 
 
 def _authorize_opr_write(
@@ -129,15 +88,32 @@ def _authorize_episode_retirement(
 
 class AsyncWorker:
     def __init__(self, maxsize: int | None = None):
-        self.queue: asyncio.Queue[Job] = asyncio.Queue(
-            maxsize=maxsize if maxsize is not None else INGEST_QUEUE_MAXSIZE
-        )
+        self._queue: asyncio.Queue[Job] | None = None
         self.task: asyncio.Task | None = None
         # True exactly while `worker()` is inside `await job()`. A job in this
         # state has already left the queue (so `queue.qsize()` cannot count
         # it) but has not finished, so it still needs to be counted as
         # dropped if shutdown interrupts it.
         self._job_in_flight = False
+        if maxsize is not None:
+            self.configure(maxsize)
+
+    def configure(self, maxsize: int) -> None:
+        """Bind this worker to a bounded queue of the given size.
+
+        Called once, at lifespan startup, with the size resolved from
+        `Settings.ingest_queue_maxsize`. Not called at import time: the
+        module-level `async_worker` singleton below is otherwise unconfigured,
+        and using it before `configure()` raises rather than silently
+        assuming an unbounded queue.
+        """
+        self._queue = asyncio.Queue(maxsize=maxsize)
+
+    @property
+    def queue(self) -> asyncio.Queue[Job]:
+        if self._queue is None:
+            raise RuntimeError('AsyncWorker.configure() must be called before use')
+        return self._queue
 
     @property
     def depth(self) -> int:
@@ -191,6 +167,8 @@ async_worker = AsyncWorker()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    settings = get_settings()
+    async_worker.configure(settings.ingest_queue_maxsize)
     await async_worker.start()
     yield
     await async_worker.stop()
@@ -209,7 +187,7 @@ router = APIRouter(lifespan=lifespan)
     response_model=None,
     responses={
         status.HTTP_503_SERVICE_UNAVAILABLE: {
-            'description': 'Ingestion queue is at capacity; retry after the given delay.',
+            'description': 'Ingestion queue is at capacity; retry later.',
         },
     },
 )
@@ -255,7 +233,6 @@ async def add_messages(
         )
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            headers={'Retry-After': str(INGEST_QUEUE_RETRY_AFTER_SECONDS)},
             content={
                 'success': False,
                 'error': 'ingest_queue_full',
