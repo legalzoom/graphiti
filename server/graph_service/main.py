@@ -28,6 +28,11 @@ app.include_router(ingest.router)
 @app.get('/healthcheck')
 async def healthcheck():
     return JSONResponse(
-        content={'status': 'healthy', 'graphiti_core_version': version('graphiti-core')},
+        content={
+            'status': 'healthy',
+            'graphiti_core_version': version('graphiti-core'),
+            'ingest_queue_depth': ingest.async_worker.queue.qsize(),
+            'ingest_queue_maxsize': ingest.async_worker.queue.maxsize,
+        },
         status_code=200,
     )

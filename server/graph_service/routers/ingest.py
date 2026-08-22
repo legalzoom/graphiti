@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import os
 from contextlib import asynccontextmanager
 from functools import partial
 from importlib.metadata import version
@@ -29,6 +31,37 @@ from graph_service.protocol import (
     writer_fleet_epoch_sha256,
 )
 from graph_service.zep_graphiti import ZepGraphitiDep
+
+logger = logging.getLogger(__name__)
+
+# The worker drains one job at a time (see AsyncWorker.worker below), so a job
+# that is mid-flight when a caller is rejected may still take several seconds
+# to clear (an episode add is an LLM round trip, not a cheap local write).
+# This is a hint, not a promise of drain time -- callers should back off with
+# jitter rather than hammer on exactly this cadence.
+INGEST_QUEUE_RETRY_AFTER_SECONDS = 5
+
+
+def _required_positive_int_env(name: str) -> int:
+    """Read a required positive-integer environment variable.
+
+    No default is applied. An unset or malformed value is a deploy-time
+    misconfiguration -- it must fail the process at startup, not silently pick
+    a number nobody chose.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == '':
+        raise RuntimeError(f'{name} must be set to a positive integer')
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f'{name} must be a positive integer, got {raw!r}') from exc
+    if value <= 0:
+        raise RuntimeError(f'{name} must be a positive integer, got {raw!r}')
+    return value
+
+
+INGEST_QUEUE_MAXSIZE = _required_positive_int_env('INGEST_QUEUE_MAXSIZE')
 
 
 def _authorize_opr_write(
@@ -79,14 +112,15 @@ def _authorize_episode_retirement(
 
 
 class AsyncWorker:
-    def __init__(self):
-        self.queue = asyncio.Queue()
-        self.task = None
+    def __init__(self, maxsize: int | None = None):
+        self.queue: asyncio.Queue = asyncio.Queue(
+            maxsize=maxsize if maxsize is not None else INGEST_QUEUE_MAXSIZE
+        )
+        self.task: asyncio.Task | None = None
 
     async def worker(self):
         while True:
             try:
-                print(f'Got a job: (size of remaining queue: {self.queue.qsize()})')
                 job = await self.queue.get()
                 await job()
             except asyncio.CancelledError:
@@ -99,6 +133,16 @@ class AsyncWorker:
         if self.task:
             self.task.cancel()
             await self.task
+        dropped = self.queue.qsize()
+        if dropped:
+            # The queue is in-memory only: this is the known, accepted
+            # restart-loss behavior (durable retry lives in the OPR outbox
+            # producer, not here). Not silent -- logged so an operator sees
+            # exactly how many jobs a restart discarded.
+            logger.warning(
+                f'Dropping {dropped} unprocessed job(s) from the in-memory ingest '
+                'queue on shutdown; this queue is not durable across restarts.'
+            )
         while not self.queue.empty():
             self.queue.get_nowait()
 
@@ -116,13 +160,26 @@ async def lifespan(_: FastAPI):
 router = APIRouter(lifespan=lifespan)
 
 
-@router.post('/messages', status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    '/messages',
+    status_code=status.HTTP_202_ACCEPTED,
+    # The success and 503-rejection payloads are different shapes (Result vs.
+    # a plain error dict), so there is no single Pydantic response_model to
+    # infer from the `Result | JSONResponse` return annotation. Declare it
+    # explicitly rather than let FastAPI fail at startup trying to build one.
+    response_model=None,
+    responses={
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            'description': 'Ingestion queue is at capacity; retry after the given delay.',
+        },
+    },
+)
 async def add_messages(
     request: AddMessagesRequest,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
     authorization: Annotated[str | None, Header()] = None,
-):
+) -> Result | JSONResponse:
     _authorize_opr_write(settings, authorization, request.group_id)
 
     try:
@@ -149,8 +206,49 @@ async def add_messages(
             source_description=m.source_description,
         )
 
+    def _queue_full_response() -> JSONResponse:
+        depth = async_worker.queue.qsize()
+        maxsize = async_worker.queue.maxsize
+        logger.warning(
+            f'Rejecting message batch for group_id={request.group_id!r}: '
+            f'ingest queue is full (depth={depth}, maxsize={maxsize}). '
+            'Producer is expected to retry.'
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={'Retry-After': str(INGEST_QUEUE_RETRY_AFTER_SECONDS)},
+            content={
+                'success': False,
+                'error': 'ingest_queue_full',
+                'message': 'Ingestion queue is at capacity; retry later.',
+                'queue_depth': depth,
+                'queue_maxsize': maxsize,
+            },
+        )
+
+    # Reject the whole batch, not just the messages past the limit. Enqueueing
+    # some of a batch and then telling the caller to retry the whole batch
+    # would requeue those already-accepted messages a second time on retry;
+    # messages without a caller-supplied uuid have no dedup key, so a partial
+    # enqueue here would become a duplicate episode there. No `await` runs
+    # between this check and the final `put_nowait` below, so nothing else on
+    # this event loop can change queue occupancy in between: the check and the
+    # enqueue are effectively one atomic step.
+    if async_worker.queue.qsize() + len(request.messages) > async_worker.queue.maxsize:
+        return _queue_full_response()
+
     for m in request.messages:
-        await async_worker.queue.put(partial(add_messages_task, m))
+        try:
+            async_worker.queue.put_nowait(partial(add_messages_task, m))
+        except asyncio.QueueFull:
+            # Should be unreachable given the capacity check above (this
+            # endpoint is the queue's only producer). Fail loudly rather than
+            # assume: something violated that single-producer assumption.
+            raise RuntimeError(
+                'ingest queue rejected a put_nowait despite the capacity check '
+                'that should have prevented it; the single-producer invariant '
+                'for this queue has been violated'
+            ) from None
 
     return Result(message='Messages added to processing queue', success=True)
 

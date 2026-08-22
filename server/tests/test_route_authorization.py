@@ -14,6 +14,7 @@ from graph_service.dto import (
     AddMessagesRequest,
     GetMemoryRequest,
     Message,
+    Result,
     SearchQuery,
 )
 from graph_service.protocol import bearer_token_matches
@@ -141,6 +142,7 @@ async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue()
         settings,
         authorization=_bearer('opr-write-secret'),
     )
+    assert isinstance(result, Result)
     assert result.success is True
 
 
