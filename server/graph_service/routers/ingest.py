@@ -6,7 +6,7 @@ from functools import partial
 from importlib.metadata import version
 from typing import Annotated, Any
 
-from fastapi import APIRouter, FastAPI, Header, HTTPException, status
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, status
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.errors import NodeGroupMismatchError
 from graphiti_core.helpers import query_result_record_count
@@ -30,7 +30,7 @@ from graph_service.protocol import (
     reconciliation_token_matches,
     writer_fleet_epoch_sha256,
 )
-from graph_service.zep_graphiti import ZepGraphitiDep
+from graph_service.zep_graphiti import ZepGraphitiDep, graphiti_client_from_app
 
 logger = logging.getLogger(__name__)
 
@@ -130,13 +130,54 @@ class AsyncWorker:
                 self._job_in_flight = True
                 try:
                     await job()
+                except Exception:
+                    # A failing job must not take the consumer down with it.
+                    # Before this, any non-CancelledError exception (an
+                    # embedder timeout, a graph driver error) propagated out of
+                    # `while True` and ended the worker task for good. Nothing
+                    # logged it, because the task is only ever awaited in
+                    # `stop()`, so the exception sat unretrieved and the only
+                    # symptom was ingest going quiet while `/messages` kept
+                    # accepting work -- a dead consumer against a live producer
+                    # is exactly how this queue grew until the pod was
+                    # OOMKilled. Log the whole traceback and keep draining.
+                    #
+                    # `asyncio.CancelledError` derives from BaseException, so
+                    # it is not caught here: it unwinds through the `finally`
+                    # below to the loop's own handler, which breaks.
+                    logger.exception(
+                        f'Ingest worker job raised; dropping that job and continuing to '
+                        f'drain the queue (depth={self.queue.qsize()}, '
+                        f'maxsize={self.queue.maxsize}).'
+                    )
                 finally:
                     self._job_in_flight = False
             except asyncio.CancelledError:
                 break
 
+    @staticmethod
+    def _log_worker_exit(task: asyncio.Task) -> None:
+        """Surface a worker task that died instead of letting it go unnoticed.
+
+        `worker()` above no longer exits on a job failure, but if it ever does
+        exit unexpectedly the queue has no consumer at all and every later
+        `/messages` call fills it until it rejects with 503. `stop()` is the
+        only other place the task is awaited, and on a crashed worker that
+        await may never happen, so retrieve and log the exception here.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.critical(
+                'Ingest worker task exited unexpectedly; the ingest queue now has no '
+                'consumer and will fill until /messages rejects every batch.',
+                exc_info=exc,
+            )
+
     async def start(self):
         self.task = asyncio.create_task(self.worker())
+        self.task.add_done_callback(self._log_worker_exit)
 
     async def stop(self):
         # Capture before requesting cancellation: cancelling a task that is
@@ -193,6 +234,7 @@ router = APIRouter(lifespan=lifespan)
 )
 async def add_messages(
     request: AddMessagesRequest,
+    http_request: Request,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
     authorization: Annotated[str | None, Header()] = None,
@@ -212,10 +254,24 @@ async def add_messages(
             detail='episode UUID is already owned by another graph group',
         ) from exc
 
+    # Capture the application, not the request-scoped client, and not the
+    # request body: a queued job must pin as little as possible, because it can
+    # sit in the queue for as long as the queue is deep.
+    app = http_request.app
+    group_id = request.group_id
+
     async def add_messages_task(m: Message):
-        await graphiti.add_episode(
+        # Resolve the shared client when the job runs, not when it is queued.
+        # Closing over the injected `graphiti` value was two bugs at once: it
+        # pinned a whole per-request client stack (three AsyncOpenAI clients
+        # with their own connection pools, plus a graph driver) inside the
+        # queue, and `/messages` returns 202 before the job runs, so the old
+        # per-request dependency had already closed that driver by the time the
+        # job called into it.
+        client = graphiti_client_from_app(app)
+        await client.add_episode(
             uuid=m.uuid,
-            group_id=request.group_id,
+            group_id=group_id,
             name=m.name,
             episode_body=f'{m.role or ""}({m.role_type}): {m.content}',
             reference_time=m.timestamp,

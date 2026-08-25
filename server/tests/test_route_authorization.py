@@ -3,7 +3,7 @@ from typing import cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.errors import NodeGroupMismatchError
 from pydantic import SecretStr
@@ -27,7 +27,20 @@ from graph_service.routers.ingest import (
     delete_group,
 )
 from graph_service.routers.retrieve import get_episodes, get_memory, search
-from graph_service.zep_graphiti import ZepGraphiti
+from graph_service.zep_graphiti import GRAPHITI_CLIENT_STATE_ATTR, ZepGraphiti
+
+
+def _http_request(graphiti: ZepGraphiti | None = None) -> Request:
+    """A stand-in for the Starlette request `add_messages` now takes.
+
+    `add_messages` needs the application only to resolve the shared Graphiti
+    client from app state when a queued job actually runs. These tests never
+    run a queued job, so an empty state is enough unless a client is passed.
+    """
+    state = SimpleNamespace()
+    if graphiti is not None:
+        setattr(state, GRAPHITI_CLIENT_STATE_ATTR, graphiti)
+    return cast(Request, SimpleNamespace(app=SimpleNamespace(state=state)))
 
 
 def _settings(
@@ -130,12 +143,13 @@ async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue()
     settings = _settings()
 
     with pytest.raises(HTTPException) as exc_info:
-        await add_messages(request, graphiti, settings)
+        await add_messages(request, _http_request(graphiti), graphiti, settings)
     assert exc_info.value.status_code == 403
 
     with pytest.raises(HTTPException) as exc_info:
         await add_messages(
             request,
+            _http_request(graphiti),
             graphiti,
             settings,
             authorization=_bearer('opr-read-secret'),
@@ -144,6 +158,7 @@ async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue()
 
     result = await add_messages(
         request,
+        _http_request(graphiti),
         graphiti,
         settings,
         authorization=_bearer('opr-write-secret'),
@@ -173,7 +188,7 @@ async def test_message_write_rejects_known_cross_group_uuid_before_enqueue():
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await add_messages(request, graphiti, _settings())
+        await add_messages(request, _http_request(graphiti), graphiti, _settings())
 
     assert exc_info.value.status_code == 409
     assert_episode_uuid_group.assert_awaited_once_with('opr-owned-episode', 'other')
