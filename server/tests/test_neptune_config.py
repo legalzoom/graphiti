@@ -11,6 +11,7 @@ from graph_service.config import Settings
 def _settings(**overrides) -> Settings:
     values = {
         'openai_api_key': 'test-key',
+        'ingest_queue_maxsize': 1000,
         'db_backend': 'neptune',
         'neptune_host': 'neptune-db://cluster.example',
         'aoss_host': 'search.example',

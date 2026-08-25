@@ -1,10 +1,12 @@
 import asyncio
+import logging
+from collections.abc import Callable, Coroutine
 from contextlib import asynccontextmanager
 from functools import partial
 from importlib.metadata import version
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, FastAPI, Header, HTTPException, status
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, status
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.errors import NodeGroupMismatchError
 from graphiti_core.helpers import query_result_record_count
@@ -12,7 +14,7 @@ from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 from starlette.responses import JSONResponse
 
-from graph_service.config import ZepEnvDep
+from graph_service.config import ZepEnvDep, get_settings
 from graph_service.dto import (
     AddEntityNodeRequest,
     AddMessagesRequest,
@@ -28,7 +30,13 @@ from graph_service.protocol import (
     reconciliation_token_matches,
     writer_fleet_epoch_sha256,
 )
-from graph_service.zep_graphiti import ZepGraphitiDep
+from graph_service.zep_graphiti import ZepGraphitiDep, graphiti_client_from_app
+
+logger = logging.getLogger(__name__)
+
+# A queued job: a zero-argument callable returning a coroutine, produced by
+# `partial(add_messages_task, m)` below.
+Job = Callable[[], Coroutine[Any, Any, None]]
 
 
 def _authorize_opr_write(
@@ -79,26 +87,118 @@ def _authorize_episode_retirement(
 
 
 class AsyncWorker:
-    def __init__(self):
-        self.queue = asyncio.Queue()
-        self.task = None
+    def __init__(self, maxsize: int | None = None):
+        self._queue: asyncio.Queue[Job] | None = None
+        self.task: asyncio.Task | None = None
+        # True exactly while `worker()` is inside `await job()`. A job in this
+        # state has already left the queue (so `queue.qsize()` cannot count
+        # it) but has not finished, so it still needs to be counted as
+        # dropped if shutdown interrupts it.
+        self._job_in_flight = False
+        if maxsize is not None:
+            self.configure(maxsize)
+
+    def configure(self, maxsize: int) -> None:
+        """Bind this worker to a bounded queue of the given size.
+
+        Called once, at lifespan startup, with the size resolved from
+        `Settings.ingest_queue_maxsize`. Not called at import time: the
+        module-level `async_worker` singleton below is otherwise unconfigured,
+        and using it before `configure()` raises rather than silently
+        assuming an unbounded queue.
+        """
+        self._queue = asyncio.Queue(maxsize=maxsize)
+
+    @property
+    def queue(self) -> asyncio.Queue[Job]:
+        if self._queue is None:
+            raise RuntimeError('AsyncWorker.configure() must be called before use')
+        return self._queue
+
+    @property
+    def depth(self) -> int:
+        return self.queue.qsize()
+
+    @property
+    def capacity(self) -> int:
+        return self.queue.maxsize
 
     async def worker(self):
         while True:
             try:
-                print(f'Got a job: (size of remaining queue: {self.queue.qsize()})')
                 job = await self.queue.get()
-                await job()
+                self._job_in_flight = True
+                try:
+                    await job()
+                except Exception:
+                    # A failing job must not take the consumer down with it.
+                    # Before this, any non-CancelledError exception (an
+                    # embedder timeout, a graph driver error) propagated out of
+                    # `while True` and ended the worker task for good. Nothing
+                    # logged it, because the task is only ever awaited in
+                    # `stop()`, so the exception sat unretrieved and the only
+                    # symptom was ingest going quiet while `/messages` kept
+                    # accepting work -- a dead consumer against a live producer
+                    # is exactly how this queue grew until the pod was
+                    # OOMKilled. Log the whole traceback and keep draining.
+                    #
+                    # `asyncio.CancelledError` derives from BaseException, so
+                    # it is not caught here: it unwinds through the `finally`
+                    # below to the loop's own handler, which breaks.
+                    logger.exception(
+                        f'Ingest worker job raised; dropping that job and continuing to '
+                        f'drain the queue (depth={self.queue.qsize()}, '
+                        f'maxsize={self.queue.maxsize}).'
+                    )
+                finally:
+                    self._job_in_flight = False
             except asyncio.CancelledError:
                 break
 
+    @staticmethod
+    def _log_worker_exit(task: asyncio.Task) -> None:
+        """Surface a worker task that died instead of letting it go unnoticed.
+
+        `worker()` above no longer exits on a job failure, but if it ever does
+        exit unexpectedly the queue has no consumer at all and every later
+        `/messages` call fills it until it rejects with 503. `stop()` is the
+        only other place the task is awaited, and on a crashed worker that
+        await may never happen, so retrieve and log the exception here.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.critical(
+                'Ingest worker task exited unexpectedly; the ingest queue now has no '
+                'consumer and will fill until /messages rejects every batch.',
+                exc_info=exc,
+            )
+
     async def start(self):
         self.task = asyncio.create_task(self.worker())
+        self.task.add_done_callback(self._log_worker_exit)
 
     async def stop(self):
+        # Capture before requesting cancellation: cancelling a task that is
+        # inside `await job()` runs that job's `finally` (above) as part of
+        # unwinding, which clears the flag before this coroutine resumes.
+        # Checking it now, rather than after `await self.task`, is what makes
+        # a job interrupted mid-flight actually get counted below.
+        job_in_flight = self._job_in_flight
         if self.task:
             self.task.cancel()
             await self.task
+        dropped = self.queue.qsize() + (1 if job_in_flight else 0)
+        if dropped:
+            # The queue is in-memory only: this is the known, accepted
+            # restart-loss behavior. Durable retry lives in the OPR outbox
+            # producer, not here. Not silent: logged so an operator sees
+            # exactly how many jobs a restart discarded.
+            logger.warning(
+                f'Dropping {dropped} unprocessed job(s) from the in-memory ingest '
+                'queue on shutdown; this queue is not durable across restarts.'
+            )
         while not self.queue.empty():
             self.queue.get_nowait()
 
@@ -108,6 +208,8 @@ async_worker = AsyncWorker()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    settings = get_settings()
+    async_worker.configure(settings.ingest_queue_maxsize)
     await async_worker.start()
     yield
     await async_worker.stop()
@@ -116,13 +218,27 @@ async def lifespan(_: FastAPI):
 router = APIRouter(lifespan=lifespan)
 
 
-@router.post('/messages', status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    '/messages',
+    status_code=status.HTTP_202_ACCEPTED,
+    # The success and 503-rejection payloads are different shapes (Result vs.
+    # a plain error dict), so there is no single Pydantic response_model to
+    # infer from the `Result | JSONResponse` return annotation. Declare it
+    # explicitly rather than let FastAPI fail at startup trying to build one.
+    response_model=None,
+    responses={
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            'description': 'Ingestion queue is at capacity; retry later.',
+        },
+    },
+)
 async def add_messages(
     request: AddMessagesRequest,
+    http_request: Request,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
     authorization: Annotated[str | None, Header()] = None,
-):
+) -> Result | JSONResponse:
     _authorize_opr_write(settings, authorization, request.group_id)
 
     try:
@@ -138,10 +254,24 @@ async def add_messages(
             detail='episode UUID is already owned by another graph group',
         ) from exc
 
+    # Capture the application, not the request-scoped client, and not the
+    # request body: a queued job must pin as little as possible, because it can
+    # sit in the queue for as long as the queue is deep.
+    app = http_request.app
+    group_id = request.group_id
+
     async def add_messages_task(m: Message):
-        await graphiti.add_episode(
+        # Resolve the shared client when the job runs, not when it is queued.
+        # Closing over the injected `graphiti` value was two bugs at once: it
+        # pinned a whole per-request client stack (three AsyncOpenAI clients
+        # with their own connection pools, plus a graph driver) inside the
+        # queue, and `/messages` returns 202 before the job runs, so the old
+        # per-request dependency had already closed that driver by the time the
+        # job called into it.
+        client = graphiti_client_from_app(app)
+        await client.add_episode(
             uuid=m.uuid,
-            group_id=request.group_id,
+            group_id=group_id,
             name=m.name,
             episode_body=f'{m.role or ""}({m.role_type}): {m.content}',
             reference_time=m.timestamp,
@@ -149,8 +279,48 @@ async def add_messages(
             source_description=m.source_description,
         )
 
+    def _queue_full_response() -> JSONResponse:
+        depth = async_worker.depth
+        maxsize = async_worker.capacity
+        logger.warning(
+            f'Rejecting message batch for group_id={request.group_id!r}: '
+            f'ingest queue is full (depth={depth}, maxsize={maxsize}). '
+            'Producer is expected to retry.'
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                'success': False,
+                'error': 'ingest_queue_full',
+                'message': 'Ingestion queue is at capacity; retry later.',
+                'queue_depth': depth,
+                'queue_maxsize': maxsize,
+            },
+        )
+
+    # Reject the whole batch, not just the messages past the limit. Enqueueing
+    # some of a batch and then telling the caller to retry the whole batch
+    # would requeue those already-accepted messages a second time on retry.
+    # Messages without a caller-supplied uuid have no dedup key, so a partial
+    # enqueue here would become a duplicate episode there. No `await` runs
+    # between this check and the final `put_nowait` below, so nothing else on
+    # this event loop can change queue occupancy in between: the check and the
+    # enqueue are effectively one atomic step.
+    if async_worker.depth + len(request.messages) > async_worker.capacity:
+        return _queue_full_response()
+
     for m in request.messages:
-        await async_worker.queue.put(partial(add_messages_task, m))
+        try:
+            async_worker.queue.put_nowait(partial(add_messages_task, m))
+        except asyncio.QueueFull:
+            # Should be unreachable given the capacity check above (this
+            # endpoint is the queue's only producer). Fail loudly rather than
+            # assume: something violated that single-producer assumption.
+            raise RuntimeError(
+                'ingest queue rejected a put_nowait despite the capacity check '
+                'that should have prevented it; the single-producer invariant '
+                'for this queue has been violated'
+            ) from None
 
     return Result(message='Messages added to processing queue', success=True)
 

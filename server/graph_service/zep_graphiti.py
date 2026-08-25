@@ -4,7 +4,7 @@ import logging
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from graphiti_core import Graphiti  # type: ignore
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.record_parsers import episodic_node_from_record
@@ -23,7 +23,7 @@ from graphiti_core.models.nodes.node_db_queries import (
 )
 from graphiti_core.nodes import EntityNode, EpisodicNode  # type: ignore
 
-from graph_service.config import ZepEnvDep
+from graph_service.config import Settings, ZepEnvDep
 from graph_service.dto import FactResult
 from graph_service.protocol import GRAPHITI_RECONCILIATION_PROTOCOL
 
@@ -675,27 +675,71 @@ def _create_graphiti_client(settings: ZepEnvDep) -> ZepGraphiti:
         )
 
 
-async def get_graphiti(settings: ZepEnvDep):
+# Attribute on `app.state` holding the one shared Graphiti client for the
+# process. Written once by the application lifespan; read by every request
+# dependency and every queued ingest job.
+GRAPHITI_CLIENT_STATE_ATTR = 'graphiti_client'
+
+
+def build_graphiti_client(settings: Settings) -> ZepGraphiti:
+    """Construct the single process-wide Graphiti client.
+
+    Called exactly once, from application lifespan startup, and never per
+    request. `Graphiti.__init__` builds three separate `AsyncOpenAI`
+    instances (LLM, embedder, reranker), each with its own httpx connection
+    pool and SSLContext, on top of a graph driver. Building that stack per
+    HTTP request is what turned a stalled ingest worker into an OOM loop:
+    every job sitting in the ingest queue pinned an entire per-request client
+    stack alive, so the queue grew in megabytes per item rather than
+    kilobytes.
+
+    All configuration comes from the process-wide `Settings` (itself an
+    `lru_cache` singleton), so there is nothing request-specific to vary and
+    nothing lost by building the client once.
+    """
     client = _create_graphiti_client(settings)
     if settings.openai_base_url is not None:
         client.llm_client.config.base_url = settings.openai_base_url
-    if settings.openai_api_key is not None:
-        client.llm_client.config.api_key = settings.openai_api_key
+    client.llm_client.config.api_key = settings.openai_api_key
     if settings.model_name is not None:
         client.llm_client.model = settings.model_name
-
-    try:
-        yield client
-    finally:
-        await client.close()
+    return client
 
 
-async def initialize_graphiti(settings: ZepEnvDep):
-    client = _create_graphiti_client(settings)
-    try:
-        await client.build_indices_and_constraints()
-    finally:
-        await client.close()
+def set_graphiti_client(app: FastAPI, client: ZepGraphiti) -> None:
+    """Install the shared client on app state. Called only by the lifespan."""
+    setattr(app.state, GRAPHITI_CLIENT_STATE_ATTR, client)
+
+
+def graphiti_client_from_app(app: FastAPI) -> ZepGraphiti:
+    """Return the shared client, or raise if lifespan startup never ran.
+
+    Nothing here builds a client on demand. A missing client means the app
+    was assembled without its lifespan, and both requests and queued jobs
+    must fail loudly rather than quietly construct a private second client
+    that nobody closes.
+    """
+    client = getattr(app.state, GRAPHITI_CLIENT_STATE_ATTR, None)
+    if client is None:
+        raise RuntimeError(
+            f'no shared Graphiti client on app.state.{GRAPHITI_CLIENT_STATE_ATTR}: '
+            'application lifespan startup did not run'
+        )
+    return client
+
+
+async def get_graphiti(http_request: Request) -> ZepGraphiti:
+    """Per-request dependency handing back the shared client.
+
+    Deliberately not a yield dependency: the client is owned by the
+    application lifespan and shared by every request and every queued ingest
+    job, so closing it when a response is sent would tear down the
+    process-wide client. That teardown was also a correctness bug on the
+    ingest path -- `/messages` returns 202 before its queued job runs, so the
+    old per-request `finally: await client.close()` closed the graph driver
+    out from under the job that was about to use it.
+    """
+    return graphiti_client_from_app(http_request.app)
 
 
 def get_fact_result_from_edge(edge: EntityEdge):
