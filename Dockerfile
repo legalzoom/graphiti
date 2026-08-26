@@ -51,7 +51,8 @@ ENV UV_COMPILE_BYTECODE=1 \
 RUN groupadd -r app && useradd -r -d /app -g app app
 
 # Keep the monorepo layout so server development resolves the exact local core.
-# The release build then replaces it with the same exact PyPI version below.
+# An upstream release build then replaces it with the same exact PyPI version
+# below. A fork build sets USE_LOCAL_CORE=true and keeps the copied source.
 WORKDIR /app
 COPY ./pyproject.toml ./README.md ./
 COPY ./graphiti_core ./graphiti_core
@@ -60,8 +61,9 @@ COPY ./server/graph_service ./server/graph_service
 WORKDIR /app/server
 
 # Install server dependencies (without graphiti-core from lockfile)
-# Then install graphiti-core from PyPI at the desired version
-# This prevents the stale lockfile from pinning an old graphiti-core version
+# Then install graphiti-core, either from PyPI at the desired version or from
+# the local source copied above. This prevents the stale lockfile from pinning
+# an old graphiti-core version.
 # When socket_api_key is mounted (official releases), route through sfw;
 # otherwise install directly so public docker builds keep working.
 #
@@ -69,8 +71,17 @@ WORKDIR /app/server
 # build must defeat both caches or a newly flagged package would ship unscanned:
 # SOCKET_SCAN_ID (unique per release run) invalidates this layer, and
 # UV_NO_CACHE stops uv serving wheels from the cache mount below.
+#
+# USE_LOCAL_CORE exists for downstream forks that carry patches in
+# graphiti_core/ rather than only in server/. The PyPI path below overwrites
+# the copied source with the published package, so a fork that leaves it at
+# false ships its own server layer on top of upstream's library and silently
+# loses every graphiti_core/ change it made. A fork also cannot use the PyPI
+# path at all once its pyproject version moves ahead of what is published,
+# because that version resolves to nothing.
 ARG INSTALL_FALKORDB=false
 ARG INSTALL_NEPTUNE=false
+ARG USE_LOCAL_CORE=false
 ARG SOCKET_FIREWALL_ENABLED=false
 ARG SOCKET_SCAN_ID=
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -96,7 +107,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "$INSTALL_FALKORDB" = "true" ]; then EXTRA="[falkordb]"; \
     elif [ "$INSTALL_NEPTUNE" = "true" ]; then EXTRA="[neptune]"; \
     fi; \
-    if [ -n "$GRAPHITI_VERSION" ]; then \
+    if [ "$USE_LOCAL_CORE" = "true" ]; then \
+        echo "Installing graphiti-core from local source at /app"; \
+        $UV_CMD pip install --reinstall --no-cache "/app${EXTRA}"; \
+    elif [ -n "$GRAPHITI_VERSION" ]; then \
         $UV_CMD pip install --upgrade "graphiti-core${EXTRA}==$GRAPHITI_VERSION"; \
     else \
         $UV_CMD pip install --upgrade "graphiti-core${EXTRA}"; \
