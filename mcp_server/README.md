@@ -257,6 +257,62 @@ The `config.yaml` file supports environment variable expansion using `${VAR_NAME
 
 You can set these variables in a `.env` file in the project directory.
 
+### HTTP Transport Security
+
+FastMCP Host/Origin validation and bearer authentication are independent controls. An allowed
+`Host` header only prevents DNS-rebinding attacks; it never identifies or authorizes a caller.
+
+Local and stdio usage remains compatible by default. For a production HTTP deployment, enable the
+fail-closed contract and provide all required values through the workload's secret manager:
+
+```bash
+GRAPHITI_MCP_SECURITY_REQUIRED=true
+GRAPHITI_MCP_HTTP_AUTH_ENABLED=true
+
+# Exact Host header values seen by the pod. Include every Kubernetes short name,
+# namespace name, cluster FQDN, and external name clients actually use.
+GRAPHITI_MCP_ALLOWED_HOSTS=graphiti,graphiti.my-namespace,graphiti.my-namespace.svc,graphiti.my-namespace.svc.cluster.local,graphiti.example.com
+
+# Exact browser origins, if any. Use an explicit empty value when every caller
+# is server-to-server and omits Origin.
+GRAPHITI_MCP_ALLOWED_ORIGINS=
+
+# Every request is bound to one of these exact Graphiti group IDs.
+GRAPHITI_MCP_ALLOWED_GROUPS=main,another-exact-group
+
+# Three pairwise-distinct secret-manager values, each at least 32 UTF-8 bytes.
+GRAPHITI_MCP_READ_TOKEN=<generated-secret>
+GRAPHITI_MCP_WRITE_TOKEN=<different-generated-secret>
+GRAPHITI_MCP_ADMIN_TOKEN=<third-generated-secret>
+
+# Default false: destructive MCP tools are not registered.
+GRAPHITI_MCP_DESTRUCTIVE_TOOLS_ENABLED=false
+```
+
+Generate each token independently (for example, `openssl rand -base64 48`). Wildcard Hosts,
+Origins, and groups are rejected. A non-default HTTP port must appear in the exact Host values the
+client sends (for example, `graphiti.example.com:8443`). Startup fails before database
+initialization if required auth, tokens, Hosts, or groups are incomplete. Required mode supports
+the streamable HTTP transport only.
+
+When no Host/Origin policy is explicitly configured, local development retains FastMCP's
+localhost-only wildcard-port defaults so `--port` continues to work. Required mode never uses those
+defaults: it requires an explicit exact Host list and an explicit Origin list (which may be empty).
+
+Send the selected credential as `Authorization: Bearer <token>`. Permissions are cumulative:
+
+- Read token: search/retrieval/status tools only.
+- Write token: read tools plus `add_memory`, `add_triplet`, `summarize_saga`, and
+  `build_communities`.
+- Admin token: read/write tools plus destructive tools, but only when
+  `GRAPHITI_MCP_DESTRUCTIVE_TOOLS_ENABLED=true`.
+
+Requested `group_id`/`group_ids` values and UUID-backed resources are checked against the token's
+group binding. Cross-group episode context, center-node references, and reused node UUIDs are
+rejected. `delete_entity_edge`, `delete_episode`, and `clear_graph` are omitted by default in
+required mode; `--destroy-graph` is disabled whenever HTTP auth is enabled. The `/health` endpoint
+remains unauthenticated for orchestrator probes and does not expose graph data.
+
 ## Running the Server
 
 ### Default Setup (FalkorDB Combined Container)
@@ -555,6 +611,9 @@ For HTTP transport (default), you can use this configuration:
 ## Available Tools
 
 The Graphiti MCP server exposes the following tools:
+
+In security-required HTTP mode, the three destructive tools are omitted unless explicitly enabled;
+when enabled they require the admin bearer token. Other tools require the scopes documented above.
 
 - `add_memory`: Add an episode to the knowledge graph (supports text, JSON, and message formats).
   Supports the bi-temporal `reference_time`, `excluded_entity_types`, `custom_extraction_instructions`,

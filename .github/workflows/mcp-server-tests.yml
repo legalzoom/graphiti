@@ -59,9 +59,13 @@ jobs:
       - name: Install dependencies
         working-directory: mcp_server
         run: uv sync
-      - name: Run Neptune configuration unit tests
+      - name: Run MCP configuration and security unit tests
         working-directory: mcp_server
-        run: uv run pytest tests/test_neptune_config.py -m "not integration"
+        run: |
+          uv run pytest \
+            tests/test_neptune_config.py \
+            tests/test_mcp_security.py \
+            -m "not integration"
       - name: Wait for FalkorDB
         run: |
           for i in $(seq 1 30); do

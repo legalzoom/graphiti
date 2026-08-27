@@ -5,18 +5,21 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 
 import argparse
 import asyncio
+import functools
+import inspect
 import logging
 import os
 import sys
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 from uuid import uuid4
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
-from graphiti_core.nodes import EntityNode, EpisodeType, SagaNode
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode, SagaNode
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
@@ -36,6 +39,14 @@ from models.response_types import (
     StatusResponse,
     SuccessResponse,
     TripletResponse,
+)
+from security import (
+    McpAuthorizationError,
+    McpSecuritySettings,
+    StaticTokenVerifier,
+    ToolScope,
+    authorize_resource_group,
+    authorize_tool_access,
 )
 from services.factories import (
     CrossEncoderFactory,
@@ -173,10 +184,103 @@ server requires a configured database and valid API keys for language-model oper
 """
 
 # MCP server instance
+MCP_SECURITY = McpSecuritySettings.from_env(os.environ)
+MCP_TOKEN_VERIFIER = StaticTokenVerifier(MCP_SECURITY) if MCP_SECURITY.http_auth_enabled else None
 mcp = FastMCP(
     'Graphiti Agent Memory',
     instructions=GRAPHITI_MCP_INSTRUCTIONS,
+    token_verifier=MCP_TOKEN_VERIFIER,
+    auth=MCP_SECURITY.auth_settings() if MCP_SECURITY.http_auth_enabled else None,
+    # This must be passed at construction time. FastMCP otherwise freezes a
+    # localhost-only allowlist before initialize_server later changes the bind host.
+    transport_security=MCP_SECURITY.transport_security_settings(),
 )
+
+ToolFunction = TypeVar('ToolFunction', bound=Callable[..., Any])
+active_transport: str | None = None
+
+
+def _default_group_id() -> str | None:
+    current_config = globals().get('config')
+    return current_config.graphiti.group_id if current_config is not None else None
+
+
+def _http_authorization_active() -> bool:
+    """Return whether request-scoped bearer authorization applies to this run."""
+    # Before initialize_server resolves the transport, an auth-enabled process
+    # must fail closed rather than let direct/early tool execution bypass the
+    # request-scoped policy. Explicit stdio mode is the only non-HTTP escape.
+    return MCP_SECURITY.http_auth_enabled and active_transport != 'stdio'
+
+
+def _authorize_returned_groups(
+    resources: list[Any],
+    requested_groups: list[str],
+    *,
+    required_scope: ToolScope,
+) -> None:
+    """Fail closed if the database returns a resource outside the requested groups."""
+    if not _http_authorization_active():
+        return
+    for resource in resources:
+        resource_group = getattr(resource, 'group_id', None)
+        if not isinstance(resource_group, str):
+            raise McpAuthorizationError('Graphiti resource has no valid group binding')
+        authorize_resource_group(
+            MCP_SECURITY,
+            resource_group,
+            required_scope=required_scope,
+        )
+        if resource_group not in requested_groups:
+            raise McpAuthorizationError('Graphiti returned a resource outside the requested groups')
+
+
+def secured_tool(
+    required_scope: ToolScope,
+    *,
+    group_parameter: str | None = None,
+    destructive: bool = False,
+) -> Callable[[ToolFunction], ToolFunction]:
+    """Register a tool with per-tool scope and group authorization.
+
+    Security-disabled local/stdio usage remains backward compatible. In required
+    mode destructive tools are omitted entirely unless explicitly enabled.
+    """
+
+    def decorator(function: ToolFunction) -> ToolFunction:
+        @functools.wraps(function)
+        async def authorized(*args: Any, **kwargs: Any) -> Any:
+            if not _http_authorization_active():
+                return await function(*args, **kwargs)
+
+            requested_groups: list[str] | None = None
+            if group_parameter is not None:
+                bound = inspect.signature(function).bind_partial(*args, **kwargs)
+                value = bound.arguments.get(group_parameter)
+                if value is None:
+                    default_group = _default_group_id()
+                    requested_groups = [default_group] if default_group else []
+                elif isinstance(value, str):
+                    requested_groups = [value] if value else []
+                else:
+                    requested_groups = list(value)
+
+            authorize_tool_access(
+                MCP_SECURITY,
+                required_scope=required_scope,
+                requested_groups=requested_groups,
+                destructive=destructive,
+            )
+            return await function(*args, **kwargs)
+
+        if not (MCP_SECURITY.security_required and destructive) or (
+            MCP_SECURITY.destructive_tools_enabled
+        ):
+            mcp.tool()(authorized)
+        return authorized  # type: ignore[return-value]
+
+    return decorator
+
 
 # Global services
 graphiti_service: Optional['GraphitiService'] = None
@@ -380,7 +484,7 @@ class GraphitiService:
         return self.client
 
 
-@mcp.tool()
+@secured_tool(ToolScope.WRITE, group_parameter='group_id')
 async def add_memory(
     name: str,
     episode_body: str,
@@ -477,6 +581,25 @@ async def add_memory(
         # Use the provided group_id or fall back to the default from config
         effective_group_id = group_id or config.graphiti.group_id
 
+        # Context UUIDs are indirect object references. Resolve them before the
+        # background task is queued so they cannot cross an authorized group boundary.
+        if _http_authorization_active():
+            client = await graphiti_service.get_client()
+            contextual_episode_uuids = list(previous_episode_uuids or [])
+            if saga_previous_episode_uuid:
+                contextual_episode_uuids.append(saga_previous_episode_uuid)
+            for episode_uuid in contextual_episode_uuids:
+                episode = await EpisodicNode.get_by_uuid(client.driver, episode_uuid)
+                authorize_resource_group(
+                    MCP_SECURITY,
+                    episode.group_id,
+                    required_scope=ToolScope.WRITE,
+                )
+                if episode.group_id != effective_group_id:
+                    raise McpAuthorizationError(
+                        'episode context must belong to the requested Graphiti group'
+                    )
+
         # Try to parse the source as an EpisodeType enum, with fallback to text
         episode_type = EpisodeType.text  # Default
         if source:
@@ -510,13 +633,15 @@ async def add_memory(
         return SuccessResponse(
             message=f"Episode '{name}' queued for processing in group '{effective_group_id}'"
         )
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error queuing episode: {error_msg}')
         return ErrorResponse(error=f'Error queuing episode: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.READ, group_parameter='group_ids')
 async def search_nodes(
     query: str,
     group_ids: str | list[str] | None = None,
@@ -553,6 +678,16 @@ async def search_nodes(
             else []
         )
 
+        if _http_authorization_active() and center_node_uuid:
+            center_node = await EntityNode.get_by_uuid(client.driver, center_node_uuid)
+            authorize_resource_group(
+                MCP_SECURITY,
+                center_node.group_id,
+                required_scope=ToolScope.READ,
+            )
+            if center_node.group_id not in effective_group_ids:
+                raise McpAuthorizationError('center node must belong to a requested Graphiti group')
+
         # Create search filters
         search_filters = SearchFilters(
             node_labels=entity_types,
@@ -580,6 +715,12 @@ async def search_nodes(
         # Extract nodes from results
         nodes = results.nodes[:max_nodes] if results.nodes else []
 
+        _authorize_returned_groups(
+            nodes,
+            effective_group_ids,
+            required_scope=ToolScope.READ,
+        )
+
         if not nodes:
             return NodeSearchResponse(message='No relevant nodes found', nodes=[])
 
@@ -587,13 +728,15 @@ async def search_nodes(
         node_results = [to_node_result(node) for node in nodes]
 
         return NodeSearchResponse(message='Nodes retrieved successfully', nodes=node_results)
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching nodes: {error_msg}')
         return ErrorResponse(error=f'Error searching nodes: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.READ, group_parameter='group_ids')
 async def search_memory_facts(
     query: str,
     group_ids: str | list[str] | None = None,
@@ -654,6 +797,16 @@ async def search_memory_facts(
             else []
         )
 
+        if _http_authorization_active() and center_node_uuid:
+            center_node = await EntityNode.get_by_uuid(client.driver, center_node_uuid)
+            authorize_resource_group(
+                MCP_SECURITY,
+                center_node.group_id,
+                required_scope=ToolScope.READ,
+            )
+            if center_node.group_id not in effective_group_ids:
+                raise McpAuthorizationError('center node must belong to a requested Graphiti group')
+
         relevant_edges = await client.search(
             group_ids=effective_group_ids,
             query=query,
@@ -662,18 +815,26 @@ async def search_memory_facts(
             search_filter=search_filter,
         )
 
+        _authorize_returned_groups(
+            relevant_edges,
+            effective_group_ids,
+            required_scope=ToolScope.READ,
+        )
+
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])
 
         facts = [format_fact_result(edge) for edge in relevant_edges]
         return FactSearchResponse(message='Facts retrieved successfully', facts=facts)
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching facts: {error_msg}')
         return ErrorResponse(error=f'Error searching facts: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.ADMIN, destructive=True)
 async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
     """Delete an entity edge from the graph memory.
 
@@ -690,16 +851,25 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
 
         # Get the entity edge by UUID
         entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
+        if _http_authorization_active():
+            authorize_resource_group(
+                MCP_SECURITY,
+                entity_edge.group_id,
+                required_scope=ToolScope.ADMIN,
+                destructive=True,
+            )
         # Delete the edge using its delete method
         await entity_edge.delete(client.driver)
         return SuccessResponse(message=f'Entity edge with UUID {uuid} deleted successfully')
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error deleting entity edge: {error_msg}')
         return ErrorResponse(error=f'Error deleting entity edge: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.ADMIN, destructive=True)
 async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
     """Delete an episode from the graph memory.
 
@@ -718,17 +888,28 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
     try:
         client = await graphiti_service.get_client()
 
+        if _http_authorization_active():
+            episode = await EpisodicNode.get_by_uuid(client.driver, uuid)
+            authorize_resource_group(
+                MCP_SECURITY,
+                episode.group_id,
+                required_scope=ToolScope.ADMIN,
+                destructive=True,
+            )
+
         # remove_episode cascades cleanup of episode-created entities/edges,
         # unlike EpisodicNode.delete which would orphan them.
         await client.remove_episode(uuid)
         return SuccessResponse(message=f'Episode with UUID {uuid} deleted successfully')
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error deleting episode: {error_msg}')
         return ErrorResponse(error=f'Error deleting episode: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.READ)
 async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
     """Get an entity edge from the graph memory by its UUID.
 
@@ -745,17 +926,25 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
 
         # Get the entity edge directly using the EntityEdge class method
         entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
+        if _http_authorization_active():
+            authorize_resource_group(
+                MCP_SECURITY,
+                entity_edge.group_id,
+                required_scope=ToolScope.READ,
+            )
 
         # Use the format_fact_result function to serialize the edge
         # Return the Python dict directly - MCP will handle serialization
         return format_fact_result(entity_edge)
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error getting entity edge: {error_msg}')
         return ErrorResponse(error=f'Error getting entity edge: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.READ, group_parameter='group_ids')
 async def get_episodes(
     group_ids: str | list[str] | None = None,
     max_episodes: int = 10,
@@ -800,6 +989,12 @@ async def get_episodes(
         if not episodes:
             return EpisodeSearchResponse(message='No episodes found', episodes=[])
 
+        _authorize_returned_groups(
+            episodes,
+            effective_group_ids,
+            required_scope=ToolScope.READ,
+        )
+
         # Format the results
         episode_results = []
         for episode in episodes:
@@ -819,13 +1014,15 @@ async def get_episodes(
         return EpisodeSearchResponse(
             message='Episodes retrieved successfully', episodes=episode_results
         )
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error getting episodes: {error_msg}')
         return ErrorResponse(error=f'Error getting episodes: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.WRITE, group_parameter='group_id')
 async def summarize_saga(
     saga_name: str, group_id: str | None = None
 ) -> SagaSummaryResponse | ErrorResponse:
@@ -878,7 +1075,7 @@ async def summarize_saga(
         return ErrorResponse(error=f'Error summarizing saga: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.WRITE, group_parameter='group_ids')
 async def build_communities(
     group_ids: str | list[str] | None = None,
 ) -> BuildCommunitiesResponse | ErrorResponse:
@@ -910,6 +1107,12 @@ async def build_communities(
             group_ids=normalized_group_ids
         )
 
+        _authorize_returned_groups(
+            [*communities, *community_edges],
+            normalized_group_ids or [],
+            required_scope=ToolScope.WRITE,
+        )
+
         community_results: list[CommunityResult] = [
             CommunityResult(
                 uuid=community.uuid,
@@ -926,13 +1129,15 @@ async def build_communities(
             edge_count=len(community_edges),
             communities=community_results,
         )
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error building communities: {error_msg}')
         return ErrorResponse(error=f'Error building communities: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.WRITE, group_parameter='group_id')
 async def add_triplet(
     source_node_name: str,
     edge_name: str,
@@ -970,6 +1175,21 @@ async def add_triplet(
         effective_group_id = group_id or config.graphiti.group_id
         if not effective_group_id:
             return ErrorResponse(error='No group_id provided and no default group_id is configured')
+
+        if _http_authorization_active():
+            for node_uuid in (source_node_uuid, target_node_uuid):
+                if node_uuid is None:
+                    continue
+                existing_node = await EntityNode.get_by_uuid(client.driver, node_uuid)
+                authorize_resource_group(
+                    MCP_SECURITY,
+                    existing_node.group_id,
+                    required_scope=ToolScope.WRITE,
+                )
+                if existing_node.group_id != effective_group_id:
+                    raise McpAuthorizationError(
+                        'referenced node must belong to the requested Graphiti group'
+                    )
         now = datetime.now(timezone.utc)
 
         source_node = EntityNode(
@@ -995,18 +1215,26 @@ async def add_triplet(
 
         result = await client.add_triplet(source_node, edge, target_node)
 
+        _authorize_returned_groups(
+            [*result.nodes, *result.edges],
+            [effective_group_id],
+            required_scope=ToolScope.WRITE,
+        )
+
         return TripletResponse(
             message=f"Triplet '{source_node_name} -[{edge_name}]-> {target_node_name}' added",
             nodes=[to_node_result(node) for node in result.nodes],
             edges=[to_edge_result(e) for e in result.edges],
         )
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error adding triplet: {error_msg}')
         return ErrorResponse(error=f'Error adding triplet: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.READ)
 async def get_episode_entities(
     episode_uuids: list[str],
 ) -> EpisodeEntitiesResponse | ErrorResponse:
@@ -1029,20 +1257,40 @@ async def get_episode_entities(
     try:
         client = await graphiti_service.get_client()
 
+        authorized_episode_groups: set[str] = set()
+        if _http_authorization_active():
+            for episode_uuid in episode_uuids:
+                episode = await EpisodicNode.get_by_uuid(client.driver, episode_uuid)
+                authorize_resource_group(
+                    MCP_SECURITY,
+                    episode.group_id,
+                    required_scope=ToolScope.READ,
+                )
+                authorized_episode_groups.add(episode.group_id)
+
         results = await client.get_nodes_and_edges_by_episode(episode_uuids)
+
+        if _http_authorization_active():
+            _authorize_returned_groups(
+                [*results.nodes, *results.edges],
+                list(authorized_episode_groups),
+                required_scope=ToolScope.READ,
+            )
 
         return EpisodeEntitiesResponse(
             message=f'Retrieved provenance for {len(episode_uuids)} episode(s)',
             nodes=[to_node_result(node) for node in results.nodes],
             edges=[to_edge_result(e) for e in results.edges],
         )
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error getting episode entities: {error_msg}')
         return ErrorResponse(error=f'Error getting episode entities: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.ADMIN, group_parameter='group_ids', destructive=True)
 async def clear_graph(
     group_ids: str | list[str] | None = None,
 ) -> SuccessResponse | ErrorResponse:
@@ -1085,7 +1333,7 @@ async def clear_graph(
         return ErrorResponse(error=f'Error clearing graph: {error_msg}')
 
 
-@mcp.tool()
+@secured_tool(ToolScope.READ)
 async def get_status() -> StatusResponse:
     """Get the status of the Graphiti MCP server and database connection."""
     global graphiti_service
@@ -1134,7 +1382,7 @@ async def health_check(request) -> JSONResponse:
 
 async def initialize_server() -> ServerConfig:
     """Parse CLI arguments and initialize the Graphiti server configuration."""
-    global config, graphiti_service, queue_service, graphiti_client, semaphore
+    global active_transport, config, graphiti_service, queue_service, graphiti_client, semaphore
 
     parser = argparse.ArgumentParser(
         description='Run the Graphiti MCP server with YAML configuration support'
@@ -1224,6 +1472,12 @@ async def initialize_server() -> ServerConfig:
     if hasattr(args, 'destroy_graph'):
         config.destroy_graph = args.destroy_graph
 
+    MCP_SECURITY.validate_runtime(
+        transport=config.server.transport,
+        destroy_graph=config.destroy_graph,
+    )
+    active_transport = config.server.transport
+
     # Log configuration details
     logger.info('Using configuration:')
     logger.info(f'  - LLM: {config.llm.provider} / {config.llm.model}')
@@ -1231,6 +1485,15 @@ async def initialize_server() -> ServerConfig:
     logger.info(f'  - Database: {config.database.provider}')
     logger.info(f'  - Group ID: {config.graphiti.group_id}')
     logger.info(f'  - Transport: {config.server.transport}')
+    logger.info(
+        '  - MCP HTTP security: auth=%s, required=%s, exact_hosts=%d, allowed_groups=%d, '
+        'destructive_tools=%s',
+        MCP_SECURITY.http_auth_enabled,
+        MCP_SECURITY.security_required,
+        len(MCP_SECURITY.allowed_hosts),
+        len(MCP_SECURITY.allowed_groups),
+        MCP_SECURITY.destructive_tools_enabled,
+    )
 
     # Log graphiti-core version
     try:
