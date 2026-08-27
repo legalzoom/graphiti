@@ -1,6 +1,12 @@
 # syntax=docker/dockerfile:1
 # Standalone Graphiti MCP Server Image
 # This image runs only the MCP server and connects to an external database (Neo4j, FalkorDB, or Neptune)
+#
+# BUILD CONTEXT IS THE REPOSITORY ROOT, not mcp_server/.
+# The root is required because USE_LOCAL_CORE needs graphiti_core/, which lives
+# outside mcp_server/ and cannot be reached from a narrower context. Every COPY
+# below is therefore written relative to the repo root. Build with:
+#   docker build -f mcp_server/docker/Dockerfile.standalone .
 
 FROM python:3.11-slim-bookworm
 
@@ -42,15 +48,32 @@ ENV UV_COMPILE_BYTECODE=1 \
 # Set up MCP server directory
 WORKDIR /app/mcp
 
-# Accept graphiti-core version as build argument
+# Accept graphiti-core version as build argument. Only consulted when
+# USE_LOCAL_CORE=false, since a local install takes its version from the source.
 ARG GRAPHITI_CORE_VERSION=0.29.4
 ARG SOCKET_FIREWALL_ENABLED=false
 # Unique per release run so enforced builds re-resolve and re-download instead
 # of reusing cached layers, which sfw would never see.
 ARG SOCKET_SCAN_ID=
 
+# USE_LOCAL_CORE mirrors the root Dockerfile. A downstream fork that patches
+# graphiti_core/ must set this true, or the image resolves graphiti-core from
+# PyPI and ships upstream's library underneath the fork's MCP server. A fork
+# whose pyproject version has moved past the newest published release cannot
+# use the PyPI path at all, because the pinned version resolves to nothing.
+ARG USE_LOCAL_CORE=false
+
 # Copy project files for dependency installation
-COPY pyproject.toml uv.lock ./
+COPY mcp_server/pyproject.toml mcp_server/uv.lock ./
+
+# The graphiti-core package itself, landing at /app so that the existing
+# [tool.uv.sources] entry in mcp_server/pyproject.toml
+#   graphiti-core = { path = "..", editable = true }
+# resolves to it from WORKDIR /app/mcp. No rewriting of that entry is needed.
+# Copied unconditionally because COPY cannot be conditional; when
+# USE_LOCAL_CORE=false the sources entry is stripped below and these are unused.
+COPY pyproject.toml README.md /app/
+COPY graphiti_core /app/graphiti_core
 
 # Remove the local path override for graphiti-core in Docker builds
 # Install with all supported database extras for maximum flexibility
@@ -73,9 +96,14 @@ RUN --mount=type=secret,id=socket_api_key \
       echo "socket_api_key absent; installing without Socket Firewall"; \
       UV_CMD="uv"; \
     fi; \
-    sed -i '/\[tool\.uv\.sources\]/,/graphiti-core/d' pyproject.toml; \
-    sed -i "s/graphiti-core\[falkordb\][>=]\+[0-9]\+\.[0-9]\+\.[0-9]\+/graphiti-core[neo4j,falkordb,neptune]==${GRAPHITI_CORE_VERSION}/" pyproject.toml; \
-    echo "Regenerating lock file for PyPI graphiti-core..."; \
+    if [ "$USE_LOCAL_CORE" = "true" ]; then \
+      echo "Resolving graphiti-core from local source at /app"; \
+      sed -i 's/graphiti-core\[falkordb\]/graphiti-core[falkordb,neptune]/' pyproject.toml; \
+    else \
+      sed -i '/\[tool\.uv\.sources\]/,/graphiti-core/d' pyproject.toml; \
+      sed -i "s/graphiti-core\[falkordb\][>=]\+[0-9]\+\.[0-9]\+\.[0-9]\+/graphiti-core[neo4j,falkordb,neptune]==${GRAPHITI_CORE_VERSION}/" pyproject.toml; \
+      echo "Regenerating lock file for PyPI graphiti-core..."; \
+    fi; \
     rm -f uv.lock; \
     $UV_CMD lock
 
@@ -102,13 +130,20 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi; \
     $UV_CMD sync --no-group dev --extra providers --extra azure
 
-# Store graphiti-core version
-RUN echo "${GRAPHITI_CORE_VERSION}" > /app/mcp/.graphiti-core-version
+# Store graphiti-core version. On a local install GRAPHITI_CORE_VERSION was
+# never consulted, so record what was actually installed rather than an
+# argument that had no effect.
+RUN set -eu; \
+    if [ "$USE_LOCAL_CORE" = "true" ]; then \
+      awk -F'"' '/^version = /{print $2; exit}' /app/pyproject.toml > /app/mcp/.graphiti-core-version; \
+    else \
+      echo "${GRAPHITI_CORE_VERSION}" > /app/mcp/.graphiti-core-version; \
+    fi
 
 # Copy MCP server application code
-COPY main.py ./
-COPY src/ ./src/
-COPY config/ ./config/
+COPY mcp_server/main.py ./
+COPY mcp_server/src/ ./src/
+COPY mcp_server/config/ ./config/
 
 # Create log directory
 RUN mkdir -p /var/log/graphiti

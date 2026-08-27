@@ -25,14 +25,19 @@ jobs:
     strategy:
       matrix:
         variant:
+          # Contexts differ per variant. Dockerfile.standalone builds from the
+          # repository root so it can reach graphiti_core/ for USE_LOCAL_CORE;
+          # Dockerfile (combined) still builds from mcp_server/.
           - name: standalone
             dockerfile: docker/Dockerfile.standalone
+            context: .
             image_suffix: "-standalone"
             tag_latest: "standalone"
             title: "Graphiti MCP Server (Standalone)"
             description: "Standalone Graphiti MCP server for external Neo4j or FalkorDB"
           - name: combined
             dockerfile: docker/Dockerfile
+            context: ./mcp_server
             image_suffix: ""
             tag_latest: "latest"
             title: "FalkorDB + Graphiti MCP Server"
@@ -126,7 +131,7 @@ jobs:
         uses: depot/build-push-action@5f3b3c2e5a00f0093de47f657aeaefcedff27d18 # v1
         with:
           project: v9jv1mlpwc
-          context: ./mcp_server
+          context: ${{ matrix.variant.context }}
           file: ./mcp_server/${{ matrix.variant.dockerfile }}
           platforms: linux/amd64,linux/arm64
           push: true
