@@ -58,7 +58,13 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write # Required: claude-code-action requests a GitHub OIDC token in agent mode
+      # No id-token: write. claude-code-action would exchange an OIDC token for
+      # a Claude GitHub App token, but that exchange 401s here, so the step
+      # passes github_token explicitly instead and nothing consumes an OIDC
+      # token. This repository is public and this workflow runs on
+      # pull_request_target gated to fork PRs, so the token is mintable by any
+      # outside contributor. Granting a credential nothing uses, on the one
+      # trigger anonymous users control, is surface with no purpose.
     steps:
       - name: Checkout base repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -222,7 +228,13 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write # Required: claude-code-action requests a GitHub OIDC token in agent mode
+      # No id-token: write. claude-code-action would exchange an OIDC token for
+      # a Claude GitHub App token, but that exchange 401s here, so the step
+      # passes github_token explicitly instead and nothing consumes an OIDC
+      # token. This repository is public and this workflow runs on
+      # pull_request_target gated to fork PRs, so the token is mintable by any
+      # outside contributor. Granting a credential nothing uses, on the one
+      # trigger anonymous users control, is surface with no purpose.
     steps:
       - name: Checkout base repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
