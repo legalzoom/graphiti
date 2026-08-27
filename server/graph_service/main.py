@@ -1,12 +1,16 @@
 from contextlib import asynccontextmanager
 from importlib.metadata import version
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from graph_service.config import get_settings
 from graph_service.routers import ingest, retrieve
-from graph_service.zep_graphiti import build_graphiti_client, set_graphiti_client
+from graph_service.zep_graphiti import (
+    GRAPHITI_CLIENT_STATE_ATTR,
+    build_graphiti_client,
+    set_graphiti_client,
+)
 
 
 @asynccontextmanager
@@ -45,4 +49,32 @@ async def healthcheck():
             'ingest_queue_maxsize': ingest.async_worker.capacity,
         },
         status_code=200,
+    )
+
+
+@app.get('/readyz')
+async def readiness(request: Request):
+    """Report whether this process can safely receive application traffic.
+
+    Settings are validated before the application lifespan starts, so a
+    deployment with required-but-missing OPR credentials never reaches this
+    endpoint. Once started, fail readiness if either the shared graph client
+    was not installed or the ingest consumer has exited.
+    """
+    settings = get_settings()
+    worker_task = ingest.async_worker.task
+    graphiti_ready = hasattr(request.app.state, GRAPHITI_CLIENT_STATE_ATTR)
+    worker_running = worker_task is not None and not worker_task.done()
+    ingest_ready = ingest.async_worker.ready
+    ready = graphiti_ready and ingest_ready
+    return JSONResponse(
+        content={
+            'status': 'ready' if ready else 'not_ready',
+            'graphiti_core_version': version('graphiti-core'),
+            'opr_auth_required': settings.opr_auth_required,
+            'ingest_worker_running': worker_running,
+            'ingest_accepting': ingest.async_worker.accepting,
+            'ingest_draining': ingest.async_worker.draining,
+        },
+        status_code=status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE,
     )

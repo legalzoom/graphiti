@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Callable, Coroutine
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from functools import partial
 from importlib.metadata import version
 from typing import Annotated, Any
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 # A queued job: a zero-argument callable returning a coroutine, produced by
 # `partial(add_messages_task, m)` below.
 Job = Callable[[], Coroutine[Any, Any, None]]
+_MAX_WORKER_CANCEL_WAIT_SECONDS = 1.0
 
 
 def _authorize_opr_write(
@@ -87,27 +88,43 @@ def _authorize_episode_retirement(
 
 
 class AsyncWorker:
-    def __init__(self, maxsize: int | None = None):
+    def __init__(self, maxsize: int | None = None, drain_timeout_seconds: float = 25.0):
         self._queue: asyncio.Queue[Job] | None = None
-        self.task: asyncio.Task | None = None
+        self.task: asyncio.Task[None] | None = None
         # True exactly while `worker()` is inside `await job()`. A job in this
         # state has already left the queue (so `queue.qsize()` cannot count
         # it) but has not finished, so it still needs to be counted as
         # dropped if shutdown interrupts it.
         self._job_in_flight = False
+        self._accepting = False
+        self._draining = False
+        self._drain_timeout_seconds = drain_timeout_seconds
+        self._last_shutdown_dropped_jobs = 0
         if maxsize is not None:
-            self.configure(maxsize)
+            self.configure(maxsize, drain_timeout_seconds)
 
-    def configure(self, maxsize: int) -> None:
+    def configure(self, maxsize: int, drain_timeout_seconds: float = 25.0) -> None:
         """Bind this worker to a bounded queue of the given size.
 
         Called once, at lifespan startup, with the size resolved from
-        `Settings.ingest_queue_maxsize`. Not called at import time: the
-        module-level `async_worker` singleton below is otherwise unconfigured,
-        and using it before `configure()` raises rather than silently
-        assuming an unbounded queue.
+        `Settings.ingest_queue_maxsize` and its shutdown budget. Not called at
+        import time: the module-level `async_worker` singleton below is
+        otherwise unconfigured, and using it before `configure()` raises
+        rather than silently assuming an unbounded queue.
         """
+        if self.task is not None and not self.task.done():
+            raise RuntimeError('cannot reconfigure a running AsyncWorker')
+        if maxsize <= 0:
+            raise ValueError('AsyncWorker maxsize must be positive')
+        if not 0 < drain_timeout_seconds <= 50:
+            raise ValueError('AsyncWorker drain timeout must be greater than 0 and at most 50')
         self._queue = asyncio.Queue(maxsize=maxsize)
+        self.task = None
+        self._job_in_flight = False
+        self._accepting = False
+        self._draining = False
+        self._drain_timeout_seconds = drain_timeout_seconds
+        self._last_shutdown_dropped_jobs = 0
 
     @property
     def queue(self) -> asyncio.Queue[Job]:
@@ -122,6 +139,25 @@ class AsyncWorker:
     @property
     def capacity(self) -> int:
         return self.queue.maxsize
+
+    @property
+    def accepting(self) -> bool:
+        """Whether the producer may atomically add another batch."""
+        worker_alive = self.task is not None and not self.task.done()
+        return self._accepting and not self._draining and worker_alive
+
+    @property
+    def draining(self) -> bool:
+        return self._draining
+
+    @property
+    def ready(self) -> bool:
+        """Whether the worker can accept and consume application traffic."""
+        return self.accepting and self.task is not None and not self.task.done()
+
+    @property
+    def last_shutdown_dropped_jobs(self) -> int:
+        return self._last_shutdown_dropped_jobs
 
     async def worker(self):
         while True:
@@ -152,11 +188,15 @@ class AsyncWorker:
                     )
                 finally:
                     self._job_in_flight = False
+                    # Every successful `get()` must be paired with exactly one
+                    # `task_done()`, even when the job fails or cancellation
+                    # interrupts it. Shutdown's `queue.join()` relies on this
+                    # accounting to know that every accepted job has finished.
+                    self.queue.task_done()
             except asyncio.CancelledError:
                 break
 
-    @staticmethod
-    def _log_worker_exit(task: asyncio.Task) -> None:
+    def _log_worker_exit(self, task: asyncio.Task[None]) -> None:
         """Surface a worker task that died instead of letting it go unnoticed.
 
         `worker()` above no longer exits on a job failure, but if it ever does
@@ -165,7 +205,8 @@ class AsyncWorker:
         only other place the task is awaited, and on a crashed worker that
         await may never happen, so retrieve and log the exception here.
         """
-        if task.cancelled():
+        self._accepting = False
+        if task.cancelled() or self._draining:
             return
         exc = task.exception()
         if exc is not None:
@@ -174,33 +215,117 @@ class AsyncWorker:
                 'consumer and will fill until /messages rejects every batch.',
                 exc_info=exc,
             )
+        else:
+            logger.critical(
+                'Ingest worker task exited unexpectedly without an exception; '
+                'the ingest queue will reject new work.'
+            )
 
     async def start(self):
+        if self.task is not None and not self.task.done():
+            raise RuntimeError('AsyncWorker is already running')
+        # Accessing the property fails fast if startup forgot to configure the
+        # bounded queue before opening admission.
+        _ = self.queue
+        self._draining = False
+        self._accepting = False
+        self._last_shutdown_dropped_jobs = 0
         self.task = asyncio.create_task(self.worker())
         self.task.add_done_callback(self._log_worker_exit)
+        self._accepting = True
 
-    async def stop(self):
-        # Capture before requesting cancellation: cancelling a task that is
-        # inside `await job()` runs that job's `finally` (above) as part of
-        # unwinding, which clears the flag before this coroutine resumes.
-        # Checking it now, rather than after `await self.task`, is what makes
-        # a job interrupted mid-flight actually get counted below.
-        job_in_flight = self._job_in_flight
-        if self.task:
-            self.task.cancel()
-            await self.task
-        dropped = self.queue.qsize() + (1 if job_in_flight else 0)
+    def begin_drain(self) -> None:
+        """Close admission synchronously before shutdown first yields."""
+        self._accepting = False
+        self._draining = True
+
+    def _outstanding_jobs(self) -> int:
+        return self.queue.qsize() + (1 if self._job_in_flight else 0)
+
+    def _discard_queued_jobs(self) -> int:
+        discarded = 0
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return discarded
+            else:
+                discarded += 1
+                self.queue.task_done()
+
+    async def _cancel_worker(self) -> bool:
+        """Request cancellation without letting a hostile job block shutdown.
+
+        Python tasks may suppress ``CancelledError``. Waiting on such a task
+        without a second bound would turn the configured drain timeout into an
+        unbounded shutdown. Return false after a short grace and let process
+        termination provide the final isolation boundary.
+        """
+        if self.task is None or self.task.done():
+            return True
+        self.task.cancel()
+        cancel_wait = min(self._drain_timeout_seconds, _MAX_WORKER_CANCEL_WAIT_SECONDS)
+        done, _ = await asyncio.wait({self.task}, timeout=cancel_wait)
+        if self.task in done:
+            # A task cancelled before its coroutine takes its first turn does
+            # not reach `worker()`'s own CancelledError handler.
+            with suppress(asyncio.CancelledError):
+                self.task.result()
+            return True
+
+        logger.critical(
+            f'Ingest worker did not stop within {cancel_wait:g}s after cancellation; '
+            'returning from shutdown so the process termination deadline remains bounded.'
+        )
+        # Make one final non-blocking request. Never await it here: code inside
+        # a job can suppress repeated cancellations too.
+        self.task.cancel()
+        return False
+
+    async def stop(self) -> int:
+        """Stop admission, drain accepted work, then stop the consumer.
+
+        Returns the number of accepted jobs interrupted or discarded by this
+        shutdown. Ordinary job failures are logged when they happen and remain
+        the durable producer's reconciliation responsibility. A nonzero
+        shutdown result is logged at CRITICAL because this queue is in-memory.
+        """
+        self.begin_drain()
+        self._last_shutdown_dropped_jobs = 0
+
+        worker_running = self.task is not None and not self.task.done()
+        if worker_running:
+            try:
+                await asyncio.wait_for(
+                    self.queue.join(),
+                    timeout=self._drain_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                dropped = self._outstanding_jobs()
+                self._last_shutdown_dropped_jobs = dropped
+                logger.critical(
+                    f'Ingest shutdown drain timed out after '
+                    f'{self._drain_timeout_seconds:g}s with {dropped} '
+                    'unprocessed job(s); cancelling the active job and dropping '
+                    'queued jobs. Producer reconciliation is required.'
+                )
+                await self._cancel_worker()
+                self._discard_queued_jobs()
+                return dropped
+
+            await self._cancel_worker()
+            return 0
+
+        dropped = self._outstanding_jobs()
         if dropped:
-            # The queue is in-memory only: this is the known, accepted
-            # restart-loss behavior. Durable retry lives in the OPR outbox
-            # producer, not here. Not silent: logged so an operator sees
-            # exactly how many jobs a restart discarded.
-            logger.warning(
-                f'Dropping {dropped} unprocessed job(s) from the in-memory ingest '
-                'queue on shutdown; this queue is not durable across restarts.'
+            self._last_shutdown_dropped_jobs = dropped
+            logger.critical(
+                f'Ingest shutdown cannot drain because its worker is not running; '
+                f'dropping {dropped} unprocessed job(s). Producer reconciliation '
+                'is required.'
             )
-        while not self.queue.empty():
-            self.queue.get_nowait()
+            self._discard_queued_jobs()
+        return dropped
 
 
 async_worker = AsyncWorker()
@@ -209,7 +334,10 @@ async_worker = AsyncWorker()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings = get_settings()
-    async_worker.configure(settings.ingest_queue_maxsize)
+    async_worker.configure(
+        settings.ingest_queue_maxsize,
+        settings.ingest_drain_timeout_seconds,
+    )
     await async_worker.start()
     yield
     await async_worker.stop()
@@ -228,7 +356,10 @@ router = APIRouter(lifespan=lifespan)
     response_model=None,
     responses={
         status.HTTP_503_SERVICE_UNAVAILABLE: {
-            'description': 'Ingestion queue is at capacity; retry later.',
+            'description': (
+                'The worker is unavailable, ingestion is draining, or the queue is at capacity; '
+                'retry later.'
+            ),
         },
     },
 )
@@ -240,6 +371,38 @@ async def add_messages(
     authorization: Annotated[str | None, Header()] = None,
 ) -> Result | JSONResponse:
     _authorize_opr_write(settings, authorization, request.group_id)
+
+    def _admission_closed_response() -> JSONResponse:
+        depth = async_worker.depth
+        maxsize = async_worker.capacity
+        draining = async_worker.draining
+        error = 'ingest_draining' if draining else 'ingest_worker_unavailable'
+        message = (
+            'Ingestion is draining for shutdown; retry another instance.'
+            if draining
+            else 'The ingestion worker is unavailable; retry another instance.'
+        )
+        logger.warning(
+            f'Rejecting message batch for group_id={request.group_id!r}: '
+            f'ingest admission is closed ({error}; depth={depth}, maxsize={maxsize}). '
+            'Producer is expected to retry another instance.'
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                'success': False,
+                'error': error,
+                'message': message,
+                'queue_depth': depth,
+                'queue_maxsize': maxsize,
+            },
+        )
+
+    # Check before UUID ownership I/O so a request that starts after shutdown
+    # does not spend part of the finite termination grace doing work that
+    # cannot be admitted.
+    if not async_worker.accepting:
+        return _admission_closed_response()
 
     try:
         for message in request.messages:
@@ -253,6 +416,13 @@ async def add_messages(
             status_code=status.HTTP_409_CONFLICT,
             detail='episode UUID is already owned by another graph group',
         ) from exc
+
+    # The ownership checks above await graph I/O. Shutdown may have closed
+    # admission while this request was suspended, so check again here. There
+    # is no await between this gate and the batch's `put_nowait` calls, making
+    # the admission decision and enqueue atomic on this event loop.
+    if not async_worker.accepting:
+        return _admission_closed_response()
 
     # Capture the application, not the request-scoped client, and not the
     # request body: a queued job must pin as little as possible, because it can

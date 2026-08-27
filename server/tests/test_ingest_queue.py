@@ -1,11 +1,13 @@
 import asyncio
 import json
 import time
+from contextlib import suppress
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -24,8 +26,48 @@ from graph_service.zep_graphiti import (
 )
 
 
+@pytest_asyncio.fixture
+async def non_consuming_worker(monkeypatch):
+    """Start workers with live admission while leaving queued jobs untouched."""
+    tasks: list[asyncio.Task[None]] = []
+
+    async def start(worker: AsyncWorker) -> AsyncWorker:
+        wait_forever = asyncio.Event()
+
+        async def idle_worker() -> None:
+            await wait_forever.wait()
+
+        monkeypatch.setattr(worker, 'worker', idle_worker)
+        await worker.start()
+        assert worker.task is not None
+        tasks.append(worker.task)
+        return worker
+
+    yield start
+
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
 def _settings_values(**overrides) -> dict:
     values = {'openai_api_key': 'test-key', 'ingest_queue_maxsize': 1000}
+    values.update(overrides)
+    return values
+
+
+def _required_opr_settings_values(**overrides) -> dict:
+    values = _settings_values(
+        opr_auth_required=True,
+        opr_read_token='read-' + ('a' * 32),
+        opr_write_token='write-' + ('b' * 32),
+        opr_reconciliation_token='reconcile-' + ('c' * 32),
+        opr_retirement_token='retire-' + ('d' * 32),
+        opr_writer_fleet_epoch='epoch-' + ('e' * 32),
+        graphiti_admin_token='admin-' + ('f' * 32),
+    )
     values.update(overrides)
     return values
 
@@ -34,6 +76,10 @@ def _settings() -> Settings:
     # group_id below is never the OPR reconciliation group, so
     # `_authorize_opr_write` never touches these attributes.
     return cast(Settings, SimpleNamespace())
+
+
+async def _noop_job() -> None:
+    return None
 
 
 def _json_body(response: JSONResponse) -> dict:
@@ -78,9 +124,10 @@ def _request(count: int, group_id: str = 'not-opr') -> AddMessagesRequest:
 
 
 @pytest.mark.asyncio
-async def test_enqueue_up_to_maxsize_succeeds(monkeypatch):
+async def test_enqueue_up_to_maxsize_succeeds(monkeypatch, non_consuming_worker):
     worker = AsyncWorker(maxsize=2)
     monkeypatch.setattr(ingest, 'async_worker', worker)
+    await non_consuming_worker(worker)
 
     result = await add_messages(_request(2), *_client_args(), _settings())
 
@@ -90,9 +137,31 @@ async def test_enqueue_up_to_maxsize_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_request_past_maxsize_gets_503_and_does_not_grow_queue(monkeypatch):
+async def test_configured_worker_does_not_accept_before_consumer_starts(monkeypatch):
     worker = AsyncWorker(maxsize=2)
     monkeypatch.setattr(ingest, 'async_worker', worker)
+
+    response = await add_messages(_request(1), *_client_args(), _settings())
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 503
+    assert _json_body(response) == {
+        'success': False,
+        'error': 'ingest_worker_unavailable',
+        'message': 'The ingestion worker is unavailable; retry another instance.',
+        'queue_depth': 0,
+        'queue_maxsize': 2,
+    }
+    assert worker.queue.qsize() == 0
+
+
+@pytest.mark.asyncio
+async def test_request_past_maxsize_gets_503_and_does_not_grow_queue(
+    monkeypatch, non_consuming_worker
+):
+    worker = AsyncWorker(maxsize=2)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    await non_consuming_worker(worker)
     await add_messages(_request(2), *_client_args(), _settings())
     assert worker.queue.qsize() == 2
 
@@ -114,7 +183,9 @@ async def test_request_past_maxsize_gets_503_and_does_not_grow_queue(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_oversized_batch_is_rejected_atomically_with_no_partial_enqueue(monkeypatch):
+async def test_oversized_batch_is_rejected_atomically_with_no_partial_enqueue(
+    monkeypatch, non_consuming_worker
+):
     """A batch bigger than the remaining capacity enqueues none of it.
 
     Partially enqueueing a batch and then telling the caller to retry the
@@ -124,6 +195,7 @@ async def test_oversized_batch_is_rejected_atomically_with_no_partial_enqueue(mo
     """
     worker = AsyncWorker(maxsize=3)
     monkeypatch.setattr(ingest, 'async_worker', worker)
+    await non_consuming_worker(worker)
 
     response = await add_messages(_request(4), *_client_args(), _settings())
 
@@ -133,9 +205,12 @@ async def test_oversized_batch_is_rejected_atomically_with_no_partial_enqueue(mo
 
 
 @pytest.mark.asyncio
-async def test_worker_draining_frees_capacity_for_the_next_request(monkeypatch):
+async def test_worker_draining_frees_capacity_for_the_next_request(
+    monkeypatch, non_consuming_worker
+):
     worker = AsyncWorker(maxsize=1)
     monkeypatch.setattr(ingest, 'async_worker', worker)
+    await non_consuming_worker(worker)
     await add_messages(_request(1), *_client_args(), _settings())
     assert worker.queue.qsize() == 1
 
@@ -146,6 +221,7 @@ async def test_worker_draining_frees_capacity_for_the_next_request(monkeypatch):
     # Simulate the worker draining one job, exactly as AsyncWorker.worker() does.
     job = worker.queue.get_nowait()
     await job()
+    worker.queue.task_done()
     assert worker.queue.qsize() == 0
 
     accepted = await add_messages(_request(1), *_client_args(), _settings())
@@ -155,33 +231,30 @@ async def test_worker_draining_frees_capacity_for_the_next_request(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stop_drops_unprocessed_queue_items_documented_restart_loss(monkeypatch, caplog):
-    """Pins the existing restart-loss behavior; this PR does not fix it.
-
-    An in-memory queue cannot survive a pod restart. The OPR outbox producer
-    is durable and retries, so this loss is recovered by the caller. The drop
-    itself must still be logged, not silent.
-    """
+async def test_stop_without_a_live_worker_counts_and_critically_logs_dropped_jobs(
+    monkeypatch, caplog
+):
     worker = AsyncWorker(maxsize=5)
     monkeypatch.setattr(ingest, 'async_worker', worker)
-    await add_messages(_request(3), *_client_args(), _settings())
+    for _ in range(3):
+        worker.queue.put_nowait(_noop_job)
     assert worker.queue.qsize() == 3
 
-    with caplog.at_level('WARNING'):
-        await worker.stop()
+    with caplog.at_level('CRITICAL'):
+        dropped = await worker.stop()
 
+    assert dropped == 3
+    assert worker.last_shutdown_dropped_jobs == 3
     assert worker.queue.qsize() == 0
-    assert any('Dropping 3 unprocessed job' in record.message for record in caplog.records)
+    await asyncio.wait_for(worker.queue.join(), timeout=1)
+    assert any(
+        'worker is not running' in record.message and 'dropping 3 unprocessed job' in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
-async def test_stop_counts_a_job_interrupted_mid_flight_as_dropped(monkeypatch, caplog):
-    """A job the worker had already dequeued is invisible to `queue.qsize()`.
-
-    If `stop()` only counted what is still sitting in the queue, cancelling
-    the worker while it is inside `await job()` would undercount the drop by
-    exactly the in-flight job, understating what a restart actually loses.
-    """
+async def test_stop_timeout_counts_inflight_and_queued_jobs_and_logs_critical(monkeypatch, caplog):
     started_processing = asyncio.Event()
     finish_processing = asyncio.Event()
 
@@ -189,23 +262,113 @@ async def test_stop_counts_a_job_interrupted_mid_flight_as_dropped(monkeypatch, 
         started_processing.set()
         await finish_processing.wait()
 
-    worker = AsyncWorker(maxsize=5)
+    worker = AsyncWorker(maxsize=5, drain_timeout_seconds=0.01)
     monkeypatch.setattr(ingest, 'async_worker', worker)
+    worker.queue.put_nowait(slow_job)
+    worker.queue.put_nowait(slow_job)
     worker.queue.put_nowait(slow_job)
     await worker.start()
     await started_processing.wait()
-    assert worker.queue.qsize() == 0  # dequeued into the worker, not sitting in the queue
+    assert worker.queue.qsize() == 2  # one job is already in flight
 
-    with caplog.at_level('WARNING'):
-        await worker.stop()
+    with caplog.at_level('CRITICAL'):
+        dropped = await worker.stop()
 
-    assert any('Dropping 1 unprocessed job' in record.message for record in caplog.records)
+    assert dropped == 3
+    assert worker.last_shutdown_dropped_jobs == 3
+    assert worker.queue.qsize() == 0
+    await asyncio.wait_for(worker.queue.join(), timeout=1)
+    assert any(
+        'drain timed out' in record.message and '3 unprocessed job' in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio
-async def test_healthcheck_exposes_ingest_queue_depth_and_maxsize(monkeypatch):
+async def test_stop_remains_bounded_when_a_job_suppresses_repeated_cancellation(
+    monkeypatch, caplog
+):
+    started_processing = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    release_job = asyncio.Event()
+
+    async def cancellation_suppressing_job():
+        started_processing.set()
+        while not release_job.is_set():
+            try:
+                await release_job.wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+
+    worker = AsyncWorker(maxsize=1, drain_timeout_seconds=0.01)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    worker.queue.put_nowait(cancellation_suppressing_job)
+    await worker.start()
+    await started_processing.wait()
+
+    with caplog.at_level('CRITICAL'):
+        dropped = await asyncio.wait_for(worker.stop(), timeout=0.25)
+
+    assert dropped == 1
+    assert cancellation_seen.is_set()
+    assert worker.last_shutdown_dropped_jobs == 1
+    assert any(
+        'termination deadline remains bounded' in record.message for record in caplog.records
+    )
+
+    # Release the deliberately non-cooperative test job, then cancel the
+    # consumer once it returns to its normal queue wait so no task leaks out of
+    # the test event loop.
+    release_job.set()
+    await asyncio.sleep(0)
+    assert worker.task is not None
+    worker.task.cancel()
+    with suppress(asyncio.CancelledError):
+        await worker.task
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_admission_and_successfully_drains_every_accepted_job(monkeypatch):
+    started_processing = asyncio.Event()
+    finish_processing = asyncio.Event()
+    completed: list[int] = []
+
+    async def first_job():
+        started_processing.set()
+        await finish_processing.wait()
+        completed.append(1)
+
+    async def second_job():
+        completed.append(2)
+
+    worker = AsyncWorker(maxsize=5, drain_timeout_seconds=1)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    worker.queue.put_nowait(first_job)
+    worker.queue.put_nowait(second_job)
+    await worker.start()
+    await started_processing.wait()
+
+    stop_task = asyncio.create_task(worker.stop())
+    await asyncio.sleep(0)
+    assert worker.accepting is False
+    assert worker.draining is True
+    assert stop_task.done() is False
+
+    finish_processing.set()
+    assert await stop_task == 0
+    assert completed == [1, 2]
+    assert worker.last_shutdown_dropped_jobs == 0
+    assert worker.task is not None and worker.task.done()
+    await asyncio.wait_for(worker.queue.join(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_healthcheck_exposes_ingest_queue_depth_and_maxsize(
+    monkeypatch, non_consuming_worker
+):
     worker = AsyncWorker(maxsize=5)
     monkeypatch.setattr(ingest, 'async_worker', worker)
+    await non_consuming_worker(worker)
     await add_messages(_request(2), *_client_args(), _settings())
 
     response = await graph_service_main.healthcheck()
@@ -213,6 +376,112 @@ async def test_healthcheck_exposes_ingest_queue_depth_and_maxsize(monkeypatch):
     body = _json_body(response)
     assert body['ingest_queue_depth'] == 2
     assert body['ingest_queue_maxsize'] == 5
+
+
+@pytest.mark.asyncio
+async def test_readiness_requires_shared_client_and_live_ingest_worker(monkeypatch):
+    settings = Settings.model_validate(_required_opr_settings_values())
+    monkeypatch.setattr(graph_service_main, 'get_settings', lambda: settings)
+    worker = AsyncWorker(maxsize=5)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+
+    unavailable = await graph_service_main.readiness(_http_request())
+    assert unavailable.status_code == 503
+    assert _json_body(unavailable) == {
+        'status': 'not_ready',
+        'graphiti_core_version': _json_body(unavailable)['graphiti_core_version'],
+        'opr_auth_required': True,
+        'ingest_worker_running': False,
+        'ingest_accepting': False,
+        'ingest_draining': False,
+    }
+
+    await worker.start()
+    await asyncio.sleep(0)
+    try:
+        ready = await graph_service_main.readiness(_http_request(_graphiti()))
+        assert ready.status_code == 200
+        assert _json_body(ready)['status'] == 'ready'
+        assert _json_body(ready)['opr_auth_required'] is True
+        assert _json_body(ready)['ingest_worker_running'] is True
+        assert _json_body(ready)['ingest_accepting'] is True
+        assert _json_body(ready)['ingest_draining'] is False
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_drain_makes_readiness_false_and_rejects_new_ingest(monkeypatch):
+    settings = Settings.model_validate(_settings_values())
+    monkeypatch.setattr(graph_service_main, 'get_settings', lambda: settings)
+    worker = AsyncWorker(maxsize=5)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    await worker.start()
+    worker.begin_drain()
+
+    try:
+        readiness = await graph_service_main.readiness(_http_request(_graphiti()))
+        assert readiness.status_code == 503
+        assert _json_body(readiness)['status'] == 'not_ready'
+        assert _json_body(readiness)['ingest_worker_running'] is True
+        assert _json_body(readiness)['ingest_accepting'] is False
+        assert _json_body(readiness)['ingest_draining'] is True
+
+        response = await add_messages(_request(1), *_client_args(), _settings())
+        assert isinstance(response, JSONResponse)
+        assert response.status_code == 503
+        assert _json_body(response) == {
+            'success': False,
+            'error': 'ingest_draining',
+            'message': 'Ingestion is draining for shutdown; retry another instance.',
+            'queue_depth': 0,
+            'queue_maxsize': 5,
+        }
+        assert worker.queue.qsize() == 0
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_request_suspended_in_uuid_preflight_cannot_enqueue_after_drain_begins(
+    monkeypatch, non_consuming_worker
+):
+    preflight_started = asyncio.Event()
+    finish_preflight = asyncio.Event()
+
+    async def assert_episode_uuid_group(_uuid: str, _group_id: str):
+        preflight_started.set()
+        await finish_preflight.wait()
+
+    graphiti = cast(
+        ZepGraphiti,
+        SimpleNamespace(
+            assert_episode_uuid_group=AsyncMock(side_effect=assert_episode_uuid_group),
+            add_episode=AsyncMock(),
+        ),
+    )
+    worker = AsyncWorker(maxsize=5)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    await non_consuming_worker(worker)
+    request = AddMessagesRequest(
+        group_id='not-opr',
+        messages=[
+            Message(uuid='episode-id', content='message', role_type='user', role=None),
+        ],
+    )
+
+    request_task = asyncio.create_task(
+        add_messages(request, _http_request(graphiti), graphiti, _settings())
+    )
+    await preflight_started.wait()
+    worker.begin_drain()
+    finish_preflight.set()
+
+    response = await request_task
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 503
+    assert _json_body(response)['error'] == 'ingest_draining'
+    assert worker.queue.qsize() == 0
 
 
 def test_settings_requires_ingest_queue_maxsize():
@@ -231,6 +500,18 @@ def test_settings_rejects_non_integer_ingest_queue_maxsize():
 def test_settings_rejects_non_positive_ingest_queue_maxsize(value):
     with pytest.raises(ValidationError, match='ingest_queue_maxsize'):
         Settings.model_validate(_settings_values(ingest_queue_maxsize=value))
+
+
+@pytest.mark.parametrize('value', [0, -1, 51])
+def test_settings_rejects_drain_timeout_outside_pod_shutdown_budget(value):
+    with pytest.raises(ValidationError, match='ingest_drain_timeout_seconds'):
+        Settings.model_validate(_settings_values(ingest_drain_timeout_seconds=value))
+
+
+def test_settings_defaults_drain_timeout_to_25_seconds():
+    settings = Settings.model_validate(_settings_values())
+
+    assert settings.ingest_drain_timeout_seconds == 25
 
 
 def test_async_worker_unconfigured_use_raises_instead_of_falling_back():
@@ -323,7 +604,9 @@ async def test_worker_task_death_is_logged_and_its_exception_retrieved(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_queued_job_resolves_the_shared_client_at_execution_time(monkeypatch):
+async def test_queued_job_resolves_the_shared_client_at_execution_time(
+    monkeypatch, non_consuming_worker
+):
     """The job must read app state when it runs, not capture a client when queued.
 
     Closing over the injected client pinned an entire per-request client stack
@@ -333,6 +616,7 @@ async def test_queued_job_resolves_the_shared_client_at_execution_time(monkeypat
     """
     worker = AsyncWorker(maxsize=2)
     monkeypatch.setattr(ingest, 'async_worker', worker)
+    await non_consuming_worker(worker)
     request_time_client = _graphiti()
     http_request = _http_request(request_time_client)
 
@@ -345,6 +629,7 @@ async def test_queued_job_resolves_the_shared_client_at_execution_time(monkeypat
 
     job = worker.queue.get_nowait()
     await job()
+    worker.queue.task_done()
 
     cast(AsyncMock, execution_time_client.add_episode).assert_awaited_once()
     cast(AsyncMock, request_time_client.add_episode).assert_not_awaited()
@@ -458,6 +743,9 @@ def test_app_builds_one_client_for_many_requests_and_drains_jobs_against_it(monk
             time.sleep(0.01)
 
         assert client.get('/healthcheck').json()['ingest_queue_depth'] == 0
+        readiness = client.get('/readyz')
+        assert readiness.status_code == 200
+        assert readiness.json()['status'] == 'ready'
         assert len(built) == 1, 'a client per HTTP request is the leak this change removes'
         assert cast(AsyncMock, built[0].add_episode).await_count == request_count
         cast(AsyncMock, built[0].close).assert_not_awaited()
