@@ -6,6 +6,11 @@ from importlib.metadata import version
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
+from graph_service.auth import (
+    AUTHORIZER_STATE_ATTR,
+    build_graphiti_authorizer,
+    set_graphiti_authorizer,
+)
 from graph_service.config import get_settings
 from graph_service.dto import ReadinessResponse
 from graph_service.routers import ingest, retrieve
@@ -55,22 +60,33 @@ async def _close_graphiti_client(client: ZepGraphiti) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    # One Graphiti client for the whole process, owned here and installed on
-    # app state. Request dependencies and queued ingest jobs both resolve this
-    # same instance; nothing constructs a client per request.
-    client = build_graphiti_client(settings)
-    set_graphiti_client(app, client)
+    authorizer = build_graphiti_authorizer(settings)
+    client: ZepGraphiti | None = None
     try:
+        # JWT mode eagerly resolves the configured LZ JWKS. A pod never starts
+        # accepting traffic with an empty verification-key cache.
+        await authorizer.start()
+        set_graphiti_authorizer(app, authorizer)
+
+        # One Graphiti client for the whole process, owned here and installed on
+        # app state. Request dependencies and queued ingest jobs both resolve this
+        # same instance; nothing constructs a client per request.
+        client = build_graphiti_client(settings)
+        set_graphiti_client(app, client)
         await client.build_indices_and_constraints()
         yield
     finally:
-        # The only place this client is closed. The ingest router's lifespan is
-        # merged inside this one by `include_router`, so it has already closed
-        # admission and completed its bounded drain/cancellation attempt. A job
-        # that deliberately suppresses cancellation remains in doubt until the
-        # process exits; bound client cleanup too so it cannot consume the rest
-        # of the pod's termination deadline.
-        await _close_graphiti_client(client)
+        try:
+            if client is not None:
+                # The only place this client is closed. The ingest router's lifespan is
+                # merged inside this one by `include_router`, so it has already closed
+                # admission and completed its bounded drain/cancellation attempt. A job
+                # that deliberately suppresses cancellation remains in doubt until the
+                # process exits; bound client cleanup too so it cannot consume the rest
+                # of the pod's termination deadline.
+                await _close_graphiti_client(client)
+        finally:
+            await authorizer.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -110,14 +126,16 @@ async def readiness(request: Request):
     settings = get_settings()
     worker_task = ingest.async_worker.task
     graphiti_ready = hasattr(request.app.state, GRAPHITI_CLIENT_STATE_ATTR)
+    authorization_ready = hasattr(request.app.state, AUTHORIZER_STATE_ATTR)
     worker_running = worker_task is not None and not worker_task.done()
     ingest_ready = ingest.async_worker.ready
-    ready = graphiti_ready and ingest_ready
+    ready = graphiti_ready and authorization_ready and ingest_ready
     return JSONResponse(
         content={
             'status': 'ready' if ready else 'not_ready',
             'graphiti_core_version': version('graphiti-core'),
             'opr_auth_required': settings.opr_auth_required,
+            'opr_auth_mode': settings.opr_auth_mode.value,
             'ingest_worker_running': worker_running,
             'ingest_accepting': ingest.async_worker.accepting,
             'ingest_draining': ingest.async_worker.draining,

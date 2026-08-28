@@ -8,7 +8,8 @@ from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.errors import NodeGroupMismatchError
 from pydantic import SecretStr
 
-from graph_service.config import Settings
+from graph_service.auth import GraphitiAuthorizer
+from graph_service.config import OprAuthMode, Settings
 from graph_service.dto import (
     AddEntityNodeRequest,
     AddMessagesRequest,
@@ -68,8 +69,13 @@ def _settings(
             opr_retirement_token=SecretStr(retirement_token),
             opr_writer_fleet_epoch=SecretStr(writer_fleet_epoch),
             graphiti_admin_clear_enabled=clear_enabled,
+            opr_auth_mode=OprAuthMode.STATIC,
         ),
     )
+
+
+def _authorizer(settings: Settings | None = None) -> GraphitiAuthorizer:
+    return GraphitiAuthorizer(settings or _settings())
 
 
 def _bearer(token: str) -> str:
@@ -307,7 +313,9 @@ async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue(m
     settings = _settings()
 
     with pytest.raises(HTTPException) as exc_info:
-        await add_messages(request, _http_request(graphiti), graphiti, settings)
+        await add_messages(
+            request, _http_request(graphiti), graphiti, settings, _authorizer(settings)
+        )
     assert exc_info.value.status_code == 403
 
     with pytest.raises(HTTPException) as exc_info:
@@ -316,6 +324,7 @@ async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue(m
             _http_request(graphiti),
             graphiti,
             settings,
+            _authorizer(settings),
             authorization=_bearer('opr-read-secret'),
         )
     assert exc_info.value.status_code == 403
@@ -325,6 +334,7 @@ async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue(m
         _http_request(graphiti),
         graphiti,
         settings,
+        _authorizer(settings),
         authorization=_bearer('opr-write-secret'),
     )
     assert isinstance(result, Result)
@@ -357,7 +367,10 @@ async def test_message_write_rejects_known_cross_group_uuid_before_enqueue(monke
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await add_messages(request, _http_request(graphiti), graphiti, _settings())
+        settings = _settings()
+        await add_messages(
+            request, _http_request(graphiti), graphiti, settings, _authorizer(settings)
+        )
 
     assert exc_info.value.status_code == 409
     assert_episode_uuid_group.assert_awaited_once_with('opr-owned-episode', 'other')
@@ -414,13 +427,14 @@ async def test_opr_write_requires_write_bearer_but_non_opr_write_remains_compati
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await add_entity_node(opr_request, graphiti, settings)
+        await add_entity_node(opr_request, graphiti, settings, _authorizer(settings))
     assert exc_info.value.status_code == 403
     with pytest.raises(HTTPException) as exc_info:
         await add_entity_node(
             opr_request,
             graphiti,
             settings,
+            _authorizer(settings),
             authorization=_bearer('opr-read-secret'),
         )
     assert exc_info.value.status_code == 403
@@ -430,6 +444,7 @@ async def test_opr_write_requires_write_bearer_but_non_opr_write_remains_compati
         opr_request,
         graphiti,
         settings,
+        _authorizer(settings),
         authorization=_bearer('opr-write-secret'),
     )
     save_entity_node.assert_awaited_once()
@@ -444,6 +459,7 @@ async def test_opr_write_requires_write_bearer_but_non_opr_write_remains_compati
         ),
         graphiti,
         settings,
+        _authorizer(settings),
     )
     save_entity_node.assert_awaited_once()
 
@@ -460,7 +476,8 @@ async def test_entity_write_maps_atomic_group_mismatch_to_conflict():
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await add_entity_node(request, graphiti, _settings())
+        settings = _settings()
+        await add_entity_node(request, graphiti, settings, _authorizer(settings))
 
     assert exc_info.value.status_code == 409
     save_entity_node.assert_awaited_once()
@@ -474,13 +491,19 @@ async def test_search_requires_opr_bearer_for_explicit_or_unrestricted_group_acc
 
     for group_ids in (None, [], [''], ['other', 'opr']):
         with pytest.raises(HTTPException) as exc_info:
-            await search(SearchQuery(query='query', group_ids=group_ids), graphiti, settings)
+            await search(
+                SearchQuery(query='query', group_ids=group_ids),
+                graphiti,
+                settings,
+                _authorizer(settings),
+            )
         assert exc_info.value.status_code == 403
     with pytest.raises(HTTPException) as exc_info:
         await search(
             SearchQuery(query='query', group_ids=['opr']),
             graphiti,
             settings,
+            _authorizer(settings),
             authorization=_bearer('opr-write-secret'),
         )
     assert exc_info.value.status_code == 403
@@ -490,12 +513,18 @@ async def test_search_requires_opr_bearer_for_explicit_or_unrestricted_group_acc
         SearchQuery(query='query', group_ids=['opr']),
         graphiti,
         settings,
+        _authorizer(settings),
         authorization=_bearer('opr-read-secret'),
     )
     graphiti_search.assert_awaited_once()
 
     graphiti_search.reset_mock()
-    await search(SearchQuery(query='query', group_ids=['other']), graphiti, settings)
+    await search(
+        SearchQuery(query='query', group_ids=['other']),
+        graphiti,
+        settings,
+        _authorizer(settings),
+    )
     graphiti_search.assert_awaited_once()
 
 
@@ -516,10 +545,12 @@ async def test_get_memory_forwards_center_node_uuid_to_node_distance_search():
         ],
     )
 
+    settings = _settings()
     response = await get_memory(
         request,
         graphiti,
-        _settings(),
+        settings,
+        _authorizer(settings),
         authorization=_bearer('opr-read-secret'),
     )
 
@@ -544,7 +575,7 @@ async def test_ordinary_opr_listing_uses_read_bearer():
     settings = _settings()
 
     with pytest.raises(HTTPException) as exc_info:
-        await get_episodes('opr', 10, graphiti, settings)
+        await get_episodes('opr', 10, graphiti, settings, _authorizer(settings))
     assert exc_info.value.status_code == 403
     with pytest.raises(HTTPException) as exc_info:
         await get_episodes(
@@ -552,6 +583,7 @@ async def test_ordinary_opr_listing_uses_read_bearer():
             10,
             graphiti,
             settings,
+            _authorizer(settings),
             authorization=_bearer('wrong'),
         )
     assert exc_info.value.status_code == 403
@@ -562,6 +594,7 @@ async def test_ordinary_opr_listing_uses_read_bearer():
         10,
         graphiti,
         settings,
+        _authorizer(settings),
         authorization=_bearer('opr-read-secret'),
     )
     ordinary.assert_awaited_once()
@@ -578,24 +611,46 @@ async def test_legacy_destructive_routes_require_admin_and_group_delete_forbids_
     settings = _settings()
 
     with pytest.raises(HTTPException) as exc_info:
-        await delete_entity_edge('edge', graphiti, settings)
+        await delete_entity_edge('edge', graphiti, settings, _authorizer(settings))
     assert exc_info.value.status_code == 403
     with pytest.raises(HTTPException) as exc_info:
         await delete_entity_edge(
-            'edge', graphiti, settings, authorization=_bearer('opr-read-secret')
+            'edge',
+            graphiti,
+            settings,
+            _authorizer(settings),
+            authorization=_bearer('opr-read-secret'),
         )
     assert exc_info.value.status_code == 403
     delete_edge.assert_not_awaited()
 
-    await delete_entity_edge('edge', graphiti, settings, authorization=_bearer('admin-secret'))
+    await delete_entity_edge(
+        'edge',
+        graphiti,
+        settings,
+        _authorizer(settings),
+        authorization=_bearer('admin-secret'),
+    )
     delete_edge.assert_awaited_once_with('edge')
 
     with pytest.raises(HTTPException) as exc_info:
-        await delete_group('opr', graphiti, settings, authorization=_bearer('admin-secret'))
+        await delete_group(
+            'opr',
+            graphiti,
+            settings,
+            _authorizer(settings),
+            authorization=_bearer('admin-secret'),
+        )
     assert exc_info.value.status_code == 403
     delete_graph_group.assert_not_awaited()
 
-    await delete_group('other', graphiti, settings, authorization=_bearer('admin-secret'))
+    await delete_group(
+        'other',
+        graphiti,
+        settings,
+        _authorizer(settings),
+        authorization=_bearer('admin-secret'),
+    )
     delete_graph_group.assert_awaited_once_with('other')
 
 
@@ -612,10 +667,12 @@ async def test_legacy_episode_delete_atomically_excludes_opr_group(provider: Gra
     driver = SimpleNamespace(provider=provider, execute_query=execute_query)
     graphiti = cast(ZepGraphiti, SimpleNamespace(driver=driver))
 
+    settings = _settings()
     await delete_episode(
         'episode',
         graphiti,
-        _settings(),
+        settings,
+        _authorizer(settings),
         authorization=_bearer('admin-secret'),
     )
 
@@ -640,10 +697,12 @@ async def test_legacy_episode_delete_fails_closed_on_backend_without_safe_lock_q
     graphiti = cast(ZepGraphiti, SimpleNamespace(driver=driver))
 
     with pytest.raises(HTTPException) as exc_info:
+        settings = _settings()
         await delete_episode(
             'episode',
             graphiti,
-            _settings(),
+            settings,
+            _authorizer(settings),
             authorization=_bearer('admin-secret'),
         )
 
@@ -658,10 +717,12 @@ async def test_legacy_episode_delete_fails_closed_when_atomic_group_guard_does_n
     graphiti = cast(ZepGraphiti, SimpleNamespace(driver=driver))
 
     with pytest.raises(HTTPException) as exc_info:
+        settings = _settings()
         await delete_episode(
             'episode',
             graphiti,
-            _settings(),
+            settings,
+            _authorizer(settings),
             authorization=_bearer('admin-secret'),
         )
 
@@ -679,26 +740,32 @@ async def test_global_clear_requires_admin_and_explicit_enable(monkeypatch):
     )
 
     with pytest.raises(HTTPException) as exc_info:
+        settings = _settings(clear_enabled=False)
         await clear(
             graphiti,
-            _settings(clear_enabled=False),
+            settings,
+            _authorizer(settings),
             authorization=_bearer('admin-secret'),
         )
     assert exc_info.value.status_code == 403
     clear_data.assert_not_awaited()
 
     with pytest.raises(HTTPException) as exc_info:
+        settings = _settings(clear_enabled=True)
         await clear(
             graphiti,
-            _settings(clear_enabled=True),
+            settings,
+            _authorizer(settings),
             authorization=_bearer('opr-read-secret'),
         )
     assert exc_info.value.status_code == 403
     clear_data.assert_not_awaited()
 
+    settings = _settings(clear_enabled=True)
     await clear(
         graphiti,
-        _settings(clear_enabled=True),
+        settings,
+        _authorizer(settings),
         authorization=_bearer('admin-secret'),
     )
     clear_data.assert_awaited_once_with(graphiti.driver)

@@ -14,6 +14,7 @@ from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 from starlette.responses import JSONResponse
 
+from graph_service.auth import GraphitiAuthorizerDep, Permission
 from graph_service.config import MAX_INGEST_DRAIN_TIMEOUT_SECONDS, ZepEnvDep, get_settings
 from graph_service.dto import (
     AddEntityNodeRequest,
@@ -27,7 +28,6 @@ from graph_service.protocol import (
     GRAPHITI_RECONCILIATION_GROUP_ID,
     GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE,
     GRAPHITI_RECONCILIATION_PROTOCOL,
-    bearer_token_matches,
     reconciliation_token_matches,
     writer_fleet_epoch_sha256,
 )
@@ -41,46 +41,41 @@ Job = Callable[[], Coroutine[Any, Any, None]]
 _MAX_WORKER_CANCEL_WAIT_SECONDS = 1.0
 
 
-def _authorize_opr_write(
-    settings: ZepEnvDep,
+async def _authorize_opr_write(
+    authorizer: GraphitiAuthorizerDep,
     authorization: str | None,
     group_id: str,
 ) -> None:
-    if group_id == GRAPHITI_RECONCILIATION_GROUP_ID and not bearer_token_matches(
-        settings.opr_write_token.get_secret_value(), authorization
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='OPR graph write is not authorized',
-        )
+    if group_id == GRAPHITI_RECONCILIATION_GROUP_ID:
+        await authorizer.require(Permission.WRITE, authorization)
 
 
-def _authorize_graphiti_admin(settings: ZepEnvDep, authorization: str | None) -> None:
-    if not bearer_token_matches(settings.graphiti_admin_token.get_secret_value(), authorization):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail='Graphiti administrative access is not authorized',
-        )
+async def _authorize_graphiti_admin(
+    authorizer: GraphitiAuthorizerDep, authorization: str | None
+) -> None:
+    await authorizer.require(Permission.ADMIN, authorization)
 
 
-def _authorize_episode_retirement(
+async def _authorize_episode_retirement(
+    authorizer: GraphitiAuthorizerDep,
     settings: ZepEnvDep,
+    authorization: str | None,
     supplied_token: str | None,
     supplied_writer_fleet_epoch: str | None,
     operation: str | None,
     group_id: str,
 ) -> None:
-    expected_token = settings.opr_retirement_token.get_secret_value()
+    await authorizer.require(
+        Permission.RETIRE,
+        authorization,
+        legacy_token=supplied_token,
+    )
     expected_writer_fleet_epoch = settings.opr_writer_fleet_epoch.get_secret_value()
-    if (
-        not reconciliation_token_matches(expected_token, supplied_token)
-        or not reconciliation_token_matches(
-            expected_writer_fleet_epoch, supplied_writer_fleet_epoch
-        )
-        or (
-            operation != GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE
-            or group_id != GRAPHITI_RECONCILIATION_GROUP_ID
-        )
+    if not reconciliation_token_matches(
+        expected_writer_fleet_epoch, supplied_writer_fleet_epoch
+    ) or (
+        operation != GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE
+        or group_id != GRAPHITI_RECONCILIATION_GROUP_ID
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -397,9 +392,10 @@ async def add_messages(
     http_request: Request,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
+    authorizer: GraphitiAuthorizerDep,
     authorization: Annotated[str | None, Header()] = None,
 ) -> Result | JSONResponse:
-    _authorize_opr_write(settings, authorization, request.group_id)
+    await _authorize_opr_write(authorizer, authorization, request.group_id)
 
     def _admission_closed_response() -> JSONResponse:
         depth = async_worker.depth
@@ -529,9 +525,10 @@ async def add_entity_node(
     request: AddEntityNodeRequest,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
+    authorizer: GraphitiAuthorizerDep,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    _authorize_opr_write(settings, authorization, request.group_id)
+    await _authorize_opr_write(authorizer, authorization, request.group_id)
     try:
         node = await graphiti.save_entity_node(
             uuid=request.uuid,
@@ -552,9 +549,10 @@ async def delete_entity_edge(
     uuid: str,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
+    authorizer: GraphitiAuthorizerDep,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    _authorize_graphiti_admin(settings, authorization)
+    await _authorize_graphiti_admin(authorizer, authorization)
     await graphiti.delete_entity_edge(uuid)
     return Result(message='Entity Edge deleted', success=True)
 
@@ -564,9 +562,10 @@ async def delete_group(
     group_id: str,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
+    authorizer: GraphitiAuthorizerDep,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    _authorize_graphiti_admin(settings, authorization)
+    await _authorize_graphiti_admin(authorizer, authorization)
     if group_id == GRAPHITI_RECONCILIATION_GROUP_ID:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -581,9 +580,10 @@ async def delete_episode(
     uuid: str,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
+    authorizer: GraphitiAuthorizerDep,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    _authorize_graphiti_admin(settings, authorization)
+    await _authorize_graphiti_admin(authorizer, authorization)
     if graphiti.driver.provider in {GraphProvider.KUZU, GraphProvider.FALKORDB}:
         # Kuzu cannot use the transient-property lock. FalkorDB stores groups
         # in separate graph databases, but this UUID-only route has no trusted
@@ -629,12 +629,16 @@ async def delete_episode_if_matches(
     request: DeleteEpisodeIfMatchRequest,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
+    authorizer: GraphitiAuthorizerDep,
+    authorization: Annotated[str | None, Header()] = None,
     x_opr_retirement_token: Annotated[str | None, Header()] = None,
     x_opr_writer_fleet_epoch: Annotated[str | None, Header()] = None,
     x_opr_reconciliation_operation: Annotated[str | None, Header()] = None,
 ):
-    _authorize_episode_retirement(
+    await _authorize_episode_retirement(
+        authorizer,
         settings,
+        authorization,
         x_opr_retirement_token,
         x_opr_writer_fleet_epoch,
         x_opr_reconciliation_operation,
@@ -689,12 +693,16 @@ async def get_episode_retirement_status(
     group_id: str,
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
+    authorizer: GraphitiAuthorizerDep,
+    authorization: Annotated[str | None, Header()] = None,
     x_opr_retirement_token: Annotated[str | None, Header()] = None,
     x_opr_writer_fleet_epoch: Annotated[str | None, Header()] = None,
     x_opr_reconciliation_operation: Annotated[str | None, Header()] = None,
 ):
-    _authorize_episode_retirement(
+    await _authorize_episode_retirement(
+        authorizer,
         settings,
+        authorization,
         x_opr_retirement_token,
         x_opr_writer_fleet_epoch,
         x_opr_reconciliation_operation,
@@ -727,9 +735,10 @@ async def get_episode_retirement_status(
 async def clear(
     graphiti: ZepGraphitiDep,
     settings: ZepEnvDep,
+    authorizer: GraphitiAuthorizerDep,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    _authorize_graphiti_admin(settings, authorization)
+    await _authorize_graphiti_admin(authorizer, authorization)
     if not settings.graphiti_admin_clear_enabled:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
