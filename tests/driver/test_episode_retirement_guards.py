@@ -7,12 +7,15 @@ import pytest
 from neo4j.exceptions import ClientError
 
 from graphiti_core.driver.driver import GraphProvider
-from graphiti_core.driver.kuzu_driver import KuzuDriver
+from graphiti_core.driver.kuzu.operations.has_episode_edge_ops import KuzuHasEpisodeEdgeOperations
+from graphiti_core.driver.kuzu.operations.next_episode_edge_ops import KuzuNextEpisodeEdgeOperations
+from graphiti_core.driver.kuzu_driver import KuzuDriver, KuzuDriverSession
 from graphiti_core.driver.neo4j.schema import (
     delete_standalone_indexes,
     ensure_episode_uuid_uniqueness,
 )
-from graphiti_core.driver.query_executor import QueryExecutor
+from graphiti_core.driver.query_executor import QueryExecutor, Transaction
+from graphiti_core.edges import HasEpisodeEdge, NextEpisodeEdge
 from graphiti_core.errors import EpisodeTombstonedError, GraphitiError, NodeGroupMismatchError
 from graphiti_core.models.nodes.node_db_queries import get_entity_node_save_query
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
@@ -77,6 +80,50 @@ async def test_kuzu_node_writes_preserve_existing_group_ownership():
         assert (await EntityNode.get_by_uuid(driver, entity.uuid)).group_id == 'opr'
     finally:
         await driver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('operation', 'edge_type'),
+    [
+        (KuzuHasEpisodeEdgeOperations(), HasEpisodeEdge),
+        (KuzuNextEpisodeEdgeOperations(), NextEpisodeEdge),
+    ],
+)
+async def test_kuzu_saga_edge_transaction_preserves_success_result(operation, edge_type):
+    query_result = ([{'uuid': 'edge'}], None, None)
+    execute_query = AsyncMock(return_value=query_result)
+    driver = cast(
+        KuzuDriver,
+        SimpleNamespace(execute_query=execute_query),
+    )
+    session = KuzuDriverSession(driver)
+    edge = edge_type(
+        uuid='edge',
+        source_node_uuid='source',
+        target_node_uuid='target',
+        group_id='team-a',
+        created_at=datetime.now(timezone.utc),
+    )
+
+    await operation.save(cast(QueryExecutor, driver), edge, tx=cast(Transaction, session))
+
+    execute_query.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_kuzu_session_list_run_returns_last_result():
+    first_result = ([{'uuid': 'first'}], None, None)
+    last_result = ([{'uuid': 'last'}], None, None)
+    driver = cast(
+        KuzuDriver,
+        SimpleNamespace(execute_query=AsyncMock(side_effect=[first_result, last_result])),
+    )
+    session = KuzuDriverSession(driver)
+
+    result = await session.run([('RETURN 1', {}), ('RETURN 2', {})])
+
+    assert result is last_result
 
 
 @pytest.mark.parametrize(

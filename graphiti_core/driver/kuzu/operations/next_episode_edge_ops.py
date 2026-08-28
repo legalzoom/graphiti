@@ -20,8 +20,8 @@ from typing import Any
 from graphiti_core.driver.operations.next_episode_edge_ops import NextEpisodeEdgeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
 from graphiti_core.edges import NextEpisodeEdge
-from graphiti_core.errors import EdgeNotFoundError
-from graphiti_core.helpers import parse_db_date
+from graphiti_core.errors import EdgeNotFoundError, NodeGroupMismatchError
+from graphiti_core.helpers import parse_db_date, query_result_record_count
 from graphiti_core.models.edges.edge_db_queries import (
     NEXT_EPISODE_EDGE_RETURN,
     NEXT_EPISODE_EDGE_SAVE,
@@ -55,9 +55,11 @@ class KuzuNextEpisodeEdgeOperations(NextEpisodeEdgeOperations):
             'created_at': edge.created_at,
         }
         if tx is not None:
-            await tx.run(NEXT_EPISODE_EDGE_SAVE, **params)
+            result = await tx.run(NEXT_EPISODE_EDGE_SAVE, **params)
         else:
-            await executor.execute_query(NEXT_EPISODE_EDGE_SAVE, **params)
+            result = await executor.execute_query(NEXT_EPISODE_EDGE_SAVE, **params)
+        if await query_result_record_count(result) != 1:
+            raise NodeGroupMismatchError()
 
         logger.debug(f'Saved Edge to Graph: {edge.uuid}')
 

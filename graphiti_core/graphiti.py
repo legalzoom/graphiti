@@ -1095,6 +1095,17 @@ class Graphiti:
                     if previous_episode_uuids is None
                     else await EpisodicNode.get_by_uuids(self.driver, previous_episode_uuids)
                 )
+                if any(previous.group_id != group_id for previous in previous_episodes):
+                    raise NodeGroupMismatchError()
+
+                # Validate the saga predecessor at use time; callers may enqueue this
+                # operation after performing their own preflight.
+                if saga is not None and saga_previous_episode_uuid is not None:
+                    saga_previous_episode = await EpisodicNode.get_by_uuid(
+                        self.driver, saga_previous_episode_uuid
+                    )
+                    if saga_previous_episode.group_id != group_id:
+                        raise NodeGroupMismatchError()
 
                 # Get or create episode
                 episode = None

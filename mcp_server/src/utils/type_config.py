@@ -56,12 +56,12 @@ def coerce_group_ids(group_ids: str | list[str] | None) -> list[str] | None:
     graphiti-core expects ``list[str] | None``. A non-empty string becomes a
     one-element list; a blank string is treated as omitted (``None``) so it falls
     back to the configured default group rather than operating on group ``''``
-    (which matters for the destructive ``clear_graph``). Lists and ``None`` pass
-    through unchanged.
+    (which matters for the destructive ``clear_graph``). Lists are deduplicated in
+    their original order so FalkorDB does not query one physical graph twice.
     """
     if isinstance(group_ids, str):
         return [group_ids] if group_ids else None
-    return group_ids
+    return list(dict.fromkeys(group_ids)) if group_ids is not None else None
 
 
 def _doc_only_model(name: str, description: str) -> type[BaseModel]:

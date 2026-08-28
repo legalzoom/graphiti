@@ -6,16 +6,43 @@ threading without requiring a live database or LLM. They run as part of the
 default (non-integration) suite.
 """
 
+import asyncio
 import inspect
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from graphiti_core import Graphiti
-from graphiti_core.edges import EntityEdge
-from graphiti_core.nodes import EntityNode
+from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.falkordb.operations.has_episode_edge_ops import (
+    FalkorHasEpisodeEdgeOperations,
+)
+from graphiti_core.driver.falkordb.operations.next_episode_edge_ops import (
+    FalkorNextEpisodeEdgeOperations,
+)
+from graphiti_core.driver.kuzu.operations.has_episode_edge_ops import KuzuHasEpisodeEdgeOperations
+from graphiti_core.driver.kuzu.operations.next_episode_edge_ops import KuzuNextEpisodeEdgeOperations
+from graphiti_core.driver.neo4j.operations.has_episode_edge_ops import Neo4jHasEpisodeEdgeOperations
+from graphiti_core.driver.neo4j.operations.next_episode_edge_ops import (
+    Neo4jNextEpisodeEdgeOperations,
+)
+from graphiti_core.driver.neptune.operations.has_episode_edge_ops import (
+    NeptuneHasEpisodeEdgeOperations,
+)
+from graphiti_core.driver.neptune.operations.next_episode_edge_ops import (
+    NeptuneNextEpisodeEdgeOperations,
+)
+from graphiti_core.edges import EntityEdge, HasEpisodeEdge, NextEpisodeEdge
+from graphiti_core.errors import NodeGroupMismatchError
+from graphiti_core.models.edges.edge_db_queries import (
+    HAS_EPISODE_EDGE_SAVE,
+    NEXT_EPISODE_EDGE_SAVE,
+)
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search.search_filters import ComparisonOperator, SearchFilters
 
 # Add the src directory to the path (mirrors the other unit tests)
@@ -156,8 +183,11 @@ class TestQueueServiceThreading:
     """The queue service must forward every parity param to Graphiti.add_episode."""
 
     @pytest.mark.asyncio
-    async def test_add_episode_forwards_all_params(self):
+    async def test_add_episode_forwards_all_params(self, monkeypatch):
         client = AsyncMock(spec=Graphiti)
+        scoped_client = AsyncMock(spec=Graphiti)
+        scope_client = AsyncMock(return_value=scoped_client)
+        monkeypatch.setattr('services.queue_service.graphiti_for_group', scope_client)
         service = QueueService()
         await service.initialize(client)
 
@@ -187,8 +217,10 @@ class TestQueueServiceThreading:
         # The worker runs the queued coroutine in the background; wait for it.
         await service._episode_queues['g1'].join()
 
-        client.add_episode.assert_awaited_once()
-        kwargs = client.add_episode.await_args.kwargs
+        scope_client.assert_awaited_once_with(client, 'g1')
+        scoped_client.add_episode.assert_awaited_once()
+        client.add_episode.assert_not_awaited()
+        kwargs = scoped_client.add_episode.await_args.kwargs
         assert kwargs['reference_time'] == ref_time
         assert kwargs['edge_types'] == edge_types
         assert kwargs['edge_type_map'] == edge_type_map
@@ -200,9 +232,17 @@ class TestQueueServiceThreading:
         assert kwargs['saga_previous_episode_uuid'] == 'saga-prev'
         assert kwargs['uuid'] == 'ep-uuid'
 
+        worker = service._worker_tasks['g1']
+        worker.cancel()
+        await worker
+
     @pytest.mark.asyncio
-    async def test_add_episode_defaults_reference_time_to_now(self):
+    async def test_add_episode_defaults_reference_time_to_now(self, monkeypatch):
         client = AsyncMock(spec=Graphiti)
+        scoped_client = AsyncMock(spec=Graphiti)
+        monkeypatch.setattr(
+            'services.queue_service.graphiti_for_group', AsyncMock(return_value=scoped_client)
+        )
         service = QueueService()
         await service.initialize(client)
 
@@ -219,8 +259,196 @@ class TestQueueServiceThreading:
         await service._episode_queues['g2'].join()
         after = datetime.now(timezone.utc)
 
-        kwargs = client.add_episode.await_args.kwargs
+        kwargs = scoped_client.add_episode.await_args.kwargs
         assert before <= kwargs['reference_time'] <= after
+
+        worker = service._worker_tasks['g2']
+        worker.cancel()
+        await worker
+
+    @pytest.mark.asyncio
+    async def test_falkor_logical_default_does_not_trigger_an_inner_core_clone(self, monkeypatch):
+        client = AsyncMock(spec=Graphiti)
+        scoped_client = SimpleNamespace(
+            driver=SimpleNamespace(default_group_id='_'),
+            add_episode=AsyncMock(),
+        )
+        scope_client = AsyncMock(return_value=scoped_client)
+        monkeypatch.setattr('services.queue_service.graphiti_for_group', scope_client)
+        service = QueueService()
+        await service.initialize(client)
+
+        for episode_uuid in ('ep-1', 'ep-2'):
+            await service.add_episode(
+                group_id='_',
+                name=episode_uuid,
+                content='body',
+                source_description='desc',
+                episode_type='text',
+                entity_types=None,
+                uuid=episode_uuid,
+            )
+        await service._episode_queues['_'].join()
+
+        assert [call.kwargs['group_id'] for call in scoped_client.add_episode.await_args_list] == [
+            None,
+            None,
+        ]
+        assert scope_client.await_count == 2
+
+        worker = service._worker_tasks['_']
+        worker.cancel()
+        await worker
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_group_enqueues_use_one_sequential_worker(self):
+        service = QueueService()
+        active = 0
+        max_active = 0
+        processed = 0
+
+        async def process_episode() -> None:
+            nonlocal active, max_active, processed
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.01)
+                processed += 1
+            finally:
+                active -= 1
+
+        await asyncio.gather(
+            *(service.add_episode_task('same-group', process_episode) for _ in range(8))
+        )
+        await service._episode_queues['same-group'].join()
+
+        assert processed == 8
+        assert max_active == 1
+        assert service.is_worker_running('same-group')
+
+        worker = service._worker_tasks['same-group']
+        worker.cancel()
+        await worker
+        assert not service.is_worker_running('same-group')
+
+
+class TestEpisodeContextGroupIntegrity:
+    @staticmethod
+    def graphiti_stub():
+        driver = SimpleNamespace(provider=GraphProvider.NEO4J, _database='team-a')
+        graphiti: Any = object.__new__(Graphiti)
+        graphiti.driver = driver
+        graphiti.clients = SimpleNamespace(driver=driver)
+        graphiti.tracer = MagicMock()
+        return graphiti
+
+    @pytest.mark.asyncio
+    async def test_core_rejects_cross_group_explicit_context(self, monkeypatch):
+        graphiti = self.graphiti_stub()
+        get_previous = AsyncMock(return_value=[SimpleNamespace(group_id='team-b')])
+        monkeypatch.setattr(EpisodicNode, 'get_by_uuids', get_previous)
+
+        with pytest.raises(NodeGroupMismatchError):
+            await graphiti.add_episode(
+                name='episode',
+                episode_body='body',
+                source_description='test',
+                reference_time=datetime.now(timezone.utc),
+                source=EpisodeType.text,
+                group_id='team-a',
+                previous_episode_uuids=['cross-group'],
+            )
+
+        get_previous.assert_awaited_once_with(graphiti.driver, ['cross-group'])
+
+    @pytest.mark.asyncio
+    async def test_core_rejects_cross_group_saga_predecessor(self, monkeypatch):
+        graphiti = self.graphiti_stub()
+        monkeypatch.setattr(EpisodicNode, 'get_by_uuids', AsyncMock(return_value=[]))
+        get_saga_previous = AsyncMock(return_value=SimpleNamespace(group_id='team-b'))
+        monkeypatch.setattr(EpisodicNode, 'get_by_uuid', get_saga_previous)
+
+        with pytest.raises(NodeGroupMismatchError):
+            await graphiti.add_episode(
+                name='episode',
+                episode_body='body',
+                source_description='test',
+                reference_time=datetime.now(timezone.utc),
+                source=EpisodeType.text,
+                group_id='team-a',
+                previous_episode_uuids=[],
+                saga='saga',
+                saga_previous_episode_uuid='cross-group',
+            )
+
+        get_saga_previous.assert_awaited_once_with(graphiti.driver, 'cross-group')
+
+    def test_saga_edge_writes_match_endpoints_by_uuid_and_group(self):
+        assert 'MATCH (saga:Saga {uuid: $saga_uuid, group_id: $group_id})' in HAS_EPISODE_EDGE_SAVE
+        assert (
+            'MATCH (episode:Episodic {uuid: $episode_uuid, group_id: $group_id})'
+            in HAS_EPISODE_EDGE_SAVE
+        )
+        assert (
+            'MATCH (source_episode:Episodic '
+            '{uuid: $source_episode_uuid, group_id: $group_id})' in NEXT_EPISODE_EDGE_SAVE
+        )
+        assert (
+            'MATCH (target_episode:Episodic '
+            '{uuid: $target_episode_uuid, group_id: $group_id})' in NEXT_EPISODE_EDGE_SAVE
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('edge_type', [HasEpisodeEdge, NextEpisodeEdge])
+    async def test_legacy_saga_edge_writes_fail_closed_on_missing_endpoints(self, edge_type):
+        driver = SimpleNamespace(
+            graph_operations_interface=None,
+            provider=GraphProvider.NEO4J,
+            execute_query=AsyncMock(return_value=([], [], None)),
+        )
+        edge = edge_type(
+            source_node_uuid='source',
+            target_node_uuid='target',
+            group_id='team-a',
+            created_at=datetime.now(timezone.utc),
+        )
+
+        with pytest.raises(NodeGroupMismatchError):
+            await edge.save(driver)
+
+        driver.execute_query.return_value = ([{'uuid': edge.uuid}], [], None)
+        await edge.save(driver)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('operation', 'edge_type'),
+        [
+            (Neo4jHasEpisodeEdgeOperations(), HasEpisodeEdge),
+            (Neo4jNextEpisodeEdgeOperations(), NextEpisodeEdge),
+            (NeptuneHasEpisodeEdgeOperations(), HasEpisodeEdge),
+            (NeptuneNextEpisodeEdgeOperations(), NextEpisodeEdge),
+            (FalkorHasEpisodeEdgeOperations(), HasEpisodeEdge),
+            (FalkorNextEpisodeEdgeOperations(), NextEpisodeEdge),
+            (KuzuHasEpisodeEdgeOperations(), HasEpisodeEdge),
+            (KuzuNextEpisodeEdgeOperations(), NextEpisodeEdge),
+        ],
+    )
+    async def test_provider_saga_edge_writes_fail_closed_on_missing_endpoints(
+        self, operation, edge_type
+    ):
+        executor = SimpleNamespace(execute_query=AsyncMock(return_value=([], [], None)))
+        edge = edge_type(
+            source_node_uuid='source',
+            target_node_uuid='target',
+            group_id='team-a',
+            created_at=datetime.now(timezone.utc),
+        )
+
+        with pytest.raises(NodeGroupMismatchError):
+            await operation.save(executor, edge)
+
+        executor.execute_query.return_value = ([{'uuid': edge.uuid}], [], None)
+        await operation.save(executor, edge)
 
 
 class TestCoreSignatureCompatibility:
@@ -302,6 +530,9 @@ class TestCoerceGroupIds:
 
     def test_list_passes_through(self):
         assert coerce_group_ids(['g1', 'g2']) == ['g1', 'g2']
+
+    def test_duplicate_groups_are_deduplicated_in_order(self):
+        assert coerce_group_ids(['g2', 'g1', 'g2']) == ['g2', 'g1']
 
     def test_none_passes_through(self):
         assert coerce_group_ids(None) is None

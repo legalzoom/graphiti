@@ -9,6 +9,9 @@ server:
   transport: "http"  # Options: stdio, sse (deprecated), http
   host: "0.0.0.0"
   port: 8000
+  # HTTP authentication and FastMCP Host/Origin policy are configured with
+  # GRAPHITI_MCP_* environment variables. Keep bearer tokens in a secret manager;
+  # see ../.env.example and README.md#http-transport-security.
   
 llm:
   provider: "openai"  # Options: openai, azure_openai, anthropic, gemini, groq

@@ -160,6 +160,10 @@ class FalkorDriver(GraphDriver):
         """
         super().__init__()
         self._database = database
+        # The logical default group ('_') belongs to the database selected when
+        # this connection was created, which may not be the literal default_db.
+        # Group-scoped clones preserve this origin for later routing back to '_'.
+        self._default_database = database
         if falkor_db is not None:
             # If a FalkorDB instance is provided, use it directly
             self.client = falkor_db
@@ -332,18 +336,25 @@ class FalkorDriver(GraphDriver):
         for query in index_queries:
             await self.execute_query(query)
 
+    def with_database(self, database: str) -> 'GraphDriver':
+        """Return a lightweight view routed to a physical Falkor graph."""
+        target_database = self._default_database if database == self.default_group_id else database
+        if target_database == self._database:
+            return self
+        return super().with_database(target_database)
+
     def clone(self, database: str) -> 'GraphDriver':
         """
         Returns a shallow copy of this driver with a different default database.
         Reuses the same connection (e.g. FalkorDB, Neo4j).
         """
-        if database == self._database:
+        target_database = self._default_database if database == self.default_group_id else database
+        if target_database == self._database:
             cloned = self
-        elif database == self.default_group_id:
-            cloned = FalkorDriver(falkor_db=self.client)
         else:
             # Create a new instance of FalkorDriver with the same connection but a different database
-            cloned = FalkorDriver(falkor_db=self.client, database=database)
+            cloned = FalkorDriver(falkor_db=self.client, database=target_database)
+            cloned._default_database = self._default_database
 
         return cloned
 
