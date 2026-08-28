@@ -146,6 +146,25 @@ class JwtVerifier:
         if self._owns_client:
             await self._client.aclose()
 
+    async def is_ready(self) -> bool:
+        """Refresh expired keys and report whether authorization can serve traffic."""
+        if (
+            self._keys
+            and self._clock() - self._last_successful_refresh
+            <= self._settings.opr_jwks_max_stale_seconds
+        ):
+            return True
+
+        try:
+            await self._refresh(force=True)
+        except _JwksUnavailable:
+            return False
+        return (
+            bool(self._keys)
+            and self._clock() - self._last_successful_refresh
+            <= self._settings.opr_jwks_max_stale_seconds
+        )
+
     async def verify(self, token: str, required_scope: str) -> Mapping[str, Any]:
         try:
             header = jwt.get_unverified_header(token)
@@ -183,9 +202,12 @@ class JwtVerifier:
         except jwt.PyJWTError as exc:
             raise _InvalidAccessToken from exc
 
+        authorized_party = claims.get('azp')
         if (
             claims.get('gty') != 'client-credentials'
-            or claims.get('azp') not in self._allowed_client_ids
+            or not isinstance(authorized_party, str)
+            or not authorized_party
+            or authorized_party not in self._allowed_client_ids
         ):
             raise _InvalidAccessToken
         if required_scope not in _token_scopes(claims.get('scope')):
@@ -371,6 +393,11 @@ class GraphitiAuthorizer:
     async def close(self) -> None:
         if self._jwt_verifier is not None:
             await self._jwt_verifier.close()
+
+    async def is_ready(self) -> bool:
+        if self._jwt_verifier is None:
+            return True
+        return await self._jwt_verifier.is_ready()
 
     async def require(
         self,
