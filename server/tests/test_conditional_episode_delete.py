@@ -24,6 +24,7 @@ from graphiti_core.nodes import EpisodeType, EpisodicNode
 from pydantic import SecretStr
 from starlette.responses import JSONResponse
 
+from graph_service.auth import GraphitiAuthorizer
 from graph_service.config import Settings
 from graph_service.dto import DeleteEpisodeIfMatchRequest
 from graph_service.protocol import (
@@ -85,6 +86,7 @@ async def test_dedicated_reconciliation_listing_attests_same_response(monkeypatc
         20,
         graphiti,
         settings,
+        GraphitiAuthorizer(settings),
         x_opr_reconciliation_token='reconcile-secret',
         x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
     )
@@ -118,6 +120,7 @@ async def test_reconciliation_listing_is_bound_to_opr_group():
             20,
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_reconciliation_token='reconcile-secret',
             x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
         )
@@ -150,6 +153,7 @@ async def test_reconciliation_listing_requires_exact_writer_fleet_epoch(
             20,
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_reconciliation_token='reconcile-secret',
             x_opr_writer_fleet_epoch=writer_fleet_epoch,
         )
@@ -751,6 +755,7 @@ async def test_conditional_delete_route_fails_precondition_without_success_recei
                 request,
                 graphiti,
                 settings,
+                GraphitiAuthorizer(settings),
                 x_opr_retirement_token='retire-secret',
                 x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
                 x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
@@ -795,6 +800,7 @@ async def test_conditional_delete_route_rejects_receipt_binding_conflict():
             request,
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_retirement_token='retire-secret',
             x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
@@ -830,6 +836,7 @@ async def test_conditional_delete_route_returns_success_only_after_atomic_match(
             request,
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_retirement_token='retire-secret',
             x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
@@ -894,6 +901,7 @@ async def test_conditional_delete_requires_token_and_exact_operation_scope(
             request,
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_retirement_token=token,
             x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=operation,
@@ -932,6 +940,7 @@ async def test_conditional_delete_requires_exact_writer_fleet_epoch(
             request,
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_retirement_token='retire-secret',
             x_opr_writer_fleet_epoch=writer_fleet_epoch,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
@@ -967,6 +976,7 @@ async def test_conditional_delete_is_bound_to_opr_group():
             request,
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_retirement_token='retire-secret',
             x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
@@ -1190,6 +1200,7 @@ async def test_retirement_status_route_returns_request_bound_receipt():
             'opr',
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_retirement_token='retire-secret',
             x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),
@@ -1231,6 +1242,7 @@ async def test_retirement_status_route_returns_durable_not_applied_receipt():
             'opr',
             graphiti,
             settings,
+            GraphitiAuthorizer(settings),
             x_opr_retirement_token='retire-secret',
             x_opr_writer_fleet_epoch=WRITER_FLEET_EPOCH,
             x_opr_reconciliation_operation=(GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE),

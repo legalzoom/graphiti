@@ -5,7 +5,7 @@ from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -15,6 +15,11 @@ from pydantic import ValidationError
 from starlette.responses import JSONResponse
 
 import graph_service.main as graph_service_main
+from graph_service.auth import (
+    AUTHORIZER_STATE_ATTR,
+    GraphitiAuthorizer,
+    graphiti_authorizer_from_app,
+)
 from graph_service.config import Settings, get_settings
 from graph_service.dto import AddMessagesRequest, Message, Result
 from graph_service.routers import ingest
@@ -76,7 +81,11 @@ def _required_opr_settings_values(**overrides) -> dict:
 def _settings() -> Settings:
     # group_id below is never the OPR reconciliation group, so
     # `_authorize_opr_write` never touches these attributes.
-    return cast(Settings, SimpleNamespace())
+    return cast(Settings, SimpleNamespace(opr_auth_mode='static'))
+
+
+def _authorizer() -> GraphitiAuthorizer:
+    return GraphitiAuthorizer(_settings())
 
 
 async def _noop_job() -> None:
@@ -110,6 +119,7 @@ def _http_request(graphiti: ZepGraphiti | None = None) -> Request:
     lives and where a queued job resolves it from at execution time.
     """
     state = SimpleNamespace()
+    setattr(state, AUTHORIZER_STATE_ATTR, _authorizer())
     if graphiti is not None:
         setattr(state, GRAPHITI_CLIENT_STATE_ATTR, graphiti)
     return cast(Request, SimpleNamespace(app=SimpleNamespace(state=state)))
@@ -130,7 +140,7 @@ async def test_enqueue_up_to_maxsize_succeeds(monkeypatch, non_consuming_worker)
     monkeypatch.setattr(ingest, 'async_worker', worker)
     await non_consuming_worker(worker)
 
-    result = await add_messages(_request(2), *_client_args(), _settings())
+    result = await add_messages(_request(2), *_client_args(), _settings(), _authorizer())
 
     assert isinstance(result, Result)
     assert result.success is True
@@ -142,7 +152,7 @@ async def test_configured_worker_does_not_accept_before_consumer_starts(monkeypa
     worker = AsyncWorker(maxsize=2)
     monkeypatch.setattr(ingest, 'async_worker', worker)
 
-    response = await add_messages(_request(1), *_client_args(), _settings())
+    response = await add_messages(_request(1), *_client_args(), _settings(), _authorizer())
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 503
@@ -163,10 +173,10 @@ async def test_request_past_maxsize_gets_503_and_does_not_grow_queue(
     worker = AsyncWorker(maxsize=2)
     monkeypatch.setattr(ingest, 'async_worker', worker)
     await non_consuming_worker(worker)
-    await add_messages(_request(2), *_client_args(), _settings())
+    await add_messages(_request(2), *_client_args(), _settings(), _authorizer())
     assert worker.queue.qsize() == 2
 
-    response = await add_messages(_request(1), *_client_args(), _settings())
+    response = await add_messages(_request(1), *_client_args(), _settings(), _authorizer())
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 503
@@ -198,7 +208,7 @@ async def test_oversized_batch_is_rejected_atomically_with_no_partial_enqueue(
     monkeypatch.setattr(ingest, 'async_worker', worker)
     await non_consuming_worker(worker)
 
-    response = await add_messages(_request(4), *_client_args(), _settings())
+    response = await add_messages(_request(4), *_client_args(), _settings(), _authorizer())
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 503
@@ -212,10 +222,10 @@ async def test_worker_draining_frees_capacity_for_the_next_request(
     worker = AsyncWorker(maxsize=1)
     monkeypatch.setattr(ingest, 'async_worker', worker)
     await non_consuming_worker(worker)
-    await add_messages(_request(1), *_client_args(), _settings())
+    await add_messages(_request(1), *_client_args(), _settings(), _authorizer())
     assert worker.queue.qsize() == 1
 
-    rejected = await add_messages(_request(1), *_client_args(), _settings())
+    rejected = await add_messages(_request(1), *_client_args(), _settings(), _authorizer())
     assert isinstance(rejected, JSONResponse)
     assert rejected.status_code == 503
 
@@ -225,7 +235,7 @@ async def test_worker_draining_frees_capacity_for_the_next_request(
     worker.queue.task_done()
     assert worker.queue.qsize() == 0
 
-    accepted = await add_messages(_request(1), *_client_args(), _settings())
+    accepted = await add_messages(_request(1), *_client_args(), _settings(), _authorizer())
     assert isinstance(accepted, Result)
     assert accepted.success is True
     assert worker.queue.qsize() == 1
@@ -373,7 +383,7 @@ async def test_healthcheck_exposes_ingest_queue_depth_and_maxsize(
     worker = AsyncWorker(maxsize=5)
     monkeypatch.setattr(ingest, 'async_worker', worker)
     await non_consuming_worker(worker)
-    await add_messages(_request(2), *_client_args(), _settings())
+    await add_messages(_request(2), *_client_args(), _settings(), _authorizer())
 
     response = await graph_service_main.healthcheck()
 
@@ -395,6 +405,7 @@ async def test_readiness_requires_shared_client_and_live_ingest_worker(monkeypat
         'status': 'not_ready',
         'graphiti_core_version': _json_body(neither_ready)['graphiti_core_version'],
         'opr_auth_required': True,
+        'opr_auth_mode': 'static',
         'ingest_worker_running': False,
         'ingest_accepting': False,
         'ingest_draining': False,
@@ -480,7 +491,7 @@ async def test_drain_makes_readiness_false_and_rejects_new_ingest(monkeypatch):
         assert _json_body(readiness)['ingest_accepting'] is False
         assert _json_body(readiness)['ingest_draining'] is True
 
-        response = await add_messages(_request(1), *_client_args(), _settings())
+        response = await add_messages(_request(1), *_client_args(), _settings(), _authorizer())
         assert isinstance(response, JSONResponse)
         assert response.status_code == 503
         assert _json_body(response) == {
@@ -507,7 +518,9 @@ async def test_closed_admission_rejects_before_uuid_preflight(monkeypatch):
         ],
     )
 
-    response = await add_messages(request, _http_request(graphiti), graphiti, _settings())
+    response = await add_messages(
+        request, _http_request(graphiti), graphiti, _settings(), _authorizer()
+    )
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 503
@@ -543,7 +556,7 @@ async def test_request_suspended_in_uuid_preflight_cannot_enqueue_after_drain_be
     )
 
     request_task = asyncio.create_task(
-        add_messages(request, _http_request(graphiti), graphiti, _settings())
+        add_messages(request, _http_request(graphiti), graphiti, _settings(), _authorizer())
     )
     await preflight_started.wait()
     worker.begin_drain()
@@ -736,7 +749,7 @@ async def test_queued_job_resolves_the_shared_client_at_execution_time(
     request_time_client = _graphiti()
     http_request = _http_request(request_time_client)
 
-    await add_messages(_request(1), http_request, request_time_client, _settings())
+    await add_messages(_request(1), http_request, request_time_client, _settings(), _authorizer())
 
     # Swap the client on app state after the response was produced. A job that
     # captured the request-time client would still call that one.
@@ -776,6 +789,12 @@ async def test_app_lifespan_builds_exactly_one_graphiti_client_and_closes_it(mon
     """One client per process, not one per HTTP request."""
     settings = Settings.model_validate(_settings_values())
     monkeypatch.setattr(graph_service_main, 'get_settings', lambda: settings)
+    authorizer = SimpleNamespace(start=AsyncMock(), close=AsyncMock())
+    monkeypatch.setattr(
+        graph_service_main,
+        'build_graphiti_authorizer',
+        lambda _settings: authorizer,
+    )
 
     built: list[ZepGraphiti] = []
 
@@ -795,6 +814,9 @@ async def test_app_lifespan_builds_exactly_one_graphiti_client_and_closes_it(mon
     app = FastAPI()
     async with graph_service_main.lifespan(app):
         assert len(built) == 1
+        assert graphiti_authorizer_from_app(app) is authorizer
+        authorizer.start.assert_awaited_once()
+        authorizer.close.assert_not_awaited()
         # Every request and every queued job resolves this same instance.
         assert graphiti_client_from_app(app) is built[0]
         assert await get_graphiti(cast(Request, SimpleNamespace(app=app))) is built[0]
@@ -803,6 +825,31 @@ async def test_app_lifespan_builds_exactly_one_graphiti_client_and_closes_it(mon
 
     assert len(built) == 1
     cast(AsyncMock, built[0].close).assert_awaited_once()
+    authorizer.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_authorizer_startup_failure_aborts_graph_client_and_closes_authorizer(monkeypatch):
+    settings = Settings.model_validate(_settings_values())
+    monkeypatch.setattr(graph_service_main, 'get_settings', lambda: settings)
+    authorizer = SimpleNamespace(
+        start=AsyncMock(side_effect=RuntimeError('JWKS unavailable')),
+        close=AsyncMock(),
+    )
+    build_graphiti = Mock()
+    monkeypatch.setattr(
+        graph_service_main,
+        'build_graphiti_authorizer',
+        lambda _settings: authorizer,
+    )
+    monkeypatch.setattr(graph_service_main, 'build_graphiti_client', build_graphiti)
+
+    with pytest.raises(RuntimeError, match='JWKS unavailable'):
+        async with graph_service_main.lifespan(FastAPI()):
+            pass
+
+    build_graphiti.assert_not_called()
+    authorizer.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
