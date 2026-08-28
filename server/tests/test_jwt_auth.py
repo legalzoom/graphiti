@@ -284,6 +284,8 @@ async def test_other_valid_lz_client_is_rejected_even_with_the_required_scope():
         _claims('graphiti:read', nbf=int(time.time()) + 300),
         _claims('graphiti:read', iat=int(time.time()) + 300),
         _claims('graphiti:read', gty='authorization-code'),
+        _claims('graphiti:read', azp=['opr-client-id']),
+        _claims('graphiti:read', azp={'client_id': 'opr-client-id'}),
         {key: value for key, value in _claims('graphiti:read').items() if key != 'azp'},
         {key: value for key, value in _claims('graphiti:read').items() if key != 'exp'},
         {key: value for key, value in _claims('graphiti:read').items() if key != 'sub'},
@@ -316,6 +318,47 @@ async def test_wrong_signature_algorithm_and_missing_kid_return_401():
             with pytest.raises(HTTPException) as exc_info:
                 await authorizer.require(Permission.READ, f'Bearer {token}')
             assert exc_info.value.status_code == 401
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_readiness_fails_closed_after_jwks_max_stale_and_recovers():
+    calls = 0
+    now = [100.0]
+    issuer_available = [True]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if not issuer_available[0]:
+            return httpx.Response(503, request=request)
+        return httpx.Response(200, json={'keys': [JWK_1]}, request=request)
+
+    settings = _settings(
+        opr_jwks_cache_ttl_seconds=10,
+        opr_jwks_max_stale_seconds=20,
+        opr_jwks_refresh_min_interval_seconds=5,
+    )
+    client = _client(handler)
+    authorizer, _ = await _started_authorizer(
+        settings=settings,
+        client=client,
+        clock=lambda: now[0],
+    )
+    try:
+        assert await authorizer.is_ready() is True
+        assert calls == 1
+
+        issuer_available[0] = False
+        now[0] = 121.0
+        assert await authorizer.is_ready() is False
+        assert calls == 2
+
+        issuer_available[0] = True
+        now[0] = 126.0
+        assert await authorizer.is_ready() is True
+        assert calls == 3
     finally:
         await client.aclose()
 
