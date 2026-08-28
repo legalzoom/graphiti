@@ -6,6 +6,8 @@ from fastapi import Depends
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
 
+from graph_service.protocol import is_http_token68
+
 _PRIVILEGED_SECRET_NAMES = (
     'OPR_READ_TOKEN',
     'OPR_WRITE_TOKEN',
@@ -15,6 +17,7 @@ _PRIVILEGED_SECRET_NAMES = (
     'GRAPHITI_ADMIN_TOKEN',
 )
 _MIN_PRIVILEGED_SECRET_BYTES = 32
+MAX_INGEST_DRAIN_TIMEOUT_SECONDS = 15.0
 
 
 class Settings(BaseSettings):
@@ -45,10 +48,16 @@ class Settings(BaseSettings):
     graphiti_admin_token: SecretStr = SecretStr('')
     graphiti_admin_clear_enabled: bool = False
     ingest_queue_maxsize: int = Field(gt=0)
-    # The pod currently has a 60-second termination grace period. Capping the
-    # application drain at 50 seconds leaves time for the graph client and
-    # server process to close before Kubernetes sends SIGKILL.
-    ingest_drain_timeout_seconds: float = Field(default=25.0, gt=0, le=50.0)
+    # LegalZoom's 60-second pod grace includes a platform-managed 30-second
+    # preStop hook. The image then gives Uvicorn 3 seconds for active requests
+    # and bounds graph-client close at 5 seconds. Keep the queue drain at or
+    # below 15 seconds so cancellation and scheduler overhead retain margin
+    # before Kubernetes sends SIGKILL.
+    ingest_drain_timeout_seconds: float = Field(
+        default=MAX_INGEST_DRAIN_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_INGEST_DRAIN_TIMEOUT_SECONDS,
+    )
 
     model_config = SettingsConfigDict(
         env_file='.env',
@@ -75,6 +84,18 @@ class Settings(BaseSettings):
                     + ', '.join(missing)
                 )
 
+        invalid_for_http = [
+            name
+            for name in _PRIVILEGED_SECRET_NAMES
+            if secrets[name] and not is_http_token68(secrets[name])
+        ]
+        if invalid_for_http:
+            raise ValueError(
+                'privileged credentials require HTTP token68-compatible ASCII values: '
+                + ', '.join(invalid_for_http)
+            )
+
+        if self.opr_auth_required:
             too_short = [
                 name
                 for name in _PRIVILEGED_SECRET_NAMES
@@ -83,7 +104,7 @@ class Settings(BaseSettings):
             if too_short:
                 raise ValueError(
                     'OPR_AUTH_REQUIRED=true requires privileged values of at least '
-                    f'{_MIN_PRIVILEGED_SECRET_BYTES} UTF-8 bytes: ' + ', '.join(too_short)
+                    f'{_MIN_PRIVILEGED_SECRET_BYTES} bytes: ' + ', '.join(too_short)
                 )
 
         # Preserve the pre-existing safety check for deployments that opt in
@@ -94,8 +115,7 @@ class Settings(BaseSettings):
             and len(writer_fleet_epoch.encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
         ):
             raise ValueError(
-                f'OPR_WRITER_FLEET_EPOCH must be at least '
-                f'{_MIN_PRIVILEGED_SECRET_BYTES} UTF-8 bytes'
+                f'OPR_WRITER_FLEET_EPOCH must be at least {_MIN_PRIVILEGED_SECRET_BYTES} bytes'
             )
 
         configured = [(name, value.encode('utf-8')) for name, value in secrets.items() if value]

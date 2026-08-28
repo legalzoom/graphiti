@@ -14,11 +14,12 @@ from graphiti_core.nodes import EpisodeType  # type: ignore
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data  # type: ignore
 from starlette.responses import JSONResponse
 
-from graph_service.config import ZepEnvDep, get_settings
+from graph_service.config import MAX_INGEST_DRAIN_TIMEOUT_SECONDS, ZepEnvDep, get_settings
 from graph_service.dto import (
     AddEntityNodeRequest,
     AddMessagesRequest,
     DeleteEpisodeIfMatchRequest,
+    IngestUnavailableResponse,
     Message,
     Result,
 )
@@ -88,22 +89,30 @@ def _authorize_episode_retirement(
 
 
 class AsyncWorker:
-    def __init__(self, maxsize: int | None = None, drain_timeout_seconds: float = 25.0):
+    def __init__(
+        self,
+        maxsize: int | None = None,
+        drain_timeout_seconds: float = MAX_INGEST_DRAIN_TIMEOUT_SECONDS,
+    ):
         self._queue: asyncio.Queue[Job] | None = None
         self.task: asyncio.Task[None] | None = None
         # True exactly while `worker()` is inside `await job()`. A job in this
         # state has already left the queue (so `queue.qsize()` cannot count
         # it) but has not finished, so it still needs to be counted as
-        # dropped if shutdown interrupts it.
+        # unresolved if shutdown interrupts it.
         self._job_in_flight = False
         self._accepting = False
         self._draining = False
         self._drain_timeout_seconds = drain_timeout_seconds
-        self._last_shutdown_dropped_jobs = 0
+        self._last_shutdown_unresolved_jobs = 0
         if maxsize is not None:
             self.configure(maxsize, drain_timeout_seconds)
 
-    def configure(self, maxsize: int, drain_timeout_seconds: float = 25.0) -> None:
+    def configure(
+        self,
+        maxsize: int,
+        drain_timeout_seconds: float = MAX_INGEST_DRAIN_TIMEOUT_SECONDS,
+    ) -> None:
         """Bind this worker to a bounded queue of the given size.
 
         Called once, at lifespan startup, with the size resolved from
@@ -116,15 +125,18 @@ class AsyncWorker:
             raise RuntimeError('cannot reconfigure a running AsyncWorker')
         if maxsize <= 0:
             raise ValueError('AsyncWorker maxsize must be positive')
-        if not 0 < drain_timeout_seconds <= 50:
-            raise ValueError('AsyncWorker drain timeout must be greater than 0 and at most 50')
+        if not 0 < drain_timeout_seconds <= MAX_INGEST_DRAIN_TIMEOUT_SECONDS:
+            raise ValueError(
+                'AsyncWorker drain timeout must be greater than 0 and at most '
+                f'{MAX_INGEST_DRAIN_TIMEOUT_SECONDS:g}'
+            )
         self._queue = asyncio.Queue(maxsize=maxsize)
         self.task = None
         self._job_in_flight = False
         self._accepting = False
         self._draining = False
         self._drain_timeout_seconds = drain_timeout_seconds
-        self._last_shutdown_dropped_jobs = 0
+        self._last_shutdown_unresolved_jobs = 0
 
     @property
     def queue(self) -> asyncio.Queue[Job]:
@@ -142,7 +154,12 @@ class AsyncWorker:
 
     @property
     def accepting(self) -> bool:
-        """Whether the producer may atomically add another batch."""
+        """Whether the lifecycle admission gate is open.
+
+        Queue capacity is checked atomically by the producer after this gate;
+        a full queue remains a transient 503 backpressure condition rather
+        than making the entire pod unready for reads.
+        """
         worker_alive = self.task is not None and not self.task.done()
         return self._accepting and not self._draining and worker_alive
 
@@ -152,12 +169,13 @@ class AsyncWorker:
 
     @property
     def ready(self) -> bool:
-        """Whether the worker can accept and consume application traffic."""
+        """Whether the worker lifecycle can consume application traffic."""
         return self.accepting and self.task is not None and not self.task.done()
 
     @property
-    def last_shutdown_dropped_jobs(self) -> int:
-        return self._last_shutdown_dropped_jobs
+    def last_shutdown_unresolved_jobs(self) -> int:
+        """Accepted jobs not confirmed complete when the last shutdown returned."""
+        return self._last_shutdown_unresolved_jobs
 
     async def worker(self):
         while True:
@@ -200,25 +218,28 @@ class AsyncWorker:
         """Surface a worker task that died instead of letting it go unnoticed.
 
         `worker()` above no longer exits on a job failure, but if it ever does
-        exit unexpectedly the queue has no consumer at all and every later
-        `/messages` call fills it until it rejects with 503. `stop()` is the
-        only other place the task is awaited, and on a crashed worker that
-        await may never happen, so retrieve and log the exception here.
+        exit unexpectedly the queue has no consumer. Admission closes as soon
+        as the done callback runs, so later `/messages` calls reject with 503.
+        `stop()` is the only other place the task may be observed; retrieve and
+        log the exception here even when its exit races with shutdown.
         """
         self._accepting = False
-        if task.cancelled() or self._draining:
+        if task.cancelled():
             return
         exc = task.exception()
+        if self._draining and exc is None:
+            return
         if exc is not None:
             logger.critical(
-                'Ingest worker task exited unexpectedly; the ingest queue now has no '
-                'consumer and will fill until /messages rejects every batch.',
+                'Ingest worker task exited unexpectedly%s; accepted work may be '
+                'unresolved and /messages will reject new batches immediately.',
+                ' during shutdown drain' if self._draining else '',
                 exc_info=exc,
             )
         else:
             logger.critical(
                 'Ingest worker task exited unexpectedly without an exception; '
-                'the ingest queue will reject new work.'
+                '/messages will reject new batches immediately.'
             )
 
     async def start(self):
@@ -229,7 +250,7 @@ class AsyncWorker:
         _ = self.queue
         self._draining = False
         self._accepting = False
-        self._last_shutdown_dropped_jobs = 0
+        self._last_shutdown_unresolved_jobs = 0
         self.task = asyncio.create_task(self.worker())
         self.task.add_done_callback(self._log_worker_exit)
         self._accepting = True
@@ -285,13 +306,16 @@ class AsyncWorker:
     async def stop(self) -> int:
         """Stop admission, drain accepted work, then stop the consumer.
 
-        Returns the number of accepted jobs interrupted or discarded by this
-        shutdown. Ordinary job failures are logged when they happen and remain
-        the durable producer's reconciliation responsibility. A nonzero
-        shutdown result is logged at CRITICAL because this queue is in-memory.
+        Returns the number of accepted jobs not confirmed complete when this
+        shutdown returns. Queued jobs are discarded after the deadline; an
+        in-flight job that suppresses cancellation remains in doubt and may
+        still be executing until process termination. Ordinary job failures
+        are logged when they happen and remain the durable producer's
+        reconciliation responsibility. A nonzero result is logged at CRITICAL
+        because this queue is in-memory.
         """
         self.begin_drain()
-        self._last_shutdown_dropped_jobs = 0
+        self._last_shutdown_unresolved_jobs = 0
 
         worker_running = self.task is not None and not self.task.done()
         if worker_running:
@@ -301,31 +325,37 @@ class AsyncWorker:
                     timeout=self._drain_timeout_seconds,
                 )
             except asyncio.TimeoutError:
-                dropped = self._outstanding_jobs()
-                self._last_shutdown_dropped_jobs = dropped
+                unresolved = self._outstanding_jobs()
+                self._last_shutdown_unresolved_jobs = unresolved
                 logger.critical(
                     f'Ingest shutdown drain timed out after '
-                    f'{self._drain_timeout_seconds:g}s with {dropped} '
-                    'unprocessed job(s); cancelling the active job and dropping '
-                    'queued jobs. Producer reconciliation is required.'
+                    f'{self._drain_timeout_seconds:g}s with {unresolved} '
+                    'unresolved job(s); cancelling the active job and discarding '
+                    'queued jobs. In-flight work may remain in doubt if it suppresses '
+                    'cancellation. Producer reconciliation is required.'
                 )
-                await self._cancel_worker()
+                worker_stopped = await self._cancel_worker()
                 self._discard_queued_jobs()
-                return dropped
+                if not worker_stopped and self._job_in_flight:
+                    logger.critical(
+                        'An in-flight ingest job is still running after cancellation; '
+                        'its outcome is unknown and must be reconciled before retry.'
+                    )
+                return unresolved
 
             await self._cancel_worker()
             return 0
 
-        dropped = self._outstanding_jobs()
-        if dropped:
-            self._last_shutdown_dropped_jobs = dropped
+        unresolved = self._outstanding_jobs()
+        if unresolved:
+            self._last_shutdown_unresolved_jobs = unresolved
             logger.critical(
                 f'Ingest shutdown cannot drain because its worker is not running; '
-                f'dropping {dropped} unprocessed job(s). Producer reconciliation '
+                f'discarding {unresolved} unresolved job(s). Producer reconciliation '
                 'is required.'
             )
             self._discard_queued_jobs()
-        return dropped
+        return unresolved
 
 
 async_worker = AsyncWorker()
@@ -339,8 +369,10 @@ async def lifespan(_: FastAPI):
         settings.ingest_drain_timeout_seconds,
     )
     await async_worker.start()
-    yield
-    await async_worker.stop()
+    try:
+        yield
+    finally:
+        await async_worker.stop()
 
 
 router = APIRouter(lifespan=lifespan)
@@ -349,13 +381,10 @@ router = APIRouter(lifespan=lifespan)
 @router.post(
     '/messages',
     status_code=status.HTTP_202_ACCEPTED,
-    # The success and 503-rejection payloads are different shapes (Result vs.
-    # a plain error dict), so there is no single Pydantic response_model to
-    # infer from the `Result | JSONResponse` return annotation. Declare it
-    # explicitly rather than let FastAPI fail at startup trying to build one.
-    response_model=None,
+    response_model=Result,
     responses={
         status.HTTP_503_SERVICE_UNAVAILABLE: {
+            'model': IngestUnavailableResponse,
             'description': (
                 'The worker is unavailable, ingestion is draining, or the queue is at capacity; '
                 'retry later.'

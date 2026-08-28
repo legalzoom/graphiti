@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from contextlib import suppress
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -231,7 +232,7 @@ async def test_worker_draining_frees_capacity_for_the_next_request(
 
 
 @pytest.mark.asyncio
-async def test_stop_without_a_live_worker_counts_and_critically_logs_dropped_jobs(
+async def test_stop_without_a_live_worker_counts_and_critically_logs_unresolved_jobs(
     monkeypatch, caplog
 ):
     worker = AsyncWorker(maxsize=5)
@@ -241,14 +242,15 @@ async def test_stop_without_a_live_worker_counts_and_critically_logs_dropped_job
     assert worker.queue.qsize() == 3
 
     with caplog.at_level('CRITICAL'):
-        dropped = await worker.stop()
+        unresolved = await worker.stop()
 
-    assert dropped == 3
-    assert worker.last_shutdown_dropped_jobs == 3
+    assert unresolved == 3
+    assert worker.last_shutdown_unresolved_jobs == 3
     assert worker.queue.qsize() == 0
     await asyncio.wait_for(worker.queue.join(), timeout=1)
     assert any(
-        'worker is not running' in record.message and 'dropping 3 unprocessed job' in record.message
+        'worker is not running' in record.message
+        and 'discarding 3 unresolved job' in record.message
         for record in caplog.records
     )
 
@@ -272,14 +274,14 @@ async def test_stop_timeout_counts_inflight_and_queued_jobs_and_logs_critical(mo
     assert worker.queue.qsize() == 2  # one job is already in flight
 
     with caplog.at_level('CRITICAL'):
-        dropped = await worker.stop()
+        unresolved = await worker.stop()
 
-    assert dropped == 3
-    assert worker.last_shutdown_dropped_jobs == 3
+    assert unresolved == 3
+    assert worker.last_shutdown_unresolved_jobs == 3
     assert worker.queue.qsize() == 0
     await asyncio.wait_for(worker.queue.join(), timeout=1)
     assert any(
-        'drain timed out' in record.message and '3 unprocessed job' in record.message
+        'drain timed out' in record.message and '3 unresolved job' in record.message
         for record in caplog.records
     )
 
@@ -307,14 +309,16 @@ async def test_stop_remains_bounded_when_a_job_suppresses_repeated_cancellation(
     await started_processing.wait()
 
     with caplog.at_level('CRITICAL'):
-        dropped = await asyncio.wait_for(worker.stop(), timeout=0.25)
+        unresolved = await asyncio.wait_for(worker.stop(), timeout=0.25)
 
-    assert dropped == 1
+    assert unresolved == 1
     assert cancellation_seen.is_set()
-    assert worker.last_shutdown_dropped_jobs == 1
+    assert worker.last_shutdown_unresolved_jobs == 1
+    assert worker.task is not None and not worker.task.done()
     assert any(
         'termination deadline remains bounded' in record.message for record in caplog.records
     )
+    assert any('outcome is unknown' in record.message for record in caplog.records)
 
     # Release the deliberately non-cooperative test job, then cancel the
     # consumer once it returns to its normal queue wait so no task leaks out of
@@ -357,7 +361,7 @@ async def test_stop_closes_admission_and_successfully_drains_every_accepted_job(
     finish_processing.set()
     assert await stop_task == 0
     assert completed == [1, 2]
-    assert worker.last_shutdown_dropped_jobs == 0
+    assert worker.last_shutdown_unresolved_jobs == 0
     assert worker.task is not None and worker.task.done()
     await asyncio.wait_for(worker.queue.join(), timeout=1)
 
@@ -385,20 +389,31 @@ async def test_readiness_requires_shared_client_and_live_ingest_worker(monkeypat
     worker = AsyncWorker(maxsize=5)
     monkeypatch.setattr(ingest, 'async_worker', worker)
 
-    unavailable = await graph_service_main.readiness(_http_request())
-    assert unavailable.status_code == 503
-    assert _json_body(unavailable) == {
+    neither_ready = await graph_service_main.readiness(_http_request())
+    assert neither_ready.status_code == 503
+    assert _json_body(neither_ready) == {
         'status': 'not_ready',
-        'graphiti_core_version': _json_body(unavailable)['graphiti_core_version'],
+        'graphiti_core_version': _json_body(neither_ready)['graphiti_core_version'],
         'opr_auth_required': True,
         'ingest_worker_running': False,
         'ingest_accepting': False,
         'ingest_draining': False,
     }
 
+    client_only = await graph_service_main.readiness(_http_request(_graphiti()))
+    assert client_only.status_code == 503
+    assert _json_body(client_only)['status'] == 'not_ready'
+    assert _json_body(client_only)['ingest_worker_running'] is False
+
     await worker.start()
     await asyncio.sleep(0)
     try:
+        worker_only = await graph_service_main.readiness(_http_request())
+        assert worker_only.status_code == 503
+        assert _json_body(worker_only)['status'] == 'not_ready'
+        assert _json_body(worker_only)['ingest_worker_running'] is True
+        assert _json_body(worker_only)['ingest_accepting'] is True
+
         ready = await graph_service_main.readiness(_http_request(_graphiti()))
         assert ready.status_code == 200
         assert _json_body(ready)['status'] == 'ready'
@@ -408,6 +423,44 @@ async def test_readiness_requires_shared_client_and_live_ingest_worker(monkeypat
         assert _json_body(ready)['ingest_draining'] is False
     finally:
         await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_full_ingest_queue_is_backpressure_not_whole_pod_unreadiness(
+    monkeypatch, non_consuming_worker
+):
+    settings = Settings.model_validate(_settings_values())
+    monkeypatch.setattr(graph_service_main, 'get_settings', lambda: settings)
+    worker = AsyncWorker(maxsize=1)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    await non_consuming_worker(worker)
+    worker.queue.put_nowait(_noop_job)
+
+    response = await graph_service_main.readiness(_http_request(_graphiti()))
+
+    assert response.status_code == 200
+    assert _json_body(response)['ingest_accepting'] is True
+    assert worker.depth == worker.capacity
+
+
+def test_openapi_documents_readiness_and_ingest_rejection_contracts():
+    schema = graph_service_main.app.openapi()
+
+    readiness_responses = schema['paths']['/readyz']['get']['responses']
+    assert readiness_responses['200']['content']['application/json']['schema']['$ref'].endswith(
+        '/ReadinessResponse'
+    )
+    assert readiness_responses['503']['content']['application/json']['schema']['$ref'].endswith(
+        '/ReadinessResponse'
+    )
+
+    ingest_responses = schema['paths']['/messages']['post']['responses']
+    assert ingest_responses['202']['content']['application/json']['schema']['$ref'].endswith(
+        '/Result'
+    )
+    assert ingest_responses['503']['content']['application/json']['schema']['$ref'].endswith(
+        '/IngestUnavailableResponse'
+    )
 
 
 @pytest.mark.asyncio
@@ -440,6 +493,25 @@ async def test_drain_makes_readiness_false_and_rejects_new_ingest(monkeypatch):
         assert worker.queue.qsize() == 0
     finally:
         await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_closed_admission_rejects_before_uuid_preflight(monkeypatch):
+    worker = AsyncWorker(maxsize=5)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    graphiti = _graphiti()
+    request = AddMessagesRequest(
+        group_id='not-opr',
+        messages=[
+            Message(uuid='episode-id', content='message', role_type='user', role=None),
+        ],
+    )
+
+    response = await add_messages(request, _http_request(graphiti), graphiti, _settings())
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 503
+    cast(AsyncMock, graphiti.assert_episode_uuid_group).assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -502,16 +574,22 @@ def test_settings_rejects_non_positive_ingest_queue_maxsize(value):
         Settings.model_validate(_settings_values(ingest_queue_maxsize=value))
 
 
-@pytest.mark.parametrize('value', [0, -1, 51])
+@pytest.mark.parametrize('value', [0, -1, 15.01, 51])
 def test_settings_rejects_drain_timeout_outside_pod_shutdown_budget(value):
     with pytest.raises(ValidationError, match='ingest_drain_timeout_seconds'):
         Settings.model_validate(_settings_values(ingest_drain_timeout_seconds=value))
 
 
-def test_settings_defaults_drain_timeout_to_25_seconds():
+def test_settings_defaults_drain_timeout_to_15_seconds():
     settings = Settings.model_validate(_settings_values())
 
-    assert settings.ingest_drain_timeout_seconds == 25
+    assert settings.ingest_drain_timeout_seconds == 15
+
+
+def test_container_bounds_uvicorn_request_shutdown_before_lifespan_drain():
+    dockerfile = (Path(__file__).resolve().parents[2] / 'Dockerfile').read_text()
+
+    assert '"--timeout-graceful-shutdown", "3"' in dockerfile
 
 
 def test_async_worker_unconfigured_use_raises_instead_of_falling_back():
@@ -525,19 +603,39 @@ def test_async_worker_unconfigured_use_raises_instead_of_falling_back():
 @pytest.mark.asyncio
 async def test_lifespan_configures_async_worker_from_settings(monkeypatch):
     """The worker's bound size comes from Settings at startup, not import time."""
-    settings = Settings.model_validate(_settings_values(ingest_queue_maxsize=7))
+    settings = Settings.model_validate(
+        _settings_values(ingest_queue_maxsize=7, ingest_drain_timeout_seconds=11)
+    )
     monkeypatch.setattr(ingest, 'get_settings', lambda: settings)
     worker = AsyncWorker()
     monkeypatch.setattr(ingest, 'async_worker', worker)
 
     async with ingest.lifespan(cast(FastAPI, SimpleNamespace())):
         assert worker.capacity == 7
+        assert worker._drain_timeout_seconds == 11
         assert worker.task is not None
         # Let the worker task actually take its first turn before the context
         # exits and cancels it; cancelling a task before it has ever run once
         # raises CancelledError straight through `await self.task` instead of
         # letting `worker()`'s own try/except handle it.
         await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_lifespan_stops_worker_when_application_context_raises(monkeypatch):
+    settings = Settings.model_validate(_settings_values(ingest_queue_maxsize=7))
+    monkeypatch.setattr(ingest, 'get_settings', lambda: settings)
+    worker = AsyncWorker()
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+
+    with pytest.raises(RuntimeError, match='lifespan failed'):
+        async with ingest.lifespan(cast(FastAPI, SimpleNamespace())):
+            await asyncio.sleep(0)
+            raise RuntimeError('lifespan failed')
+
+    assert worker.accepting is False
+    assert worker.draining is True
+    assert worker.task is not None and worker.task.done()
 
 
 @pytest.mark.asyncio
@@ -599,8 +697,26 @@ async def test_worker_task_death_is_logged_and_its_exception_retrieved(monkeypat
 
     critical = [record for record in caplog.records if record.levelname == 'CRITICAL']
     assert critical, 'a dead ingest worker must be logged'
-    assert 'no consumer' in critical[0].message
+    assert '/messages will reject new batches immediately' in critical[0].message
     assert 'worker loop died' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_racing_with_drain_is_retrieved_and_logged(caplog):
+    worker = AsyncWorker(maxsize=1)
+
+    async def exploding_worker():
+        raise RuntimeError('worker failed during drain')
+
+    task = asyncio.create_task(exploding_worker())
+    worker.begin_drain()
+    await asyncio.wait({task})
+
+    with caplog.at_level('CRITICAL'):
+        worker._log_worker_exit(task)
+
+    assert any('during shutdown drain' in record.message for record in caplog.records)
+    assert 'worker failed during drain' in caplog.text
 
 
 @pytest.mark.asyncio
@@ -687,6 +803,88 @@ async def test_app_lifespan_builds_exactly_one_graphiti_client_and_closes_it(mon
 
     assert len(built) == 1
     cast(AsyncMock, built[0].close).assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_merged_lifespan_drains_inflight_job_before_closing_client(monkeypatch):
+    settings = Settings.model_validate(
+        _settings_values(ingest_queue_maxsize=2, ingest_drain_timeout_seconds=1)
+    )
+    monkeypatch.setattr(graph_service_main, 'get_settings', lambda: settings)
+    monkeypatch.setattr(ingest, 'get_settings', lambda: settings)
+    worker = AsyncWorker()
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+
+    close = AsyncMock()
+    client = cast(
+        ZepGraphiti,
+        SimpleNamespace(build_indices_and_constraints=AsyncMock(), close=close),
+    )
+    monkeypatch.setattr(graph_service_main, 'build_graphiti_client', lambda _settings: client)
+
+    job_started = asyncio.Event()
+    release_job = asyncio.Event()
+    job_completed = asyncio.Event()
+
+    async def blocking_job():
+        job_started.set()
+        await release_job.wait()
+        job_completed.set()
+
+    app = FastAPI(lifespan=graph_service_main.lifespan)
+    app.include_router(ingest.router)
+    context = app.router.lifespan_context(app)
+    await context.__aenter__()
+    worker.queue.put_nowait(blocking_job)
+    await job_started.wait()
+
+    shutdown = asyncio.create_task(context.__aexit__(None, None, None))
+    try:
+        await asyncio.sleep(0)
+        close.assert_not_awaited()
+        assert job_completed.is_set() is False
+
+        release_job.set()
+        await asyncio.wait_for(shutdown, timeout=1)
+    finally:
+        release_job.set()
+        if not shutdown.done():
+            await shutdown
+
+    assert job_completed.is_set()
+    close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_client_close_has_its_own_shutdown_deadline(monkeypatch, caplog):
+    settings = Settings.model_validate(_settings_values())
+    monkeypatch.setattr(graph_service_main, 'get_settings', lambda: settings)
+    monkeypatch.setattr(graph_service_main, '_GRAPHITI_CLIENT_CLOSE_TIMEOUT_SECONDS', 0.01)
+
+    close_started = asyncio.Event()
+
+    async def slow_close():
+        close_started.set()
+        await asyncio.Event().wait()
+
+    client = cast(
+        ZepGraphiti,
+        SimpleNamespace(
+            build_indices_and_constraints=AsyncMock(),
+            close=AsyncMock(side_effect=slow_close),
+        ),
+    )
+    monkeypatch.setattr(graph_service_main, 'build_graphiti_client', lambda _settings: client)
+
+    with caplog.at_level('CRITICAL'):
+        async with graph_service_main.lifespan(FastAPI()):
+            pass
+
+    assert close_started.is_set()
+    assert any(
+        'termination deadline remains bounded' in record.message for record in caplog.records
+    )
+    await asyncio.sleep(0)
 
 
 def test_app_builds_one_client_for_many_requests_and_drains_jobs_against_it(monkeypatch):

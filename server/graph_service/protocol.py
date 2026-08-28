@@ -2,10 +2,18 @@
 
 import hashlib
 import hmac
+import re
 
 GRAPHITI_RECONCILIATION_PROTOCOL = 'opr.graphiti.reconciliation/v5'
 GRAPHITI_RECONCILIATION_OPERATION_RETIRE_EPISODE = 'retire_episode'
 GRAPHITI_RECONCILIATION_GROUP_ID = 'opr'
+
+_HTTP_TOKEN68 = re.compile(r'[A-Za-z0-9._~+/\-]+=*', re.ASCII)
+
+
+def is_http_token68(value: str) -> bool:
+    """Return whether a secret can make a lossless HTTP token round trip."""
+    return bool(value and _HTTP_TOKEN68.fullmatch(value))
 
 
 def reconciliation_token_matches(expected: str, supplied: str | None) -> bool:
@@ -30,9 +38,8 @@ def bearer_token_matches(expected: str, authorization: str | None) -> bool:
     if (
         separator != ' '
         or scheme.casefold() != 'bearer'
-        or not supplied
-        or supplied != supplied.strip()
-        or any(character.isspace() for character in supplied)
+        or not is_http_token68(expected)
+        or not is_http_token68(supplied)
     ):
         return False
     return hmac.compare_digest(expected.encode('utf-8'), supplied.encode('utf-8'))
