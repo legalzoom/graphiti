@@ -92,6 +92,20 @@ class TestFalkorDriver:
         self.mock_client.select_graph.assert_called_once_with('default_db')
         assert result is mock_graph
 
+    @unittest.skipIf(not HAS_FALKORDB, 'FalkorDB is not installed')
+    def test_logical_default_group_preserves_configured_physical_database(self):
+        mock_falkor_db = MagicMock()
+        driver = FalkorDriver(falkor_db=mock_falkor_db, database='custom-graph')
+
+        assert driver.clone(driver.default_group_id) is driver
+        assert driver.with_database(driver.default_group_id) is driver
+
+        scoped = driver.clone('team-a')
+        assert scoped._database == 'team-a'
+        assert scoped._default_database == 'custom-graph'
+        assert scoped.with_database(scoped.default_group_id)._database == 'custom-graph'
+        assert scoped.clone(scoped.default_group_id)._database == 'custom-graph'
+
     @pytest.mark.asyncio
     @unittest.skipIf(not HAS_FALKORDB, 'FalkorDB is not installed')
     async def test_execute_query_success(self):
@@ -216,9 +230,7 @@ class TestFalkorDriver:
             # hasattr(self.client, 'aclose') returns False
             # hasattr(self.client.connection, 'aclose') returns False
             # hasattr(self.client.connection, 'close') returns True
-            mock_hasattr.side_effect = lambda obj, attr: (
-                attr == 'close' and obj is mock_connection
-            )
+            mock_hasattr.side_effect = lambda obj, attr: attr == 'close' and obj is mock_connection
 
             await self.driver.close()
 

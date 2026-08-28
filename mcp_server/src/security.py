@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -22,6 +23,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyHttpUrl
 
 MIN_TOKEN_BYTES = 32
+_HTTP_TOKEN68 = re.compile(r'[A-Za-z0-9._~+/\-]+=*', re.ASCII)
+_GRAPHITI_GROUP_ID = re.compile(r'[A-Za-z0-9_-]+', re.ASCII)
 
 DEFAULT_LOCAL_HOSTS = (
     'localhost:*',
@@ -100,6 +103,7 @@ def _validate_exact_origins(origins: Sequence[str]) -> None:
             parsed = None
         if (
             '*' in origin
+            or any(char.isspace() for char in origin)
             or parsed is None
             or parsed.scheme not in {'http', 'https'}
             or not parsed.hostname
@@ -118,10 +122,10 @@ def _validate_exact_origins(origins: Sequence[str]) -> None:
 def _validate_token(name: str, token: str | None) -> None:
     if token is None or not token:
         raise ValueError(f'{name} must be configured')
-    if token != token.strip():
-        raise ValueError(f'{name} must not have leading or trailing whitespace')
+    if _HTTP_TOKEN68.fullmatch(token) is None:
+        raise ValueError(f'{name} must use HTTP token68-compatible ASCII')
     if len(token.encode('utf-8')) < MIN_TOKEN_BYTES:
-        raise ValueError(f'{name} must be at least {MIN_TOKEN_BYTES} UTF-8 bytes')
+        raise ValueError(f'{name} must be at least {MIN_TOKEN_BYTES} bytes')
     normalized = token.lower()
     if len(set(token)) < 12 or any(
         marker in normalized
@@ -232,6 +236,11 @@ class McpSecuritySettings:
             raise ValueError('GRAPHITI_MCP_ALLOWED_GROUPS must contain at least one group')
         if any('*' in group for group in self.allowed_groups):
             raise ValueError('GRAPHITI_MCP_ALLOWED_GROUPS does not permit wildcard groups')
+        if any(_GRAPHITI_GROUP_ID.fullmatch(group) is None for group in self.allowed_groups):
+            raise ValueError(
+                'GRAPHITI_MCP_ALLOWED_GROUPS entries may contain only ASCII letters, '
+                'numbers, dashes, and underscores'
+            )
 
         # Let Pydantic validate URL syntax now rather than after service initialization.
         self.auth_settings()
@@ -355,9 +364,16 @@ def authorize_tool_access(
 
     if requested_groups is None:
         return
-    groups = {group for group in requested_groups if group}
-    if not groups:
+    if not requested_groups:
         raise McpAuthorizationError('an explicit authorized Graphiti group is required')
+    if any(
+        not isinstance(group, str) or _GRAPHITI_GROUP_ID.fullmatch(group) is None
+        for group in requested_groups
+    ):
+        raise McpAuthorizationError(
+            'every requested Graphiti group must be a non-empty valid group ID'
+        )
+    groups = set(requested_groups)
     claims: dict[str, Any] = token.claims or {}
     claimed_groups = claims.get('graphiti_allowed_groups')
     if not isinstance(claimed_groups, list) or not all(

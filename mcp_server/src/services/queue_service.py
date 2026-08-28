@@ -6,6 +6,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from services.graphiti_scope import graphiti_for_group
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,8 +18,8 @@ class QueueService:
         """Initialize the queue service."""
         # Dictionary to store queues for each group_id
         self._episode_queues: dict[str, asyncio.Queue] = {}
-        # Dictionary to track if a worker is running for each group_id
-        self._queue_workers: dict[str, bool] = {}
+        # Keep the actual worker task so check-and-reserve is atomic on the event loop.
+        self._worker_tasks: dict[str, asyncio.Task[None]] = {}
         # Store the graphiti client after initialization
         self._graphiti_client: Any = None
 
@@ -40,9 +42,14 @@ class QueueService:
         # Add the episode processing function to the queue
         await self._episode_queues[group_id].put(process_func)
 
-        # Start a worker for this queue if one isn't already running
-        if not self._queue_workers.get(group_id, False):
-            asyncio.create_task(self._process_episode_queue(group_id))
+        # Store the task before yielding again. Setting a boolean inside the new
+        # coroutine leaves a race where simultaneous enqueues can spawn workers
+        # that process one group's supposedly sequential queue concurrently.
+        worker = self._worker_tasks.get(group_id)
+        if worker is None or worker.done():
+            self._worker_tasks[group_id] = asyncio.create_task(
+                self._process_episode_queue(group_id)
+            )
 
         return self._episode_queues[group_id].qsize()
 
@@ -53,7 +60,6 @@ class QueueService:
         from the queue one at a time.
         """
         logger.info(f'Starting episode queue worker for group_id: {group_id}')
-        self._queue_workers[group_id] = True
 
         try:
             while True:
@@ -76,7 +82,9 @@ class QueueService:
         except Exception as e:
             logger.error(f'Unexpected error in queue worker for group_id {group_id}: {str(e)}')
         finally:
-            self._queue_workers[group_id] = False
+            current_worker = asyncio.current_task()
+            if self._worker_tasks.get(group_id) is current_worker:
+                self._worker_tasks.pop(group_id, None)
             logger.info(f'Stopped episode queue worker for group_id: {group_id}')
 
     def get_queue_size(self, group_id: str) -> int:
@@ -87,7 +95,8 @@ class QueueService:
 
     def is_worker_running(self, group_id: str) -> bool:
         """Check if a worker is running for a group_id."""
-        return self._queue_workers.get(group_id, False)
+        worker = self._worker_tasks.get(group_id)
+        return worker is not None and not worker.done()
 
     async def initialize(self, graphiti_client: Any) -> None:
         """Initialize the queue service with a graphiti client.
@@ -154,13 +163,25 @@ class QueueService:
             try:
                 logger.info(f'Processing episode {uuid} for group {group_id}')
 
-                # Process the episode using the graphiti client
-                await self._graphiti_client.add_episode(
+                # FalkorDB maps each group to its own physical graph. Use a
+                # call-scoped Graphiti copy so workers for different groups
+                # never race by rebinding the shared client's driver.
+                scoped_client = await graphiti_for_group(self._graphiti_client, group_id)
+                core_group_id = (
+                    None
+                    if group_id
+                    == getattr(getattr(scoped_client, 'driver', None), 'default_group_id', None)
+                    else group_id
+                )
+                await scoped_client.add_episode(
                     name=name,
                     episode_body=content,
                     source_description=source_description,
                     source=episode_type,
-                    group_id=group_id,
+                    # Falkor's logical default group ('_') lives in the configured base
+                    # database. Passing '_' explicitly makes core clone
+                    # again; None selects the logical default without rebinding.
+                    group_id=core_group_id,
                     reference_time=reference_time or datetime.now(timezone.utc),
                     entity_types=entity_types,
                     edge_types=edge_types,

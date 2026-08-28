@@ -27,8 +27,8 @@ from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.embedder import EmbedderClient
-from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError
-from graphiti_core.helpers import parse_db_date
+from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeGroupMismatchError
+from graphiti_core.helpers import parse_db_date, query_result_record_count
 from graphiti_core.models.edges.edge_db_queries import (
     COMMUNITY_EDGE_RETURN,
     EPISODIC_EDGE_RETURN,
@@ -715,6 +715,8 @@ class HasEpisodeEdge(Edge):
             group_id=self.group_id,
             created_at=self.created_at,
         )
+        if await query_result_record_count(result) != 1:
+            raise NodeGroupMismatchError()
 
         logger.debug(f'Saved edge to Graph: {self.uuid}')
 
@@ -848,6 +850,8 @@ class NextEpisodeEdge(Edge):
             group_id=self.group_id,
             created_at=self.created_at,
         )
+        if await query_result_record_count(result) != 1:
+            raise NodeGroupMismatchError()
 
         logger.debug(f'Saved edge to Graph: {self.uuid}')
 

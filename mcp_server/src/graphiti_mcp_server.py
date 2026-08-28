@@ -18,8 +18,11 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
+from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.edges import EntityEdge
+from graphiti_core.errors import NodeNotFoundError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode, SagaNode
+from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
@@ -54,6 +57,7 @@ from services.factories import (
     EmbedderFactory,
     LLMClientFactory,
 )
+from services.graphiti_scope import driver_for_group, graphiti_for_group
 from services.queue_service import QueueService
 from utils.formatting import format_fact_result, to_edge_result, to_node_result
 from utils.type_config import (
@@ -213,6 +217,73 @@ def _http_authorization_active() -> bool:
     return MCP_SECURITY.http_auth_enabled and active_transport != 'stdio'
 
 
+def _raise_group_boundary_error(message: str) -> None:
+    """Raise a protocol authorization error for HTTP, a tool error otherwise."""
+    if _http_authorization_active():
+        raise McpAuthorizationError(message)
+    raise ValueError(message)
+
+
+def _require_resource_in_groups(
+    resource_group: object,
+    requested_groups: list[str],
+    *,
+    required_scope: ToolScope,
+    resource_name: str,
+    destructive: bool = False,
+) -> None:
+    """Keep resource/group integrity independent from HTTP authentication mode."""
+    if not isinstance(resource_group, str):
+        _raise_group_boundary_error(f'{resource_name} has no valid Graphiti group binding')
+        return
+    if _http_authorization_active():
+        authorize_resource_group(
+            MCP_SECURITY,
+            resource_group,
+            required_scope=required_scope,
+            destructive=destructive,
+        )
+    if resource_group not in requested_groups:
+        _raise_group_boundary_error(f'{resource_name} must belong to the requested Graphiti group')
+
+
+async def _entity_node_for_requested_groups(
+    client: Graphiti,
+    uuid: str,
+    requested_groups: list[str],
+) -> EntityNode:
+    """Resolve a center-node UUID without querying an ambient Falkor graph."""
+    if client.driver.provider != GraphProvider.FALKORDB:
+        node = await EntityNode.get_by_uuid(client.driver, uuid)
+        _require_resource_in_groups(
+            node.group_id,
+            requested_groups,
+            required_scope=ToolScope.READ,
+            resource_name='center node',
+        )
+        return node
+
+    matches: list[EntityNode] = []
+    for group_id in dict.fromkeys(requested_groups):
+        try:
+            node = await EntityNode.get_by_uuid(await driver_for_group(client, group_id), uuid)
+        except NodeNotFoundError:
+            continue
+        _require_resource_in_groups(
+            node.group_id,
+            [group_id],
+            required_scope=ToolScope.READ,
+            resource_name='center node',
+        )
+        matches.append(node)
+
+    if not matches:
+        raise NodeNotFoundError(uuid)
+    if len(matches) > 1:
+        _raise_group_boundary_error('center node UUID is ambiguous across requested groups')
+    return matches[0]
+
+
 def _authorize_returned_groups(
     resources: list[Any],
     requested_groups: list[str],
@@ -220,19 +291,19 @@ def _authorize_returned_groups(
     required_scope: ToolScope,
 ) -> None:
     """Fail closed if the database returns a resource outside the requested groups."""
-    if not _http_authorization_active():
-        return
     for resource in resources:
         resource_group = getattr(resource, 'group_id', None)
         if not isinstance(resource_group, str):
-            raise McpAuthorizationError('Graphiti resource has no valid group binding')
-        authorize_resource_group(
-            MCP_SECURITY,
-            resource_group,
-            required_scope=required_scope,
-        )
+            _raise_group_boundary_error('Graphiti resource has no valid group binding')
+            continue
+        if _http_authorization_active():
+            authorize_resource_group(
+                MCP_SECURITY,
+                resource_group,
+                required_scope=required_scope,
+            )
         if resource_group not in requested_groups:
-            raise McpAuthorizationError('Graphiti returned a resource outside the requested groups')
+            _raise_group_boundary_error('Graphiti returned a resource outside the requested groups')
 
 
 def secured_tool(
@@ -582,23 +653,35 @@ async def add_memory(
         effective_group_id = group_id or config.graphiti.group_id
 
         # Context UUIDs are indirect object references. Resolve them before the
-        # background task is queued so they cannot cross an authorized group boundary.
-        if _http_authorization_active():
+        # background task is queued so they cannot cross a group boundary. Token
+        # checks apply to HTTP, but resource/group integrity applies to every mode.
+        contextual_episode_uuids = list(previous_episode_uuids or [])
+        if saga_previous_episode_uuid:
+            contextual_episode_uuids.append(saga_previous_episode_uuid)
+        if uuid or contextual_episode_uuids:
             client = await graphiti_service.get_client()
-            contextual_episode_uuids = list(previous_episode_uuids or [])
-            if saga_previous_episode_uuid:
-                contextual_episode_uuids.append(saga_previous_episode_uuid)
-            for episode_uuid in contextual_episode_uuids:
-                episode = await EpisodicNode.get_by_uuid(client.driver, episode_uuid)
-                authorize_resource_group(
-                    MCP_SECURITY,
-                    episode.group_id,
-                    required_scope=ToolScope.WRITE,
-                )
-                if episode.group_id != effective_group_id:
-                    raise McpAuthorizationError(
-                        'episode context must belong to the requested Graphiti group'
+            lookup_driver = await driver_for_group(client, effective_group_id)
+            if uuid:
+                try:
+                    existing_episode = await EpisodicNode.get_by_uuid(lookup_driver, uuid)
+                except NodeNotFoundError:
+                    pass
+                else:
+                    _require_resource_in_groups(
+                        existing_episode.group_id,
+                        [effective_group_id],
+                        required_scope=ToolScope.WRITE,
+                        resource_name='episode UUID',
                     )
+
+            for episode_uuid in contextual_episode_uuids:
+                episode = await EpisodicNode.get_by_uuid(lookup_driver, episode_uuid)
+                _require_resource_in_groups(
+                    episode.group_id,
+                    [effective_group_id],
+                    required_scope=ToolScope.WRITE,
+                    resource_name='episode context',
+                )
 
         # Try to parse the source as an EpisodeType enum, with fallback to text
         episode_type = EpisodeType.text  # Default
@@ -678,15 +761,12 @@ async def search_nodes(
             else []
         )
 
-        if _http_authorization_active() and center_node_uuid:
-            center_node = await EntityNode.get_by_uuid(client.driver, center_node_uuid)
-            authorize_resource_group(
-                MCP_SECURITY,
-                center_node.group_id,
-                required_scope=ToolScope.READ,
+        if center_node_uuid:
+            await _entity_node_for_requested_groups(
+                client,
+                center_node_uuid,
+                effective_group_ids,
             )
-            if center_node.group_id not in effective_group_ids:
-                raise McpAuthorizationError('center node must belong to a requested Graphiti group')
 
         # Create search filters
         search_filters = SearchFilters(
@@ -704,13 +784,28 @@ async def search_nodes(
         node_config = (
             NODE_HYBRID_SEARCH_NODE_DISTANCE if center_node_uuid else NODE_HYBRID_SEARCH_RRF
         )
-        results = await client.search_(
-            query=query,
-            config=node_config,
-            group_ids=effective_group_ids,
-            center_node_uuid=center_node_uuid,
-            search_filter=search_filters,
-        )
+        if client.driver.provider == GraphProvider.FALKORDB:
+            group_results: list[SearchResults] = []
+            for effective_group_id in effective_group_ids:
+                scoped_client = await graphiti_for_group(client, effective_group_id)
+                group_results.append(
+                    await scoped_client.search_(
+                        query=query,
+                        config=node_config,
+                        group_ids=[effective_group_id],
+                        center_node_uuid=center_node_uuid,
+                        search_filter=search_filters,
+                    )
+                )
+            results = SearchResults.merge(group_results)
+        else:
+            results = await client.search_(
+                query=query,
+                config=node_config,
+                group_ids=effective_group_ids,
+                center_node_uuid=center_node_uuid,
+                search_filter=search_filters,
+            )
 
         # Extract nodes from results
         nodes = results.nodes[:max_nodes] if results.nodes else []
@@ -797,23 +892,34 @@ async def search_memory_facts(
             else []
         )
 
-        if _http_authorization_active() and center_node_uuid:
-            center_node = await EntityNode.get_by_uuid(client.driver, center_node_uuid)
-            authorize_resource_group(
-                MCP_SECURITY,
-                center_node.group_id,
-                required_scope=ToolScope.READ,
+        if center_node_uuid:
+            await _entity_node_for_requested_groups(
+                client,
+                center_node_uuid,
+                effective_group_ids,
             )
-            if center_node.group_id not in effective_group_ids:
-                raise McpAuthorizationError('center node must belong to a requested Graphiti group')
 
-        relevant_edges = await client.search(
-            group_ids=effective_group_ids,
-            query=query,
-            num_results=max_facts,
-            center_node_uuid=center_node_uuid,
-            search_filter=search_filter,
-        )
+        if client.driver.provider == GraphProvider.FALKORDB:
+            relevant_edges = []
+            for effective_group_id in effective_group_ids:
+                scoped_client = await graphiti_for_group(client, effective_group_id)
+                relevant_edges.extend(
+                    await scoped_client.search(
+                        group_ids=[effective_group_id],
+                        query=query,
+                        num_results=max_facts,
+                        center_node_uuid=center_node_uuid,
+                        search_filter=search_filter,
+                    )
+                )
+        else:
+            relevant_edges = await client.search(
+                group_ids=effective_group_ids,
+                query=query,
+                num_results=max_facts,
+                center_node_uuid=center_node_uuid,
+                search_filter=search_filter,
+            )
 
         _authorize_returned_groups(
             relevant_edges,
@@ -834,12 +940,16 @@ async def search_memory_facts(
         return ErrorResponse(error=f'Error searching facts: {error_msg}')
 
 
-@secured_tool(ToolScope.ADMIN, destructive=True)
-async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
+@secured_tool(ToolScope.ADMIN, group_parameter='group_id', destructive=True)
+async def delete_entity_edge(
+    uuid: str,
+    group_id: str | None = None,
+) -> SuccessResponse | ErrorResponse:
     """Delete an entity edge from the graph memory.
 
     Args:
         uuid: UUID of the entity edge to delete
+        group_id: Group containing the edge. Falls back to the configured default group.
     """
     global graphiti_service
 
@@ -848,18 +958,22 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
 
     try:
         client = await graphiti_service.get_client()
+        effective_group_id = group_id or _default_group_id()
+        if not effective_group_id:
+            return ErrorResponse(error='No group_id provided and no default group_id is configured')
+        scoped_client = await graphiti_for_group(client, effective_group_id)
 
         # Get the entity edge by UUID
-        entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
-        if _http_authorization_active():
-            authorize_resource_group(
-                MCP_SECURITY,
-                entity_edge.group_id,
-                required_scope=ToolScope.ADMIN,
-                destructive=True,
-            )
+        entity_edge = await EntityEdge.get_by_uuid(scoped_client.driver, uuid)
+        _require_resource_in_groups(
+            entity_edge.group_id,
+            [effective_group_id],
+            required_scope=ToolScope.ADMIN,
+            resource_name='entity edge',
+            destructive=True,
+        )
         # Delete the edge using its delete method
-        await entity_edge.delete(client.driver)
+        await entity_edge.delete(scoped_client.driver)
         return SuccessResponse(message=f'Entity edge with UUID {uuid} deleted successfully')
     except McpAuthorizationError:
         raise
@@ -869,8 +983,11 @@ async def delete_entity_edge(uuid: str) -> SuccessResponse | ErrorResponse:
         return ErrorResponse(error=f'Error deleting entity edge: {error_msg}')
 
 
-@secured_tool(ToolScope.ADMIN, destructive=True)
-async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
+@secured_tool(ToolScope.ADMIN, group_parameter='group_id', destructive=True)
+async def delete_episode(
+    uuid: str,
+    group_id: str | None = None,
+) -> SuccessResponse | ErrorResponse:
     """Delete an episode from the graph memory.
 
     Uses Graphiti.remove_episode, which cascades the deletion: entities and facts
@@ -879,6 +996,7 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
 
     Args:
         uuid: UUID of the episode to delete
+        group_id: Group containing the episode. Falls back to the configured default group.
     """
     global graphiti_service
 
@@ -887,19 +1005,23 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
 
     try:
         client = await graphiti_service.get_client()
+        effective_group_id = group_id or _default_group_id()
+        if not effective_group_id:
+            return ErrorResponse(error='No group_id provided and no default group_id is configured')
+        scoped_client = await graphiti_for_group(client, effective_group_id)
 
-        if _http_authorization_active():
-            episode = await EpisodicNode.get_by_uuid(client.driver, uuid)
-            authorize_resource_group(
-                MCP_SECURITY,
-                episode.group_id,
-                required_scope=ToolScope.ADMIN,
-                destructive=True,
-            )
+        episode = await EpisodicNode.get_by_uuid(scoped_client.driver, uuid)
+        _require_resource_in_groups(
+            episode.group_id,
+            [effective_group_id],
+            required_scope=ToolScope.ADMIN,
+            resource_name='episode',
+            destructive=True,
+        )
 
         # remove_episode cascades cleanup of episode-created entities/edges,
         # unlike EpisodicNode.delete which would orphan them.
-        await client.remove_episode(uuid)
+        await scoped_client.remove_episode(uuid)
         return SuccessResponse(message=f'Episode with UUID {uuid} deleted successfully')
     except McpAuthorizationError:
         raise
@@ -909,12 +1031,16 @@ async def delete_episode(uuid: str) -> SuccessResponse | ErrorResponse:
         return ErrorResponse(error=f'Error deleting episode: {error_msg}')
 
 
-@secured_tool(ToolScope.READ)
-async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
+@secured_tool(ToolScope.READ, group_parameter='group_id')
+async def get_entity_edge(
+    uuid: str,
+    group_id: str | None = None,
+) -> dict[str, Any] | ErrorResponse:
     """Get an entity edge from the graph memory by its UUID.
 
     Args:
         uuid: UUID of the entity edge to retrieve
+        group_id: Group containing the edge. Falls back to the configured default group.
     """
     global graphiti_service
 
@@ -923,15 +1049,19 @@ async def get_entity_edge(uuid: str) -> dict[str, Any] | ErrorResponse:
 
     try:
         client = await graphiti_service.get_client()
+        effective_group_id = group_id or _default_group_id()
+        if not effective_group_id:
+            return ErrorResponse(error='No group_id provided and no default group_id is configured')
+        scoped_client = await graphiti_for_group(client, effective_group_id)
 
         # Get the entity edge directly using the EntityEdge class method
-        entity_edge = await EntityEdge.get_by_uuid(client.driver, uuid)
-        if _http_authorization_active():
-            authorize_resource_group(
-                MCP_SECURITY,
-                entity_edge.group_id,
-                required_scope=ToolScope.READ,
-            )
+        entity_edge = await EntityEdge.get_by_uuid(scoped_client.driver, uuid)
+        _require_resource_in_groups(
+            entity_edge.group_id,
+            [effective_group_id],
+            required_scope=ToolScope.READ,
+            resource_name='entity edge',
+        )
 
         # Use the format_fact_result function to serialize the edge
         # Return the Python dict directly - MCP will handle serialization
@@ -974,13 +1104,26 @@ async def get_episodes(
             else []
         )
 
-        # Get episodes from the driver directly
-        from graphiti_core.nodes import EpisodicNode
-
         if effective_group_ids:
-            episodes = await EpisodicNode.get_by_group_ids(
-                client.driver, effective_group_ids, limit=max_episodes
-            )
+            if client.driver.provider == GraphProvider.FALKORDB:
+                # FalkorDB stores each group in a separate graph database. Query
+                # every requested graph through a call-scoped driver, then restore
+                # get_by_group_ids' global UUID-descending order and limit.
+                episodes = []
+                for effective_group_id in dict.fromkeys(effective_group_ids):
+                    episodes.extend(
+                        await EpisodicNode.get_by_group_ids(
+                            await driver_for_group(client, effective_group_id),
+                            [effective_group_id],
+                            limit=max_episodes,
+                        )
+                    )
+                episodes.sort(key=lambda episode: episode.uuid, reverse=True)
+                episodes = episodes[:max_episodes]
+            else:
+                episodes = await EpisodicNode.get_by_group_ids(
+                    client.driver, effective_group_ids, limit=max_episodes
+                )
         else:
             # If no group IDs, we need to use a different approach
             # For now, return empty list when no group IDs specified
@@ -1050,18 +1193,25 @@ async def summarize_saga(
         effective_group_id = group_id or config.graphiti.group_id
         if not effective_group_id:
             return ErrorResponse(error='No group_id provided and no default group_id is configured')
+        scoped_client = await graphiti_for_group(client, effective_group_id)
 
         # add_memory takes a saga *name*; core keys sagas by (name, group_id) and
         # assigns its own UUID, while summarize_saga requires that UUID. Resolve the
         # name to its UUID within the group before delegating to core.
-        sagas = await SagaNode.get_by_group_ids(client.driver, [effective_group_id])
+        sagas = await SagaNode.get_by_group_ids(scoped_client.driver, [effective_group_id])
         match = next((saga for saga in sagas if saga.name == saga_name), None)
         if match is None:
             return ErrorResponse(
                 error=f"No saga named '{saga_name}' found in group '{effective_group_id}'"
             )
 
-        saga_node = await client.summarize_saga(match.uuid)
+        saga_node = await scoped_client.summarize_saga(match.uuid)
+        _require_resource_in_groups(
+            saga_node.group_id,
+            [effective_group_id],
+            required_scope=ToolScope.WRITE,
+            resource_name='saga',
+        )
 
         return SagaSummaryResponse(
             message=f"Saga '{saga_name}' summarized successfully",
@@ -1069,6 +1219,8 @@ async def summarize_saga(
             name=saga_node.name,
             summary=saga_node.summary,
         )
+    except McpAuthorizationError:
+        raise
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error summarizing saga: {error_msg}')
@@ -1103,9 +1255,20 @@ async def build_communities(
         if normalized_group_ids is None and config.graphiti.group_id:
             normalized_group_ids = [config.graphiti.group_id]
 
-        communities, community_edges = await client.build_communities(
-            group_ids=normalized_group_ids
-        )
+        if client.driver.provider == GraphProvider.FALKORDB and normalized_group_ids:
+            communities = []
+            community_edges = []
+            for normalized_group_id in normalized_group_ids:
+                scoped_client = await graphiti_for_group(client, normalized_group_id)
+                group_communities, group_community_edges = await scoped_client.build_communities(
+                    group_ids=[normalized_group_id]
+                )
+                communities.extend(group_communities)
+                community_edges.extend(group_community_edges)
+        else:
+            communities, community_edges = await client.build_communities(
+                group_ids=normalized_group_ids
+            )
 
         _authorize_returned_groups(
             [*communities, *community_edges],
@@ -1175,21 +1338,18 @@ async def add_triplet(
         effective_group_id = group_id or config.graphiti.group_id
         if not effective_group_id:
             return ErrorResponse(error='No group_id provided and no default group_id is configured')
+        scoped_client = await graphiti_for_group(client, effective_group_id)
 
-        if _http_authorization_active():
-            for node_uuid in (source_node_uuid, target_node_uuid):
-                if node_uuid is None:
-                    continue
-                existing_node = await EntityNode.get_by_uuid(client.driver, node_uuid)
-                authorize_resource_group(
-                    MCP_SECURITY,
-                    existing_node.group_id,
-                    required_scope=ToolScope.WRITE,
-                )
-                if existing_node.group_id != effective_group_id:
-                    raise McpAuthorizationError(
-                        'referenced node must belong to the requested Graphiti group'
-                    )
+        for node_uuid in (source_node_uuid, target_node_uuid):
+            if node_uuid is None:
+                continue
+            existing_node = await EntityNode.get_by_uuid(scoped_client.driver, node_uuid)
+            _require_resource_in_groups(
+                existing_node.group_id,
+                [effective_group_id],
+                required_scope=ToolScope.WRITE,
+                resource_name='referenced node',
+            )
         now = datetime.now(timezone.utc)
 
         source_node = EntityNode(
@@ -1213,7 +1373,7 @@ async def add_triplet(
             created_at=now,
         )
 
-        result = await client.add_triplet(source_node, edge, target_node)
+        result = await scoped_client.add_triplet(source_node, edge, target_node)
 
         _authorize_returned_groups(
             [*result.nodes, *result.edges],
@@ -1234,9 +1394,10 @@ async def add_triplet(
         return ErrorResponse(error=f'Error adding triplet: {error_msg}')
 
 
-@secured_tool(ToolScope.READ)
+@secured_tool(ToolScope.READ, group_parameter='group_id')
 async def get_episode_entities(
     episode_uuids: list[str],
+    group_id: str | None = None,
 ) -> EpisodeEntitiesResponse | ErrorResponse:
     """Get the entities (nodes) and facts (edges) created by specific episodes.
 
@@ -1245,6 +1406,7 @@ async def get_episode_entities(
 
     Args:
         episode_uuids: List of episode UUIDs to look up provenance for
+        group_id: Group containing every episode. Falls back to the configured default group.
     """
     global graphiti_service
 
@@ -1256,26 +1418,27 @@ async def get_episode_entities(
 
     try:
         client = await graphiti_service.get_client()
+        effective_group_id = group_id or _default_group_id()
+        if not effective_group_id:
+            return ErrorResponse(error='No group_id provided and no default group_id is configured')
+        scoped_client = await graphiti_for_group(client, effective_group_id)
 
-        authorized_episode_groups: set[str] = set()
-        if _http_authorization_active():
-            for episode_uuid in episode_uuids:
-                episode = await EpisodicNode.get_by_uuid(client.driver, episode_uuid)
-                authorize_resource_group(
-                    MCP_SECURITY,
-                    episode.group_id,
-                    required_scope=ToolScope.READ,
-                )
-                authorized_episode_groups.add(episode.group_id)
-
-        results = await client.get_nodes_and_edges_by_episode(episode_uuids)
-
-        if _http_authorization_active():
-            _authorize_returned_groups(
-                [*results.nodes, *results.edges],
-                list(authorized_episode_groups),
+        for episode_uuid in episode_uuids:
+            episode = await EpisodicNode.get_by_uuid(scoped_client.driver, episode_uuid)
+            _require_resource_in_groups(
+                episode.group_id,
+                [effective_group_id],
                 required_scope=ToolScope.READ,
+                resource_name='episode',
             )
+
+        results = await scoped_client.get_nodes_and_edges_by_episode(episode_uuids)
+
+        _authorize_returned_groups(
+            [*results.nodes, *results.edges],
+            [effective_group_id],
+            required_scope=ToolScope.READ,
+        )
 
         return EpisodeEntitiesResponse(
             message=f'Retrieved provenance for {len(episode_uuids)} episode(s)',
@@ -1321,8 +1484,19 @@ async def clear_graph(
         if not effective_group_ids:
             return ErrorResponse(error='No group IDs specified for clearing')
 
-        # Clear data for the specified group IDs
-        await clear_data(client.driver, group_ids=effective_group_ids)
+        if client.driver.provider == GraphProvider.FALKORDB:
+            # FalkorDB stores each group in its own graph. Route each deletion
+            # through its initialized scoped driver.
+            for effective_group_id in dict.fromkeys(effective_group_ids):
+                await clear_data(
+                    await driver_for_group(client, effective_group_id),
+                    group_ids=[effective_group_id],
+                )
+        else:
+            # Preserve one all-groups operation for providers that keep logical
+            # groups in a shared database. Besides being cheaper, this retains the
+            # driver's transaction boundary instead of allowing a partial clear.
+            await clear_data(client.driver, group_ids=effective_group_ids)
 
         return SuccessResponse(
             message=f'Graph data cleared successfully for group IDs: {", ".join(effective_group_ids)}'

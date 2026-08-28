@@ -270,8 +270,9 @@ GRAPHITI_MCP_SECURITY_REQUIRED=true
 GRAPHITI_MCP_HTTP_AUTH_ENABLED=true
 
 # Exact Host header values seen by the pod. Include every Kubernetes short name,
-# namespace name, cluster FQDN, and external name clients actually use.
-GRAPHITI_MCP_ALLOWED_HOSTS=graphiti,graphiti.my-namespace,graphiti.my-namespace.svc,graphiti.my-namespace.svc.cluster.local,graphiti.example.com
+# namespace name, cluster FQDN, and external name clients actually use. Direct
+# callers of the app's port 8000 include that port in Host.
+GRAPHITI_MCP_ALLOWED_HOSTS=graphiti:8000,graphiti.my-namespace:8000,graphiti.my-namespace.svc:8000,graphiti.my-namespace.svc.cluster.local:8000,graphiti.example.com
 
 # Exact browser origins, if any. Use an explicit empty value when every caller
 # is server-to-server and omits Origin.
@@ -280,7 +281,8 @@ GRAPHITI_MCP_ALLOWED_ORIGINS=
 # Every request is bound to one of these exact Graphiti group IDs.
 GRAPHITI_MCP_ALLOWED_GROUPS=main,another-exact-group
 
-# Three pairwise-distinct secret-manager values, each at least 32 UTF-8 bytes.
+# Three pairwise-distinct secret-manager values, each at least 32 bytes of
+# HTTP token68-compatible ASCII.
 GRAPHITI_MCP_READ_TOKEN=<generated-secret>
 GRAPHITI_MCP_WRITE_TOKEN=<different-generated-secret>
 GRAPHITI_MCP_ADMIN_TOKEN=<third-generated-secret>
@@ -289,11 +291,18 @@ GRAPHITI_MCP_ADMIN_TOKEN=<third-generated-secret>
 GRAPHITI_MCP_DESTRUCTIVE_TOOLS_ENABLED=false
 ```
 
-Generate each token independently (for example, `openssl rand -base64 48`). Wildcard Hosts,
-Origins, and groups are rejected. A non-default HTTP port must appear in the exact Host values the
-client sends (for example, `graphiti.example.com:8443`). Startup fails before database
-initialization if required auth, tokens, Hosts, or groups are incomplete. Required mode supports
-the streamable HTTP transport only.
+Generate each token independently (for example, `openssl rand -base64 48`). Whitespace, Unicode,
+and punctuation outside the HTTP token68 alphabet are rejected so configured credentials make a
+lossless `Authorization` header round trip. Wildcard Hosts and Origins are rejected. Allowed group
+IDs must use Graphiti's ASCII letter, number, dash, and underscore grammar; wildcards are rejected.
+Any port other than the URL scheme default (80 for HTTP, 443 for HTTPS) must appear in the exact
+Host values the client sends—including the app's default port 8000 when called directly (for
+example, `graphiti:8000`). Startup fails before database initialization if required auth, tokens,
+Hosts, or groups are incomplete. Required mode supports the streamable HTTP transport only.
+
+Static bearer tokens are replayable credentials. Production callers must use HTTPS or mTLS
+end-to-end, or terminate TLS at a trusted ingress/service mesh on a protected network before
+forwarding to the pod. Never expose the plaintext port 8000 listener to an untrusted network.
 
 When no Host/Origin policy is explicitly configured, local development retains FastMCP's
 localhost-only wildcard-port defaults so `--port` continues to work. Required mode never uses those

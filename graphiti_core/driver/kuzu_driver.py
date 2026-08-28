@@ -284,8 +284,8 @@ class KuzuDriverSession(GraphDriverSession):
 
     async def run(self, query: str | list, **kwargs: Any) -> Any:
         if isinstance(query, list):
+            result = None
             for cypher, params in query:
-                await self.driver.execute_query(cypher, **params)
-        else:
-            await self.driver.execute_query(query, **kwargs)
-        return None
+                result = await self.driver.execute_query(cypher, **params)
+            return result
+        return await self.driver.execute_query(query, **kwargs)
