@@ -14,6 +14,8 @@ class ReadinessResponse(BaseModel):
     status: Literal['ready', 'not_ready']
     graphiti_core_version: str
     opr_auth_required: bool
+    opr_auth_mode: Literal['static', 'lz_jwt']
+    authorization_ready: bool
     ingest_worker_running: bool
     ingest_accepting: bool
     ingest_draining: bool

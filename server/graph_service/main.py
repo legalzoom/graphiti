@@ -119,14 +119,16 @@ async def readiness(request: Request):
 
     Settings are validated before the application lifespan starts, so a
     deployment with required-but-missing OPR credentials never reaches this
-    endpoint. Once started, fail readiness if either the shared graph client
-    was not installed or the ingest consumer has exited. Queue capacity is a
-    transient backpressure signal returned by `/messages`, not pod readiness.
+    endpoint. Once started, fail readiness if the shared graph client was not
+    installed, the authorization keys are no longer usable, or the ingest
+    consumer has exited. Queue capacity is a transient backpressure signal
+    returned by `/messages`, not pod readiness.
     """
     settings = get_settings()
     worker_task = ingest.async_worker.task
     graphiti_ready = hasattr(request.app.state, GRAPHITI_CLIENT_STATE_ATTR)
-    authorization_ready = hasattr(request.app.state, AUTHORIZER_STATE_ATTR)
+    authorizer = getattr(request.app.state, AUTHORIZER_STATE_ATTR, None)
+    authorization_ready = authorizer is not None and await authorizer.is_ready()
     worker_running = worker_task is not None and not worker_task.done()
     ingest_ready = ingest.async_worker.ready
     ready = graphiti_ready and authorization_ready and ingest_ready
@@ -136,6 +138,7 @@ async def readiness(request: Request):
             'graphiti_core_version': version('graphiti-core'),
             'opr_auth_required': settings.opr_auth_required,
             'opr_auth_mode': settings.opr_auth_mode.value,
+            'authorization_ready': authorization_ready,
             'ingest_worker_running': worker_running,
             'ingest_accepting': ingest.async_worker.accepting,
             'ingest_draining': ingest.async_worker.draining,

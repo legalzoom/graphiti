@@ -406,6 +406,7 @@ async def test_readiness_requires_shared_client_and_live_ingest_worker(monkeypat
         'graphiti_core_version': _json_body(neither_ready)['graphiti_core_version'],
         'opr_auth_required': True,
         'opr_auth_mode': 'static',
+        'authorization_ready': True,
         'ingest_worker_running': False,
         'ingest_accepting': False,
         'ingest_draining': False,
@@ -432,6 +433,27 @@ async def test_readiness_requires_shared_client_and_live_ingest_worker(monkeypat
         assert _json_body(ready)['ingest_worker_running'] is True
         assert _json_body(ready)['ingest_accepting'] is True
         assert _json_body(ready)['ingest_draining'] is False
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_readiness_fails_when_authorization_keys_are_unusable(monkeypatch):
+    settings = Settings.model_validate(_required_opr_settings_values())
+    monkeypatch.setattr(graph_service_main, 'get_settings', lambda: settings)
+    worker = AsyncWorker(maxsize=5)
+    monkeypatch.setattr(ingest, 'async_worker', worker)
+    await worker.start()
+    await asyncio.sleep(0)
+    request = _http_request(_graphiti())
+    authorizer = SimpleNamespace(is_ready=AsyncMock(return_value=False))
+    setattr(request.app.state, AUTHORIZER_STATE_ATTR, authorizer)
+
+    try:
+        response = await graph_service_main.readiness(request)
+        assert response.status_code == 503
+        assert _json_body(response)['authorization_ready'] is False
+        authorizer.is_ready.assert_awaited_once()
     finally:
         await worker.stop()
 
