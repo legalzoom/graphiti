@@ -1,3 +1,4 @@
+from typing import Literal
 from uuid import UUID
 
 from graphiti_core.nodes import EpisodeType
@@ -9,6 +10,14 @@ from graph_service.dto.common import Message
 class AddMessagesRequest(BaseModel):
     group_id: str = Field(..., description='The group id of the messages to add')
     messages: list[Message] = Field(..., description='The messages to add')
+
+
+class IngestUnavailableResponse(BaseModel):
+    success: Literal[False]
+    error: Literal['ingest_draining', 'ingest_worker_unavailable', 'ingest_queue_full']
+    message: str
+    queue_depth: int = Field(ge=0)
+    queue_maxsize: int = Field(gt=0)
 
 
 class AddEntityNodeRequest(BaseModel):

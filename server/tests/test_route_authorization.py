@@ -17,7 +17,12 @@ from graph_service.dto import (
     Result,
     SearchQuery,
 )
-from graph_service.protocol import bearer_token_matches
+from graph_service.protocol import (
+    bearer_token_matches,
+    is_http_token68,
+    reconciliation_token_matches,
+)
+from graph_service.routers import ingest
 from graph_service.routers.ingest import (
     add_entity_node,
     add_messages,
@@ -71,6 +76,22 @@ def _bearer(token: str) -> str:
     return f'Bearer {token}'
 
 
+def _required_auth_values(**overrides) -> dict:
+    values = {
+        'openai_api_key': 'test',
+        'ingest_queue_maxsize': 1000,
+        'opr_auth_required': True,
+        'opr_read_token': 'read-' + ('a' * 32),
+        'opr_write_token': 'write-' + ('b' * 32),
+        'opr_reconciliation_token': 'reconcile-' + ('c' * 32),
+        'opr_retirement_token': 'retire-' + ('d' * 32),
+        'opr_writer_fleet_epoch': 'epoch-' + ('e' * 32),
+        'graphiti_admin_token': 'admin-' + ('f' * 32),
+    }
+    values.update(overrides)
+    return values
+
+
 @pytest.mark.parametrize(
     ('left', 'right'),
     [
@@ -106,7 +127,7 @@ def test_all_configured_privileged_tokens_must_be_distinct(left: str, right: str
     assert sentinel not in str(exc_info.value)
 
 
-def test_writer_fleet_epoch_requires_256_bit_minimum_without_leaking_input():
+def test_writer_fleet_epoch_requires_32_byte_minimum_without_leaking_input():
     sentinel = 'short-fleet-epoch-secret'
     with pytest.raises(ValueError, match='at least 32 bytes') as exc_info:
         Settings.model_validate(
@@ -116,6 +137,135 @@ def test_writer_fleet_epoch_requires_256_bit_minimum_without_leaking_input():
                 'opr_writer_fleet_epoch': sentinel,
             }
         )
+    assert sentinel not in str(exc_info.value)
+
+
+def test_non_opr_deployment_does_not_require_opr_credentials():
+    settings = Settings.model_validate(
+        {
+            'openai_api_key': 'test',
+            'ingest_queue_maxsize': 1000,
+        }
+    )
+
+    assert settings.opr_auth_required is False
+    assert settings.opr_read_token.get_secret_value() == ''
+    assert settings.opr_write_token.get_secret_value() == ''
+
+
+@pytest.mark.parametrize(
+    'missing_field',
+    [
+        'opr_read_token',
+        'opr_write_token',
+        'opr_reconciliation_token',
+        'opr_retirement_token',
+        'opr_writer_fleet_epoch',
+        'graphiti_admin_token',
+    ],
+)
+def test_required_opr_auth_rejects_each_missing_privileged_value(missing_field: str):
+    values = _required_auth_values()
+    values[missing_field] = ''
+
+    with pytest.raises(ValueError, match='requires non-empty privileged values'):
+        Settings.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    'short_field',
+    [
+        'opr_read_token',
+        'opr_write_token',
+        'opr_reconciliation_token',
+        'opr_retirement_token',
+        'opr_writer_fleet_epoch',
+        'graphiti_admin_token',
+    ],
+)
+def test_required_opr_auth_rejects_each_short_privileged_value_without_leaking_it(
+    short_field: str,
+):
+    sentinel = 'short-secret'
+    values = _required_auth_values(**{short_field: sentinel})
+
+    with pytest.raises(ValueError, match='at least 32 bytes') as exc_info:
+        Settings.model_validate(values)
+
+    assert sentinel not in str(exc_info.value)
+
+
+def test_required_opr_auth_accepts_six_distinct_http_safe_values():
+    settings = Settings.model_validate(_required_auth_values())
+
+    assert settings.opr_auth_required is True
+
+
+@pytest.mark.parametrize(
+    'invalid_value',
+    [
+        'x' * 16 + ' ' + 'y' * 16,
+        '\u00e9' * 16,
+        'x' * 32 + '!',
+        'x' * 32 + '\n',
+    ],
+)
+def test_required_opr_auth_rejects_values_that_cannot_round_trip_in_http_headers(
+    invalid_value: str,
+):
+    with pytest.raises(ValueError, match='HTTP token68-compatible ASCII'):
+        Settings.model_validate(_required_auth_values(opr_read_token=invalid_value))
+
+
+@pytest.mark.parametrize(
+    'field',
+    [
+        'opr_read_token',
+        'opr_write_token',
+        'opr_reconciliation_token',
+        'opr_retirement_token',
+        'opr_writer_fleet_epoch',
+        'graphiti_admin_token',
+    ],
+)
+def test_required_opr_auth_rejects_internal_whitespace_for_every_credential(field: str):
+    invalid_value = 'x' * 16 + ' ' + 'y' * 16
+
+    with pytest.raises(ValueError, match='HTTP token68-compatible ASCII') as exc_info:
+        Settings.model_validate(_required_auth_values(**{field: invalid_value}))
+
+    assert invalid_value not in str(exc_info.value)
+
+
+def test_required_opr_auth_credentials_round_trip_through_protocol_matchers():
+    settings = Settings.model_validate(_required_auth_values())
+    read = settings.opr_read_token.get_secret_value()
+    write = settings.opr_write_token.get_secret_value()
+    admin = settings.graphiti_admin_token.get_secret_value()
+    reconciliation = settings.opr_reconciliation_token.get_secret_value()
+    retirement = settings.opr_retirement_token.get_secret_value()
+    fleet_epoch = settings.opr_writer_fleet_epoch.get_secret_value()
+
+    assert all(
+        is_http_token68(value)
+        for value in (read, write, admin, reconciliation, retirement, fleet_epoch)
+    )
+    assert bearer_token_matches(read, f'Bearer {read}')
+    assert bearer_token_matches(write, f'Bearer {write}')
+    assert bearer_token_matches(admin, f'Bearer {admin}')
+    assert reconciliation_token_matches(reconciliation, reconciliation)
+    assert reconciliation_token_matches(retirement, retirement)
+    assert reconciliation_token_matches(fleet_epoch, fleet_epoch)
+
+
+def test_required_opr_auth_rejects_equal_ordinary_credentials_without_leaking_them():
+    sentinel = 'same-ordinary-secret-' + ('x' * 32)
+
+    with pytest.raises(ValueError, match='privileged tokens must be distinct') as exc_info:
+        Settings.model_validate(
+            _required_auth_values(opr_read_token=sentinel, opr_write_token=sentinel)
+        )
+
     assert sentinel not in str(exc_info.value)
 
 
@@ -136,8 +286,22 @@ def test_bearer_parser_accepts_only_the_exact_configured_secret():
     assert bearer_token_matches('', 'Bearer secret') is False
 
 
+def test_token_comparisons_fail_closed_for_non_ascii_bearer_secrets_without_raising():
+    secret = '\u00e9' * 16
+
+    assert bearer_token_matches(secret, f'Bearer {secret}') is False
+    assert bearer_token_matches(secret, f'Bearer {secret}x') is False
+    assert reconciliation_token_matches(secret, secret) is True
+    assert reconciliation_token_matches(secret, secret + 'x') is False
+
+
 @pytest.mark.asyncio
-async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue():
+async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue(monkeypatch):
+    monkeypatch.setattr(
+        ingest,
+        'async_worker',
+        SimpleNamespace(accepting=True, draining=False, depth=0, capacity=1000),
+    )
     request = AddMessagesRequest(group_id='opr', messages=[])
     graphiti = cast(ZepGraphiti, SimpleNamespace())
     settings = _settings()
@@ -168,7 +332,12 @@ async def test_opr_message_write_rejects_missing_or_read_bearer_before_enqueue()
 
 
 @pytest.mark.asyncio
-async def test_message_write_rejects_known_cross_group_uuid_before_enqueue():
+async def test_message_write_rejects_known_cross_group_uuid_before_enqueue(monkeypatch):
+    monkeypatch.setattr(
+        ingest,
+        'async_worker',
+        SimpleNamespace(accepting=True, draining=False, depth=0, capacity=1000),
+    )
     assert_episode_uuid_group = AsyncMock(side_effect=NodeGroupMismatchError())
     graphiti = cast(
         ZepGraphiti,

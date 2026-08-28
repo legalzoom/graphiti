@@ -10,6 +10,15 @@ class Result(BaseModel):
     success: bool
 
 
+class ReadinessResponse(BaseModel):
+    status: Literal['ready', 'not_ready']
+    graphiti_core_version: str
+    opr_auth_required: bool
+    ingest_worker_running: bool
+    ingest_accepting: bool
+    ingest_draining: bool
+
+
 class Message(BaseModel):
     content: str = Field(..., description='The content of the message')
     uuid: str | None = Field(default=None, description='The uuid of the message (optional)')
