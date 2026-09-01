@@ -69,6 +69,15 @@ _STATIC_FORBIDDEN_DETAIL = {
     Permission.ADMIN: 'Graphiti administrative access is not authorized',
 }
 
+_DEV_LEGACY_COMPATIBLE_PERMISSIONS = frozenset(
+    {
+        Permission.READ,
+        Permission.WRITE,
+        Permission.RECONCILE,
+        Permission.RETIRE,
+    }
+)
+
 
 class _InvalidAccessToken(Exception):
     pass
@@ -377,6 +386,12 @@ class GraphitiAuthorizer:
     ) -> None:
         self._settings = settings
         self._auth_mode = OprAuthMode(getattr(settings, 'opr_auth_mode', OprAuthMode.STATIC))
+        self._dev_legacy_auth_compatibility_enabled = getattr(
+            settings, 'opr_dev_legacy_auth_compatibility_enabled', False
+        )
+        self._dev_legacy_auth_compatibility_remove_by = getattr(
+            settings, 'opr_dev_legacy_auth_compatibility_remove_by', None
+        )
         self._jwt_verifier = (
             JwtVerifier(settings, http_client=http_client, clock=clock)
             if self._auth_mode is OprAuthMode.LZ_JWT
@@ -384,6 +399,14 @@ class GraphitiAuthorizer:
         )
 
     async def start(self) -> None:
+        if self._dev_legacy_auth_compatibility_enabled:
+            logger.warning(
+                'SECURITY WARNING: OPR DEV LEGACY AUTH COMPATIBILITY IS ENABLED through %s. '
+                'OPR read/write/reconciliation/retirement identity checks without a configured '
+                'credential are temporarily bypassed; remove this incident bridge before that '
+                'date.',
+                self._dev_legacy_auth_compatibility_remove_by,
+            )
         if self._jwt_verifier is not None:
             try:
                 await self._jwt_verifier.start()
@@ -408,6 +431,17 @@ class GraphitiAuthorizer:
     ) -> None:
         if self._auth_mode is OprAuthMode.STATIC:
             expected = getattr(self._settings, _STATIC_SECRET_ATTR[permission]).get_secret_value()
+            if (
+                self._dev_legacy_auth_compatibility_enabled
+                and permission in _DEV_LEGACY_COMPATIBLE_PERMISSIONS
+                and not expected
+            ):
+                logger.info(
+                    'OPR DEV legacy auth compatibility bypass used for permission=%s; remove_by=%s',
+                    permission.value,
+                    self._dev_legacy_auth_compatibility_remove_by,
+                )
+                return
             if permission in {Permission.RECONCILE, Permission.RETIRE}:
                 authorized = reconciliation_token_matches(expected, legacy_token)
             else:

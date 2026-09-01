@@ -82,6 +82,30 @@ Only stable releases are built automatically (pre-release versions are skipped).
 The OPR-owned graph group (`group_id=opr`) supports two explicit authentication modes. There is no
 credential fallback between them.
 
+### Temporary DEV legacy compatibility bridge
+
+The REST service has a narrowly scoped incident bridge for rolling DEV forward before its OPR
+callers have migrated credentials. It is disabled by default and must never be enabled in shared
+configuration consumed by the MCP server. Enable it only on the DEV REST container with all three
+values:
+
+```text
+GRAPHITI_DEPLOYMENT_ENVIRONMENT=dev
+OPR_DEV_LEGACY_AUTH_COMPATIBILITY_ENABLED=true
+OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY=<future YYYY-MM-DD, at most 14 days away>
+```
+
+Startup fails unless the environment is exactly `dev`, `OPR_AUTH_REQUIRED=false`, static auth mode
+is selected, and the removal date is future-dated but no more than 14 days away. A restart after the
+date refuses the stale bridge, and startup emits a security warning containing the deadline.
+
+While active, only OPR read, write, reconciliation, and retirement caller-identity checks whose
+static credential is still empty are bypassed. Configuring a credential immediately restores its
+normal enforcement even while the bridge is active. Administrative authorization and every
+writer-fleet epoch, group, operation, receipt, and domain-level fence remain enforced. Remove the
+bridge after DEV callers send their intended static or LZ JWT credentials; it is not a third
+authentication mode.
+
 ### Static compatibility mode
 
 `OPR_AUTH_MODE=static` is the default and preserves the legacy deployment contract. When
