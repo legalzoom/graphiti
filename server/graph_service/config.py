@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
 
 from graph_service.protocol import is_http_token68
@@ -27,7 +27,7 @@ MAX_INGEST_DRAIN_TIMEOUT_SECONDS = 15.0
 _OPR_DEV_LEGACY_AUTH_COMPATIBILITY_MAX_DAYS = 14
 
 
-def _utc_today() -> date:
+def utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
@@ -110,6 +110,14 @@ class Settings(BaseSettings):
         hide_input_in_errors=True,
     )
 
+    @field_validator('opr_dev_legacy_auth_compatibility_remove_by', mode='before')
+    @classmethod
+    def normalize_blank_legacy_compatibility_remove_by(cls, value: object) -> object:
+        # Empty environment values are how the disabled switch is represented
+        # in the example config. Treat only the exact empty string as unset;
+        # malformed non-empty dates must still fail validation.
+        return None if value == '' else value
+
     @model_validator(mode='after')
     def validate_dev_legacy_auth_compatibility(self):
         if not self.opr_dev_legacy_auth_compatibility_enabled:
@@ -137,7 +145,7 @@ class Settings(BaseSettings):
                 'OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY'
             )
 
-        today = _utc_today()
+        today = utc_today()
         if remove_by <= today:
             raise ValueError('OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY must be a future date')
         if remove_by > today + timedelta(days=_OPR_DEV_LEGACY_AUTH_COMPATIBILITY_MAX_DAYS):

@@ -97,13 +97,16 @@ OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY=<future YYYY-MM-DD, at most 14 days 
 
 Startup fails unless the environment is exactly `dev`, `OPR_AUTH_REQUIRED=false`, static auth mode
 is selected, and the removal date is future-dated but no more than 14 days away. A restart after the
-date refuses the stale bridge, and startup emits a security warning containing the deadline.
+date refuses the stale bridge. A pod that remains running stops bypassing identity checks at the
+start of the removal date and falls through to normal authorization; this does not change pod
+readiness. Startup and first-use warnings expose the bridge and its deadline.
 
 While active, only OPR read, write, reconciliation, and retirement caller-identity checks whose
-static credential is still empty are bypassed. Configuring a credential immediately restores its
-normal enforcement even while the bridge is active. Administrative authorization and every
-writer-fleet epoch, group, operation, receipt, and domain-level fence remain enforced. Remove the
-bridge after DEV callers send their intended static or LZ JWT credentials; it is not a third
+static credential is still empty are bypassed. After configuring a credential, roll or restart
+every Graphiti REST pod; enforcement begins only in processes that loaded the new environment, and
+the rollout is incomplete until all older pods have terminated. Administrative authorization and
+every writer-fleet epoch, group, operation, receipt, and domain-level fence remain enforced. Remove
+the bridge after DEV callers send their intended static or LZ JWT credentials; it is not a third
 authentication mode.
 
 ### Static compatibility mode

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from datetime import date, timedelta
 from types import SimpleNamespace
 from typing import cast
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from fastapi import HTTPException, Request
 
+from graph_service import auth as auth_module
 from graph_service import config
 from graph_service.auth import GraphitiAuthorizer, Permission
 from graph_service.config import Settings
@@ -46,8 +48,20 @@ def _settings_values(**overrides) -> dict:
 
 
 def _settings(monkeypatch: pytest.MonkeyPatch, **overrides) -> Settings:
-    monkeypatch.setattr(config, '_utc_today', lambda: TODAY)
+    monkeypatch.setattr(config, 'utc_today', lambda: TODAY)
     return Settings.model_validate(_settings_values(**overrides))
+
+
+def _today() -> date:
+    return TODAY
+
+
+def _authorizer(
+    settings: Settings,
+    *,
+    current_date: Callable[[], date] = _today,
+) -> GraphitiAuthorizer:
+    return GraphitiAuthorizer(settings, current_date=current_date)
 
 
 def _http_request() -> Request:
@@ -66,6 +80,20 @@ def test_legacy_compatibility_defaults_off_and_auth_stays_fail_closed():
     assert settings.opr_dev_legacy_auth_compatibility_remove_by is None
 
 
+def test_disabled_legacy_compatibility_loads_blank_removal_date_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv('OPENAI_API_KEY', 'test')
+    monkeypatch.setenv('INGEST_QUEUE_MAXSIZE', '1000')
+    monkeypatch.setenv('OPR_DEV_LEGACY_AUTH_COMPATIBILITY_ENABLED', 'false')
+    monkeypatch.setenv('OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY', '')
+
+    settings = Settings()  # type: ignore[call-arg]
+
+    assert settings.opr_dev_legacy_auth_compatibility_enabled is False
+    assert settings.opr_dev_legacy_auth_compatibility_remove_by is None
+
+
 @pytest.mark.asyncio
 async def test_auth_stays_fail_closed_when_legacy_compatibility_is_disabled():
     settings = Settings.model_validate(
@@ -76,7 +104,7 @@ async def test_auth_stays_fail_closed_when_legacy_compatibility_is_disabled():
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await GraphitiAuthorizer(settings).require(Permission.READ, None)
+        await _authorizer(settings).require(Permission.READ, None)
 
     assert exc_info.value.status_code == 403
 
@@ -86,7 +114,7 @@ def test_legacy_compatibility_is_rejected_outside_exact_dev_environment(
     monkeypatch: pytest.MonkeyPatch,
     environment: str,
 ):
-    monkeypatch.setattr(config, '_utc_today', lambda: TODAY)
+    monkeypatch.setattr(config, 'utc_today', lambda: TODAY)
 
     with pytest.raises(ValueError, match='GRAPHITI_DEPLOYMENT_ENVIRONMENT=dev'):
         Settings.model_validate(_settings_values(graphiti_deployment_environment=environment))
@@ -106,7 +134,7 @@ def test_legacy_compatibility_requires_a_bounded_removal_date(
     remove_by: str | None,
     error: str,
 ):
-    monkeypatch.setattr(config, '_utc_today', lambda: TODAY)
+    monkeypatch.setattr(config, 'utc_today', lambda: TODAY)
 
     with pytest.raises(ValueError, match=error):
         Settings.model_validate(
@@ -114,8 +142,21 @@ def test_legacy_compatibility_requires_a_bounded_removal_date(
         )
 
 
+def test_legacy_compatibility_accepts_the_fourteen_day_removal_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config, 'utc_today', lambda: TODAY)
+    remove_by = TODAY + timedelta(days=14)
+
+    settings = Settings.model_validate(
+        _settings_values(opr_dev_legacy_auth_compatibility_remove_by=remove_by.isoformat())
+    )
+
+    assert settings.opr_dev_legacy_auth_compatibility_remove_by == remove_by
+
+
 def test_legacy_compatibility_cannot_override_required_auth(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(config, '_utc_today', lambda: TODAY)
+    monkeypatch.setattr(config, 'utc_today', lambda: TODAY)
 
     with pytest.raises(ValueError, match='OPR_AUTH_REQUIRED=false'):
         Settings.model_validate(_settings_values(opr_auth_required=True))
@@ -126,7 +167,7 @@ async def test_legacy_compatibility_emits_unmistakable_startup_warning(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ):
-    authorizer = GraphitiAuthorizer(_settings(monkeypatch))
+    authorizer = _authorizer(_settings(monkeypatch))
 
     with caplog.at_level(logging.WARNING, logger='graph_service.auth'):
         await authorizer.start()
@@ -165,7 +206,7 @@ async def test_legacy_compatibility_allows_unauthenticated_opr_messages(
         _http_request(),
         graphiti,
         settings,
-        GraphitiAuthorizer(settings),
+        _authorizer(settings),
     )
 
     assert isinstance(result, Result)
@@ -190,7 +231,7 @@ async def test_legacy_compatibility_allows_unauthenticated_opr_entity_write(
         ),
         graphiti,
         settings,
-        GraphitiAuthorizer(settings),
+        _authorizer(settings),
     )
 
     save_entity_node.assert_awaited_once()
@@ -203,7 +244,7 @@ async def test_legacy_compatibility_allows_unauthenticated_opr_search_and_memory
     graphiti_search = AsyncMock(return_value=[])
     graphiti = cast(ZepGraphiti, SimpleNamespace(search=graphiti_search))
     settings = _settings(monkeypatch)
-    authorizer = GraphitiAuthorizer(settings)
+    authorizer = _authorizer(settings)
 
     await search(
         SearchQuery(query='query', group_ids=['opr']),
@@ -232,47 +273,116 @@ async def test_legacy_compatibility_never_bypasses_admin(
     settings = _settings(monkeypatch)
 
     with pytest.raises(HTTPException) as exc_info:
-        await GraphitiAuthorizer(settings).require(Permission.ADMIN, None)
+        await _authorizer(settings).require(Permission.ADMIN, None)
 
     assert exc_info.value.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_legacy_compatibility_enforces_a_configured_read_credential(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    settings = _settings(monkeypatch, opr_read_token='configured-read-token')
-    authorizer = GraphitiAuthorizer(settings)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await authorizer.require(Permission.READ, None)
-    assert exc_info.value.status_code == 403
-
-    await authorizer.require(Permission.READ, 'Bearer configured-read-token')
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('permission', 'setting_name', 'token'),
+    ('permission', 'setting_name', 'token', 'authorization', 'legacy_token'),
     [
-        (Permission.RECONCILE, 'opr_reconciliation_token', 'configured-reconcile-token'),
-        (Permission.RETIRE, 'opr_retirement_token', 'configured-retirement-token'),
+        (
+            Permission.READ,
+            'opr_read_token',
+            'configured-read-token',
+            'Bearer configured-read-token',
+            None,
+        ),
+        (
+            Permission.WRITE,
+            'opr_write_token',
+            'configured-write-token',
+            'Bearer configured-write-token',
+            None,
+        ),
+        (
+            Permission.RECONCILE,
+            'opr_reconciliation_token',
+            'configured-reconcile-token',
+            None,
+            'configured-reconcile-token',
+        ),
+        (
+            Permission.RETIRE,
+            'opr_retirement_token',
+            'configured-retirement-token',
+            None,
+            'configured-retirement-token',
+        ),
     ],
 )
-async def test_legacy_compatibility_enforces_configured_privileged_credentials(
+async def test_legacy_compatibility_enforces_each_configured_credential(
     monkeypatch: pytest.MonkeyPatch,
     permission: Permission,
     setting_name: str,
     token: str,
+    authorization: str | None,
+    legacy_token: str | None,
 ):
     settings = _settings(monkeypatch, **{setting_name: token})
-    authorizer = GraphitiAuthorizer(settings)
+    authorizer = _authorizer(settings)
 
     with pytest.raises(HTTPException) as exc_info:
         await authorizer.require(permission, None, legacy_token=None)
     assert exc_info.value.status_code == 403
 
-    await authorizer.require(permission, None, legacy_token=token)
+    await authorizer.require(permission, authorization, legacy_token=legacy_token)
+
+
+@pytest.mark.asyncio
+async def test_legacy_compatibility_warns_once_per_bypassed_permission(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setattr(auth_module, '_DEV_LEGACY_COMPATIBILITY_WARNED_PERMISSIONS', set())
+    settings = _settings(monkeypatch)
+    authorizer = _authorizer(settings)
+
+    with caplog.at_level(logging.WARNING, logger='graph_service.auth'):
+        for _ in range(3):
+            await authorizer.require(Permission.READ, None)
+        for _ in range(2):
+            await authorizer.require(Permission.WRITE, None)
+
+    bypass_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if 'legacy auth compatibility bypass used' in record.getMessage()
+    ]
+    assert len(bypass_warnings) == 2
+    assert any('permission=read' in message for message in bypass_warnings)
+    assert any('permission=write' in message for message in bypass_warnings)
+
+
+@pytest.mark.asyncio
+async def test_legacy_compatibility_expires_for_live_read_and_write_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setattr(auth_module, '_DEV_LEGACY_COMPATIBILITY_WARNED_PERMISSIONS', set())
+    monkeypatch.setattr(auth_module, '_DEV_LEGACY_COMPATIBILITY_EXPIRY_WARNED', False)
+    current_date = [TODAY]
+    settings = _settings(monkeypatch)
+    authorizer = _authorizer(settings, current_date=lambda: current_date[0])
+
+    await authorizer.require(Permission.READ, None)
+    await authorizer.require(Permission.WRITE, None)
+
+    with caplog.at_level(logging.WARNING, logger='graph_service.auth'):
+        for expired_date in (REMOVE_BY, REMOVE_BY + timedelta(days=1)):
+            current_date[0] = expired_date
+            for permission in (Permission.READ, Permission.WRITE):
+                with pytest.raises(HTTPException) as exc_info:
+                    await authorizer.require(permission, None)
+                assert exc_info.value.status_code == 403
+
+    expiry_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if 'legacy auth compatibility expired' in record.getMessage()
+    ]
+    assert len(expiry_warnings) == 1
 
 
 @pytest.mark.asyncio
@@ -285,7 +395,7 @@ async def test_reconciliation_v5_still_requires_the_writer_fleet_fence(
         SimpleNamespace(retrieve_episodes_for_reconciliation=retrieve_episodes),
     )
     settings = _settings(monkeypatch, opr_writer_fleet_epoch=WRITER_FLEET_EPOCH)
-    authorizer = GraphitiAuthorizer(settings)
+    authorizer = _authorizer(settings)
 
     with pytest.raises(HTTPException) as exc_info:
         await get_episodes_for_reconciliation(
@@ -321,7 +431,7 @@ async def test_retirement_v5_still_requires_operation_fence_and_durable_receipt(
         SimpleNamespace(episode_retirement_outcome=retirement_outcome),
     )
     settings = _settings(monkeypatch, opr_writer_fleet_epoch=WRITER_FLEET_EPOCH)
-    authorizer = GraphitiAuthorizer(settings)
+    authorizer = _authorizer(settings)
 
     with pytest.raises(HTTPException) as operation_error:
         await get_episode_retirement_status(

@@ -13,14 +13,16 @@ import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import date
 from enum import Enum
+from threading import Lock
 from typing import Annotated, Any
 
 import httpx
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 
-from graph_service.config import OprAuthMode, Settings
+from graph_service.config import OprAuthMode, Settings, utc_today
 from graph_service.protocol import (
     bearer_token_matches,
     is_http_token68,
@@ -77,6 +79,27 @@ _DEV_LEGACY_COMPATIBLE_PERMISSIONS = frozenset(
         Permission.RETIRE,
     }
 )
+_DEV_LEGACY_COMPATIBILITY_LOG_LOCK = Lock()
+_DEV_LEGACY_COMPATIBILITY_WARNED_PERMISSIONS: set[Permission] = set()
+_DEV_LEGACY_COMPATIBILITY_EXPIRY_WARNED = False
+
+
+def _claim_first_compatibility_permission_warning(permission: Permission) -> bool:
+    with _DEV_LEGACY_COMPATIBILITY_LOG_LOCK:
+        if permission in _DEV_LEGACY_COMPATIBILITY_WARNED_PERMISSIONS:
+            return False
+        _DEV_LEGACY_COMPATIBILITY_WARNED_PERMISSIONS.add(permission)
+        return True
+
+
+def _claim_first_compatibility_expiry_warning() -> bool:
+    global _DEV_LEGACY_COMPATIBILITY_EXPIRY_WARNED
+
+    with _DEV_LEGACY_COMPATIBILITY_LOG_LOCK:
+        if _DEV_LEGACY_COMPATIBILITY_EXPIRY_WARNED:
+            return False
+        _DEV_LEGACY_COMPATIBILITY_EXPIRY_WARNED = True
+        return True
 
 
 class _InvalidAccessToken(Exception):
@@ -383,6 +406,7 @@ class GraphitiAuthorizer:
         *,
         http_client: httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.monotonic,
+        current_date: Callable[[], date] = utc_today,
     ) -> None:
         self._settings = settings
         self._auth_mode = OprAuthMode(getattr(settings, 'opr_auth_mode', OprAuthMode.STATIC))
@@ -392,6 +416,7 @@ class GraphitiAuthorizer:
         self._dev_legacy_auth_compatibility_remove_by = getattr(
             settings, 'opr_dev_legacy_auth_compatibility_remove_by', None
         )
+        self._current_date = current_date
         self._jwt_verifier = (
             JwtVerifier(settings, http_client=http_client, clock=clock)
             if self._auth_mode is OprAuthMode.LZ_JWT
@@ -401,7 +426,7 @@ class GraphitiAuthorizer:
     async def start(self) -> None:
         if self._dev_legacy_auth_compatibility_enabled:
             logger.warning(
-                'SECURITY WARNING: OPR DEV LEGACY AUTH COMPATIBILITY IS ENABLED through %s. '
+                'SECURITY WARNING: OPR DEV LEGACY AUTH COMPATIBILITY IS ENABLED until %s UTC. '
                 'OPR read/write/reconciliation/retirement identity checks without a configured '
                 'credential are temporarily bypassed; remove this incident bridge before that '
                 'date.',
@@ -431,17 +456,28 @@ class GraphitiAuthorizer:
     ) -> None:
         if self._auth_mode is OprAuthMode.STATIC:
             expected = getattr(self._settings, _STATIC_SECRET_ATTR[permission]).get_secret_value()
-            if (
+            compatibility_candidate = (
                 self._dev_legacy_auth_compatibility_enabled
                 and permission in _DEV_LEGACY_COMPATIBLE_PERMISSIONS
                 and not expected
-            ):
-                logger.info(
-                    'OPR DEV legacy auth compatibility bypass used for permission=%s; remove_by=%s',
-                    permission.value,
-                    self._dev_legacy_auth_compatibility_remove_by,
-                )
-                return
+            )
+            if compatibility_candidate:
+                remove_by = self._dev_legacy_auth_compatibility_remove_by
+                if remove_by is not None and self._current_date() < remove_by:
+                    if _claim_first_compatibility_permission_warning(permission):
+                        logger.warning(
+                            'SECURITY WARNING: OPR DEV legacy auth compatibility bypass used for '
+                            'permission=%s; remove_by=%s',
+                            permission.value,
+                            remove_by,
+                        )
+                    return
+                if remove_by is not None and _claim_first_compatibility_expiry_warning():
+                    logger.warning(
+                        'SECURITY WARNING: OPR DEV legacy auth compatibility expired on %s UTC; '
+                        'normal authorization is enforced.',
+                        remove_by,
+                    )
             if permission in {Permission.RECONCILE, Permission.RETIRE}:
                 authorized = reconciliation_token_matches(expected, legacy_token)
             else:
