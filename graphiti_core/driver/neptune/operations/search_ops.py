@@ -41,7 +41,11 @@ from graphiti_core.search.search_filters import (
     edge_search_filter_query_constructor,
     node_search_filter_query_constructor,
 )
-from graphiti_core.search.search_utils import calculate_cosine_similarity
+from graphiti_core.search.search_utils import (
+    run_neptune_similarity_pipeline,
+    run_neptune_similarity_scorer,
+    score_neptune_similarity_records,
+)
 
 if TYPE_CHECKING:
     from graphiti_core.driver.neptune_driver import NeptuneDriver
@@ -66,7 +70,7 @@ class NeptuneSearchOperations(SearchOperations):
         if self._driver is None:
             return []
         driver = self._driver
-        res = driver.run_aoss_query('node_name_and_summary', query, limit=limit)
+        res = await driver.run_aoss_query('node_name_and_summary', query, limit=limit)
         if not res or res.get('hits', {}).get('total', {}).get('value', 0) == 0:
             return []
 
@@ -125,46 +129,45 @@ class NeptuneSearchOperations(SearchOperations):
             RETURN DISTINCT id(n) as id, n.name_embedding as embedding
             """
         )
-        resp, _, _ = await executor.execute_query(
-            query,
-            **filter_params,
-        )
 
-        if not resp:
-            return []
+        async def execute_neptune_similarity_search() -> list[EntityNode]:
+            resp, _, _ = await executor.execute_query(
+                query,
+                **filter_params,
+            )
 
-        input_ids = []
-        for r in resp:
-            if r['embedding']:
-                score = calculate_cosine_similarity(
-                    search_vector, list(map(float, r['embedding'].split(',')))
-                )
-                if score > min_score:
-                    input_ids.append({'id': r['id'], 'score': score})
+            if not resp:
+                return []
 
-        if not input_ids:
-            return []
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_similarity_records, search_vector, resp, min_score
+            )
 
-        cypher = (
-            """
+            if not input_ids:
+                return []
+
+            cypher = (
+                """
             UNWIND $ids as i
             MATCH (n:Entity)
             WHERE id(n)=i.id
             RETURN
             """
-            + get_entity_node_return_query(GraphProvider.NEPTUNE)
-            + """
+                + get_entity_node_return_query(GraphProvider.NEPTUNE)
+                + """
             ORDER BY i.score DESC
             LIMIT $limit
             """
-        )
-        records, _, _ = await executor.execute_query(
-            cypher,
-            ids=input_ids,
-            limit=limit,
-        )
+            )
+            records, _, _ = await executor.execute_query(
+                cypher,
+                ids=input_ids,
+                limit=limit,
+            )
 
-        return [entity_node_from_record(r) for r in records]
+            return [entity_node_from_record(r) for r in records]
+
+        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
 
     async def node_bfs_search(
         self,
@@ -230,7 +233,7 @@ class NeptuneSearchOperations(SearchOperations):
         if self._driver is None:
             return []
         driver = self._driver
-        res = driver.run_aoss_query('edge_name_and_fact', query)
+        res = await driver.run_aoss_query('edge_name_and_fact', query, limit=limit)
         if not res or res.get('hits', {}).get('total', {}).get('value', 0) == 0:
             return []
 
@@ -315,27 +318,24 @@ class NeptuneSearchOperations(SearchOperations):
             RETURN DISTINCT id(e) as id, e.fact_embedding as embedding
             """
         )
-        resp, _, _ = await executor.execute_query(
-            query,
-            **filter_params,
-        )
 
-        if not resp:
-            return []
+        async def execute_neptune_similarity_search() -> list[EntityEdge]:
+            resp, _, _ = await executor.execute_query(
+                query,
+                **filter_params,
+            )
 
-        input_ids = []
-        for r in resp:
-            if r['embedding']:
-                score = calculate_cosine_similarity(
-                    search_vector, list(map(float, r['embedding'].split(',')))
-                )
-                if score > min_score:
-                    input_ids.append({'id': r['id'], 'score': score})
+            if not resp:
+                return []
 
-        if not input_ids:
-            return []
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_similarity_records, search_vector, resp, min_score
+            )
 
-        cypher = """
+            if not input_ids:
+                return []
+
+            cypher = """
             UNWIND $ids as i
             MATCH ()-[r]->()
             WHERE id(r) = i.id
@@ -354,14 +354,16 @@ class NeptuneSearchOperations(SearchOperations):
                 properties(r) AS attributes
             ORDER BY i.score DESC
             LIMIT $limit
-        """
-        records, _, _ = await executor.execute_query(
-            cypher,
-            ids=input_ids,
-            limit=limit,
-        )
+            """
+            records, _, _ = await executor.execute_query(
+                cypher,
+                ids=input_ids,
+                limit=limit,
+            )
 
-        return [entity_edge_from_record(r) for r in records]
+            return [entity_edge_from_record(r) for r in records]
+
+        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
 
     async def edge_bfs_search(
         self,
@@ -427,7 +429,7 @@ class NeptuneSearchOperations(SearchOperations):
         if self._driver is None:
             return []
         driver = self._driver
-        res = driver.run_aoss_query('episode_content', query, limit=limit)
+        res = await driver.run_aoss_query('episode_content', query, limit=limit)
         if not res or res.get('hits', {}).get('total', {}).get('value', 0) == 0:
             return []
 
@@ -471,7 +473,7 @@ class NeptuneSearchOperations(SearchOperations):
         if self._driver is None:
             return []
         driver = self._driver
-        res = driver.run_aoss_query('community_name', query, limit=limit)
+        res = await driver.run_aoss_query('community_name', query, limit=limit)
         if not res or res.get('hits', {}).get('total', {}).get('value', 0) == 0:
             return []
 
@@ -523,47 +525,46 @@ class NeptuneSearchOperations(SearchOperations):
             RETURN DISTINCT id(n) as id, n.name_embedding as embedding
             """
         )
-        resp, _, _ = await executor.execute_query(
-            query,
-            **query_params,
-        )
 
-        if not resp:
-            return []
+        async def execute_neptune_similarity_search() -> list[CommunityNode]:
+            resp, _, _ = await executor.execute_query(
+                query,
+                **query_params,
+            )
 
-        input_ids = []
-        for r in resp:
-            if r['embedding']:
-                score = calculate_cosine_similarity(
-                    search_vector, list(map(float, r['embedding'].split(',')))
-                )
-                if score > min_score:
-                    input_ids.append({'id': r['id'], 'score': score})
+            if not resp:
+                return []
 
-        if not input_ids:
-            return []
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_similarity_records, search_vector, resp, min_score
+            )
 
-        cypher = (
-            """
+            if not input_ids:
+                return []
+
+            cypher = (
+                """
             UNWIND $ids as i
             MATCH (n:Community)
             WHERE id(n)=i.id
             RETURN
         """
-            + COMMUNITY_NODE_RETURN_NEPTUNE
-            + """
+                + COMMUNITY_NODE_RETURN_NEPTUNE
+                + """
             ORDER BY i.score DESC
             LIMIT $limit
         """
-        )
+            )
 
-        records, _, _ = await executor.execute_query(
-            cypher,
-            ids=input_ids,
-            limit=limit,
-        )
+            records, _, _ = await executor.execute_query(
+                cypher,
+                ids=input_ids,
+                limit=limit,
+            )
 
-        return [community_node_from_record(r) for r in records]
+            return [community_node_from_record(r) for r in records]
+
+        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
 
     # --- Rerankers ---
 

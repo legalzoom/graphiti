@@ -19,12 +19,16 @@ import datetime
 import json
 import logging
 from collections.abc import Coroutine
+from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
+from functools import partial
 from typing import Any
 
 import boto3
 from botocore.config import Config
 from opensearchpy import OpenSearch, Urllib3AWSV4SignerAuth, Urllib3HttpConnection, helpers
 
+from graphiti_core.async_limiter import AsyncCapacityLease, AsyncCapacityLimiter
 from graphiti_core.driver.driver import GraphDriver, GraphDriverSession, GraphProvider
 from graphiti_core.driver.neptune.operations.community_edge_ops import (
     NeptuneCommunityEdgeOperations,
@@ -59,6 +63,33 @@ from graphiti_core.driver.operations.search_ops import SearchOperations
 
 logger = logging.getLogger(__name__)
 DEFAULT_SIZE = 10
+AOSS_QUERY_CONCURRENCY = 2
+MAX_AOSS_QUERY_SIZE = 1000
+
+# Keep AOSS reads off asyncio's default executor, which Neptune graph I/O also uses. Async
+# admission ensures bursts and cancelled waiters cannot create an unbounded executor backlog.
+_AOSS_QUERY_EXECUTOR = ThreadPoolExecutor(
+    max_workers=AOSS_QUERY_CONCURRENCY,
+    thread_name_prefix='graphiti-aoss-query',
+)
+_AOSS_QUERY_CAPACITY = AsyncCapacityLimiter(AOSS_QUERY_CONCURRENCY)
+
+
+def _finish_detached_aoss_query(future: Future[Any], lease: AsyncCapacityLease) -> None:
+    try:
+        if future.cancelled():
+            return
+        exception = future.exception()
+        if exception is not None:
+            logger.error('Detached AOSS query failed after caller cancellation', exc_info=exception)
+    finally:
+        lease.release()
+
+
+def _consume_aoss_wrapper_result(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
+
 
 # read_timeout is kept slightly above the default Neptune cluster
 # `neptune_query_timeout` (120s) so a slow-but-alive query gets a clean
@@ -411,13 +442,43 @@ class NeptuneDriver(GraphDriver):
             await self.delete_aoss_indices()
         await self.create_aoss_indices()
 
-    def run_aoss_query(self, name: str, query_text: str, limit: int = 10) -> dict[str, Any]:
+    async def run_aoss_query(self, name: str, query_text: str, limit: int = 10) -> dict[str, Any]:
         for index in aoss_indices:
             if name.lower() == index['index_name']:
-                index['query']['query']['multi_match']['query'] = query_text
-                query = {'size': limit, 'query': index['query']}
-                resp = self.aoss_client.search(body=query['query'], index=index['index_name'])
-                return resp
+                query = deepcopy(index['query'])
+                query['query']['multi_match']['query'] = query_text
+                query['size'] = max(0, min(limit, MAX_AOSS_QUERY_SIZE))
+                lease = await _AOSS_QUERY_CAPACITY.acquire()
+                loop = asyncio.get_running_loop()
+                try:
+                    thread_future = _AOSS_QUERY_EXECUTOR.submit(
+                        partial(
+                            self.aoss_client.search,
+                            body=query,
+                            index=index['index_name'],
+                        ),
+                    )
+                except BaseException:
+                    lease.release()
+                    raise
+                search_future = asyncio.wrap_future(thread_future, loop=loop)
+
+                # Cancelling the waiter cannot stop a running thread. The request is read-only and
+                # its body is per-call. Keep the slot until abandoned work actually finishes.
+                try:
+                    response = await asyncio.shield(search_future)
+                except asyncio.CancelledError:
+                    search_future.add_done_callback(_consume_aoss_wrapper_result)
+                    thread_future.add_done_callback(
+                        partial(_finish_detached_aoss_query, lease=lease)
+                    )
+                    raise
+                except BaseException:
+                    lease.release()
+                    raise
+                else:
+                    lease.release()
+                    return response
         return {}
 
     def save_to_aoss(self, name: str, data: list[dict]) -> int:
