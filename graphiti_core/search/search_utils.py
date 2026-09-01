@@ -18,7 +18,7 @@ import asyncio
 import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from time import time
 from typing import Any, TypeVar
 
@@ -26,7 +26,12 @@ import numpy as np
 from numpy._typing import NDArray
 from typing_extensions import LiteralString
 
-from graphiti_core.async_limiter import AsyncCapacityLease, AsyncCapacityLimiter
+from graphiti_core.async_limiter import (
+    AsyncCapacityLease,
+    AsyncCapacityLimiter,
+    capacity_lease_context,
+    current_capacity_lease,
+)
 from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
@@ -71,11 +76,15 @@ DEFAULT_MMR_LAMBDA = 0.5
 MAX_SEARCH_DEPTH = 3
 MAX_QUERY_LENGTH = 128
 NEPTUNE_SIMILARITY_CONCURRENCY = 2
+NEPTUNE_SIMILARITY_MAX_WAITERS = NEPTUNE_SIMILARITY_CONCURRENCY * 16
 T = TypeVar('T')
 
 # This cancellation-aware limiter is shared across event loops in the process. The scorer executor
 # is separate from asyncio's default executor, so CPU-heavy parsing cannot starve Neptune I/O.
-_NEPTUNE_SIMILARITY_CAPACITY = AsyncCapacityLimiter(NEPTUNE_SIMILARITY_CONCURRENCY)
+_NEPTUNE_SIMILARITY_CAPACITY = AsyncCapacityLimiter(
+    NEPTUNE_SIMILARITY_CONCURRENCY,
+    max_waiters=NEPTUNE_SIMILARITY_MAX_WAITERS,
+)
 _NEPTUNE_SIMILARITY_EXECUTOR = ThreadPoolExecutor(
     max_workers=NEPTUNE_SIMILARITY_CONCURRENCY,
     thread_name_prefix='graphiti-neptune-similarity',
@@ -87,7 +96,13 @@ async def _acquire_neptune_similarity_lease() -> AsyncCapacityLease:
     return await _NEPTUNE_SIMILARITY_CAPACITY.acquire()
 
 
-def _consume_background_result(future: asyncio.Future[Any]) -> None:
+def _consume_asyncio_result(future: asyncio.Future[Any]) -> None:
+    if future.cancelled():
+        return
+    future.exception()
+
+
+def _consume_background_result(future: asyncio.Future[Any] | Future[Any]) -> None:
     if future.cancelled():
         return
     exception = future.exception()
@@ -101,15 +116,17 @@ def _consume_background_result(future: asyncio.Future[Any]) -> None:
 async def run_neptune_similarity_pipeline(operation: Callable[[], Awaitable[T]]) -> T:
     """Run one Neptune search phase under bounded, cancellation-safe capacity.
 
-    Cancellation while queued never starts ``operation``. Once it starts, caller cancellation is
-    propagated immediately while the shielded task keeps its slot through fetch, scoring,
-    hydration, and model parsing. This also lets synchronous Neptune queries finish before release.
+    Cancellation while queued never starts ``operation``. Once it starts, caller cancellation
+    stops the coroutine before it can launch another phase. A synchronous query or scorer that is
+    already running retains the lease through its underlying thread future, even if the originating
+    event loop closes before that future completes.
     """
     lease = await _acquire_neptune_similarity_lease()
 
     async def run_and_release() -> T:
         try:
-            return await operation()
+            with capacity_lease_context(lease):
+                return await operation()
         finally:
             lease.release()
 
@@ -117,7 +134,19 @@ async def run_neptune_similarity_pipeline(operation: Callable[[], Awaitable[T]])
     try:
         return await asyncio.shield(operation_task)
     except asyncio.CancelledError:
-        operation_task.add_done_callback(_consume_background_result)
+        operation_task.cancel()
+        # Mark release before returning to the caller. If this event loop is closed immediately,
+        # the underlying concurrent future can still complete the deferred release itself.
+        lease.release()
+        try:
+            await operation_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            logger.error(
+                'Detached Neptune similarity work failed during cancellation',
+                exc_info=error,
+            )
         raise
 
 
@@ -126,11 +155,17 @@ async def run_neptune_similarity_scorer(
 ) -> list[dict[str, Any]]:
     """Run CPU-heavy parsing/scoring on the dedicated bounded executor."""
     loop = asyncio.get_running_loop()
-    scoring_future = loop.run_in_executor(_NEPTUNE_SIMILARITY_EXECUTOR, scorer, *args)
+    thread_future = _NEPTUNE_SIMILARITY_EXECUTOR.submit(scorer, *args)
+    lease = current_capacity_lease()
+    if lease is not None:
+        lease.hold_until_complete(thread_future)
+    scoring_future = asyncio.wrap_future(thread_future, loop=loop)
     try:
         return await asyncio.shield(scoring_future)
     except asyncio.CancelledError:
-        scoring_future.add_done_callback(_consume_background_result)
+        # The concurrent future owns the log/release path when the event loop is already gone.
+        thread_future.add_done_callback(_consume_background_result)
+        scoring_future.add_done_callback(_consume_asyncio_result)
         raise
 
 

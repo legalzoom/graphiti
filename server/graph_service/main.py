@@ -5,6 +5,7 @@ from importlib.metadata import version
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
+from graphiti_core.async_limiter import AsyncCapacityOverloadedError
 
 from graph_service.auth import (
     AUTHORIZER_STATE_ATTR,
@@ -90,6 +91,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(AsyncCapacityOverloadedError)
+async def async_capacity_overloaded(
+    _request: Request, error: AsyncCapacityOverloadedError
+) -> JSONResponse:
+    """Expose bounded search admission as transient backpressure to REST callers."""
+    return JSONResponse(
+        content={'detail': str(error)},
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        headers={'Retry-After': str(error.retry_after_seconds)},
+    )
 
 
 app.include_router(retrieve.router)

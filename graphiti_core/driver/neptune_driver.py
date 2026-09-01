@@ -28,7 +28,11 @@ import boto3
 from botocore.config import Config
 from opensearchpy import OpenSearch, Urllib3AWSV4SignerAuth, Urllib3HttpConnection, helpers
 
-from graphiti_core.async_limiter import AsyncCapacityLease, AsyncCapacityLimiter
+from graphiti_core.async_limiter import (
+    AsyncCapacityLease,
+    AsyncCapacityLimiter,
+    current_capacity_lease,
+)
 from graphiti_core.driver.driver import GraphDriver, GraphDriverSession, GraphProvider
 from graphiti_core.driver.neptune.operations.community_edge_ops import (
     NeptuneCommunityEdgeOperations,
@@ -64,6 +68,7 @@ from graphiti_core.driver.operations.search_ops import SearchOperations
 logger = logging.getLogger(__name__)
 DEFAULT_SIZE = 10
 AOSS_QUERY_CONCURRENCY = 2
+AOSS_QUERY_MAX_WAITERS = AOSS_QUERY_CONCURRENCY * 16
 MAX_AOSS_QUERY_SIZE = 1000
 
 # Keep AOSS reads off asyncio's default executor, which Neptune graph I/O also uses. Async
@@ -72,7 +77,19 @@ _AOSS_QUERY_EXECUTOR = ThreadPoolExecutor(
     max_workers=AOSS_QUERY_CONCURRENCY,
     thread_name_prefix='graphiti-aoss-query',
 )
-_AOSS_QUERY_CAPACITY = AsyncCapacityLimiter(AOSS_QUERY_CONCURRENCY)
+_AOSS_QUERY_CAPACITY = AsyncCapacityLimiter(
+    AOSS_QUERY_CONCURRENCY,
+    max_waiters=AOSS_QUERY_MAX_WAITERS,
+)
+
+# Only similarity pipelines with a bound capacity lease use this executor. Direct submission gives
+# us the concurrent.futures.Future needed to retain that lease independently of an event loop that
+# may close while the synchronous Neptune client is still running. Omitting max_workers is
+# intentional: the similarity admission limit (currently two pipelines) bounds submissions, and a
+# second independently configured concurrency limit could drift or deadlock admitted work.
+_NEPTUNE_SIMILARITY_QUERY_EXECUTOR = ThreadPoolExecutor(
+    thread_name_prefix='graphiti-neptune-similarity-query'
+)
 
 
 def _finish_detached_aoss_query(future: Future[Any], lease: AsyncCapacityLease) -> None:
@@ -89,6 +106,17 @@ def _finish_detached_aoss_query(future: Future[Any], lease: AsyncCapacityLease) 
 def _consume_aoss_wrapper_result(future: asyncio.Future[Any]) -> None:
     if not future.cancelled():
         future.exception()
+
+
+def _consume_detached_neptune_query(future: Future[Any]) -> None:
+    if future.cancelled():
+        return
+    exception = future.exception()
+    if exception is not None:
+        logger.error(
+            'Detached Neptune similarity query failed after caller cancellation',
+            exc_info=exception,
+        )
 
 
 # read_timeout is kept slightly above the default Neptune cluster
@@ -382,10 +410,29 @@ class NeptuneDriver(GraphDriver):
         if isinstance(cypher_query_, list):
             result: list[dict[str, Any]] = []
             for q in cypher_query_:
-                result, _, _ = await asyncio.to_thread(self._run_query, q[0], q[1])
+                result, _, _ = await self._execute_query_in_thread(q[0], q[1])
             return result, None, None
         else:
+            return await self._execute_query_in_thread(cypher_query_, params)
+
+    async def _execute_query_in_thread(
+        self, cypher_query_: str, params: Any
+    ) -> tuple[list[dict[str, Any]], None, None]:
+        lease = current_capacity_lease()
+        if lease is None:
             return await asyncio.to_thread(self._run_query, cypher_query_, params)
+
+        loop = asyncio.get_running_loop()
+        thread_future = _NEPTUNE_SIMILARITY_QUERY_EXECUTOR.submit(
+            self._run_query, cypher_query_, params
+        )
+        lease.hold_until_complete(thread_future)
+        query_future = asyncio.wrap_future(thread_future, loop=loop)
+        try:
+            return await query_future
+        except asyncio.CancelledError:
+            thread_future.add_done_callback(_consume_detached_neptune_query)
+            raise
 
     def _run_query(self, cypher_query_, params):
         cypher_query_ = str(self._sanitize_parameters(cypher_query_, params))
