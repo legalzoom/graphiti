@@ -181,6 +181,24 @@ def test_lz_jwt_mode_does_not_require_legacy_identity_secrets():
     assert settings.opr_writer_fleet_epoch.get_secret_value() == FLEET_EPOCH
 
 
+@pytest.mark.parametrize(
+    'field',
+    [
+        'opr_read_token',
+        'opr_write_token',
+        'opr_reconciliation_token',
+        'opr_retirement_token',
+        'graphiti_admin_token',
+    ],
+)
+def test_lz_jwt_mode_ignores_short_legacy_identity_secrets(field: str):
+    legacy_secret = 'short-legacy-secret'
+
+    settings = _settings(**{field: legacy_secret})
+
+    assert getattr(settings, field).get_secret_value() == legacy_secret
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('permission', 'scope'),

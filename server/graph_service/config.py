@@ -1,12 +1,13 @@
 import hmac
 import re
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Depends
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict  # type: ignore
 
 from graph_service.protocol import is_http_token68
@@ -23,6 +24,11 @@ _MIN_PRIVILEGED_SECRET_BYTES = 32
 _OAUTH_SCOPE_TOKEN = re.compile(r'[\x21\x23-\x5B\x5D-\x7E]+', re.ASCII)
 _CLIENT_ID_TOKEN = re.compile(r'[\x21-\x2B\x2D-\x7E]+', re.ASCII)
 MAX_INGEST_DRAIN_TIMEOUT_SECONDS = 15.0
+_OPR_DEV_LEGACY_AUTH_COMPATIBILITY_MAX_DAYS = 14
+
+
+def utc_today() -> date:
+    return datetime.now(timezone.utc).date()
 
 
 class OprAuthMode(str, Enum):
@@ -52,6 +58,12 @@ class Settings(BaseSettings):
     # Keeping the default false preserves the upstream graph service for users
     # that never address the OPR-owned group.
     opr_auth_required: bool = False
+    # Temporary incident bridge for the REST service in DEV only. This is a
+    # separate, expiring switch so OPR_AUTH_REQUIRED keeps its existing
+    # fail-closed runtime meaning.
+    graphiti_deployment_environment: str = ''
+    opr_dev_legacy_auth_compatibility_enabled: bool = False
+    opr_dev_legacy_auth_compatibility_remove_by: date | None = None
     # Static remains the default so upstream and existing deployments preserve
     # their current behavior. A deployment must opt in explicitly before any
     # request is interpreted as an LZ Authorization Service access token.
@@ -98,6 +110,51 @@ class Settings(BaseSettings):
         hide_input_in_errors=True,
     )
 
+    @field_validator('opr_dev_legacy_auth_compatibility_remove_by', mode='before')
+    @classmethod
+    def normalize_blank_legacy_compatibility_remove_by(cls, value: object) -> object:
+        # Empty environment values are how the disabled switch is represented
+        # in the example config. Treat only the exact empty string as unset;
+        # malformed non-empty dates must still fail validation.
+        return None if value == '' else value
+
+    @model_validator(mode='after')
+    def validate_dev_legacy_auth_compatibility(self):
+        if not self.opr_dev_legacy_auth_compatibility_enabled:
+            return self
+
+        if self.graphiti_deployment_environment != 'dev':
+            raise ValueError(
+                'OPR_DEV_LEGACY_AUTH_COMPATIBILITY_ENABLED=true requires '
+                'GRAPHITI_DEPLOYMENT_ENVIRONMENT=dev'
+            )
+        if self.opr_auth_required:
+            raise ValueError(
+                'OPR_DEV_LEGACY_AUTH_COMPATIBILITY_ENABLED=true requires OPR_AUTH_REQUIRED=false'
+            )
+        if self.opr_auth_mode is not OprAuthMode.STATIC:
+            raise ValueError(
+                'OPR_DEV_LEGACY_AUTH_COMPATIBILITY_ENABLED=true is only valid with '
+                'OPR_AUTH_MODE=static'
+            )
+
+        remove_by = self.opr_dev_legacy_auth_compatibility_remove_by
+        if remove_by is None:
+            raise ValueError(
+                'OPR_DEV_LEGACY_AUTH_COMPATIBILITY_ENABLED=true requires '
+                'OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY'
+            )
+
+        today = utc_today()
+        if remove_by <= today:
+            raise ValueError('OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY must be a future date')
+        if remove_by > today + timedelta(days=_OPR_DEV_LEGACY_AUTH_COMPATIBILITY_MAX_DAYS):
+            raise ValueError(
+                'OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY must be no more than '
+                f'{_OPR_DEV_LEGACY_AUTH_COMPATIBILITY_MAX_DAYS} days from startup'
+            )
+        return self
+
     @model_validator(mode='after')
     def require_distinct_privileged_tokens(self):
         secrets = {
@@ -128,28 +185,28 @@ class Settings(BaseSettings):
                 + ', '.join(invalid_for_http)
             )
 
-        if self.opr_auth_required and self.opr_auth_mode is OprAuthMode.STATIC:
-            too_short = [
-                name
-                for name in _PRIVILEGED_SECRET_NAMES
-                if len(secrets[name].encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
-            ]
-            if too_short:
-                raise ValueError(
-                    'OPR_AUTH_REQUIRED=true requires privileged values of at least '
-                    f'{_MIN_PRIVILEGED_SECRET_BYTES} bytes: ' + ', '.join(too_short)
-                )
-
-        # Preserve the pre-existing safety check for deployments that opt in
-        # to the writer epoch without enabling the complete OPR auth profile.
-        writer_fleet_epoch = secrets['OPR_WRITER_FLEET_EPOCH']
-        if (
-            writer_fleet_epoch
-            and len(writer_fleet_epoch.encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
-        ):
+        # The writer epoch is always an active rollout fence and retains its
+        # universal minimum. Apply the identity-token minimum only to required
+        # static profiles and the temporary DEV bridge. This preserves legacy
+        # optional static configs and lets JWT migrations carry ignored legacy
+        # identity values.
+        enforce_static_identity_minimum = self.opr_auth_mode is OprAuthMode.STATIC and (
+            self.opr_auth_required or self.opr_dev_legacy_auth_compatibility_enabled
+        )
+        too_short = [
+            name
+            for name in _PRIVILEGED_SECRET_NAMES
+            if secrets[name]
+            and len(secrets[name].encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
+            and (name == 'OPR_WRITER_FLEET_EPOCH' or enforce_static_identity_minimum)
+        ]
+        if too_short:
             raise ValueError(
-                f'OPR_WRITER_FLEET_EPOCH must be at least {_MIN_PRIVILEGED_SECRET_BYTES} bytes'
+                'configured privileged values must be at least '
+                f'{_MIN_PRIVILEGED_SECRET_BYTES} bytes: ' + ', '.join(too_short)
             )
+
+        writer_fleet_epoch = secrets['OPR_WRITER_FLEET_EPOCH']
 
         if self.opr_auth_mode is OprAuthMode.LZ_JWT:
             if not self.opr_auth_required:

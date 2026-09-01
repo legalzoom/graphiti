@@ -82,6 +82,34 @@ Only stable releases are built automatically (pre-release versions are skipped).
 The OPR-owned graph group (`group_id=opr`) supports two explicit authentication modes. There is no
 credential fallback between them.
 
+### Temporary DEV legacy compatibility bridge
+
+The REST service has a narrowly scoped incident bridge for rolling DEV forward before its OPR
+callers have migrated credentials. It is disabled by default and must never be enabled in shared
+configuration consumed by the MCP server. Enable it only on the DEV REST container with all three
+values:
+
+```text
+GRAPHITI_DEPLOYMENT_ENVIRONMENT=dev
+OPR_DEV_LEGACY_AUTH_COMPATIBILITY_ENABLED=true
+OPR_DEV_LEGACY_AUTH_COMPATIBILITY_REMOVE_BY=<future YYYY-MM-DD, at most 14 days away>
+```
+
+Startup fails unless the environment is exactly `dev`, `OPR_AUTH_REQUIRED=false`, static auth mode
+is selected, and the removal date is future-dated but no more than 14 days away. A restart after the
+date refuses the stale bridge. A pod that remains running stops bypassing identity checks at the
+start of the removal date and falls through to normal authorization; this does not change pod
+readiness. Startup and first-use warnings expose the bridge and its deadline.
+
+While active, only OPR read, write, reconciliation, and retirement caller-identity checks whose
+static credential is still empty are bypassed. After configuring a credential, roll or restart
+every Graphiti REST pod; enforcement begins only in processes that loaded the new environment, and
+the rollout is incomplete until all older pods have terminated. Administrative authorization and
+every writer-fleet epoch, group, operation, receipt, and domain-level fence remain enforced. Every
+non-empty privileged value must still be HTTP-safe, distinct, and at least 32 bytes, even when the
+bridge is active. Remove the bridge after DEV callers send their intended static or LZ JWT
+credentials; it is not a third authentication mode.
+
 ### Static compatibility mode
 
 `OPR_AUTH_MODE=static` is the default and preserves the legacy deployment contract. When

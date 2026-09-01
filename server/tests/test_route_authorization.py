@@ -160,6 +160,30 @@ def test_non_opr_deployment_does_not_require_opr_credentials():
 
 
 @pytest.mark.parametrize(
+    'field',
+    [
+        'opr_read_token',
+        'opr_write_token',
+        'opr_reconciliation_token',
+        'opr_retirement_token',
+        'graphiti_admin_token',
+    ],
+)
+def test_optional_static_profile_preserves_legacy_identity_secret_lengths(field: str):
+    legacy_secret = 'short-legacy-secret'
+
+    settings = Settings.model_validate(
+        {
+            'openai_api_key': 'test',
+            'ingest_queue_maxsize': 1000,
+            field: legacy_secret,
+        }
+    )
+
+    assert getattr(settings, field).get_secret_value() == legacy_secret
+
+
+@pytest.mark.parametrize(
     'missing_field',
     [
         'opr_read_token',
