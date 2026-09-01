@@ -248,6 +248,74 @@ class TestNeptuneDriverAsyncBoundary:
         assert driver.aoss_client.search.call_args.kwargs['body']['size'] == MAX_AOSS_QUERY_SIZE
 
     @pytest.mark.asyncio
+    async def test_awaited_aoss_failure_releases_capacity_for_replacement(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.aoss_client = MagicMock()
+        capacity = AsyncCapacityLimiter(1, max_waiters=1)
+
+        def search(*, body, index):
+            query_text = body['query']['multi_match']['query']
+            if query_text == 'failed':
+                raise RuntimeError('expected search failure')
+            return {'query': query_text, 'index': index}
+
+        driver.aoss_client.search.side_effect = search
+        index_template = {
+            'index_name': 'node_name_and_summary',
+            'query': {
+                'query': {'multi_match': {'query': '', 'fields': ['name']}},
+                'size': 10,
+            },
+        }
+
+        with (
+            patch.object(neptune_driver_module, '_AOSS_QUERY_CAPACITY', capacity),
+            patch('graphiti_core.driver.neptune_driver.aoss_indices', [index_template]),
+        ):
+            with pytest.raises(RuntimeError, match='expected search failure'):
+                await driver.run_aoss_query('node_name_and_summary', 'failed')
+
+            result = await asyncio.wait_for(
+                driver.run_aoss_query('node_name_and_summary', 'replacement'), timeout=1
+            )
+
+        assert result == {'query': 'replacement', 'index': 'node_name_and_summary'}
+
+    @pytest.mark.asyncio
+    async def test_aoss_submit_failure_releases_capacity_for_replacement(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.aoss_client = MagicMock()
+        driver.aoss_client.search.return_value = {'ok': True}
+        capacity = AsyncCapacityLimiter(1, max_waiters=1)
+        index_template = {
+            'index_name': 'node_name_and_summary',
+            'query': {
+                'query': {'multi_match': {'query': '', 'fields': ['name']}},
+                'size': 10,
+            },
+        }
+
+        with (
+            patch.object(neptune_driver_module, '_AOSS_QUERY_CAPACITY', capacity),
+            patch('graphiti_core.driver.neptune_driver.aoss_indices', [index_template]),
+        ):
+            with (
+                patch.object(
+                    neptune_driver_module._AOSS_QUERY_EXECUTOR,
+                    'submit',
+                    side_effect=RuntimeError('expected submit failure'),
+                ),
+                pytest.raises(RuntimeError, match='expected submit failure'),
+            ):
+                await driver.run_aoss_query('node_name_and_summary', 'failed')
+
+            result = await asyncio.wait_for(
+                driver.run_aoss_query('node_name_and_summary', 'replacement'), timeout=1
+            )
+
+        assert result == {'ok': True}
+
+    @pytest.mark.asyncio
     async def test_aoss_cancellation_holds_capacity_until_worker_finishes(self):
         driver = object.__new__(NeptuneDriver)
         driver.aoss_client = MagicMock()
@@ -502,42 +570,74 @@ class TestNeptuneSimilarityCapacity:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     @pytest.mark.asyncio
-    async def test_cancel_during_fetch_holds_capacity_until_pipeline_finishes(self):
-        started = [asyncio.Event() for _ in range(3)]
-        release = [asyncio.Event() for _ in range(3)]
-        finished = [asyncio.Event() for _ in range(3)]
+    async def test_cancel_during_fetch_holds_capacity_and_skips_later_phases(self, monkeypatch):
+        capacity = AsyncCapacityLimiter(1, max_waiters=1)
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+        fetch_finished = threading.Event()
+        scorer_called = threading.Event()
+        hydration_called = threading.Event()
+        replacement_started = asyncio.Event()
+        release_replacement = asyncio.Event()
+        query_count = 0
 
-        async def operation(index):
-            started[index].set()
-            try:
-                await release[index].wait()
-                return index
-            finally:
-                finished[index].set()
+        def run_query(query, params):
+            nonlocal query_count
+            query_count += 1
+            if query_count == 1:
+                fetch_started.set()
+                release_fetch.wait(timeout=2)
+                fetch_finished.set()
+                return ([{'id': 7, 'embedding': '1.0,0.0'}], None, None)
+            hydration_called.set()
+            return ([{'uuid': 'hydrated'}], None, None)
 
-        first = asyncio.create_task(run_neptune_similarity_pipeline(lambda: operation(0)))
-        second = asyncio.create_task(run_neptune_similarity_pipeline(lambda: operation(1)))
-        third = None
+        def scorer(*args):
+            scorer_called.set()
+            return [{'id': 7, 'score': 1.0}]
+
+        async def replacement_operation():
+            replacement_started.set()
+            await release_replacement.wait()
+
+        driver = object.__new__(NeptuneDriver)
+        driver._run_query = run_query
+        monkeypatch.setattr(search_utils, '_NEPTUNE_SIMILARITY_CAPACITY', capacity)
+        monkeypatch.setattr(neptune_search_ops, 'score_neptune_similarity_records', scorer)
+
+        search_task = asyncio.create_task(
+            NeptuneSearchOperations().node_similarity_search(
+                driver,
+                [1.0, 0.0],
+                SearchFilters(),
+            )
+        )
+        replacement = None
         try:
-            await asyncio.wait_for(asyncio.gather(started[0].wait(), started[1].wait()), 1)
-            third = asyncio.create_task(run_neptune_similarity_pipeline(lambda: operation(2)))
-            await asyncio.sleep(0)
-
-            first.cancel()
+            assert await asyncio.to_thread(fetch_started.wait, 1)
+            search_task.cancel()
             with pytest.raises(asyncio.CancelledError):
-                await first
-            await asyncio.sleep(0)
-            assert not started[2].is_set()
+                await search_task
 
-            release[0].set()
-            await asyncio.wait_for(finished[0].wait(), 1)
-            await asyncio.wait_for(started[2].wait(), 1)
+            replacement = asyncio.create_task(
+                run_neptune_similarity_pipeline(replacement_operation)
+            )
+            await asyncio.sleep(0)
+            assert not replacement_started.is_set()
+
+            release_fetch.set()
+            assert await asyncio.to_thread(fetch_finished.wait, 1)
+            await asyncio.wait_for(replacement_started.wait(), 1)
+            assert not scorer_called.is_set()
+            assert not hydration_called.is_set()
         finally:
-            for event in release:
-                event.set()
-            remaining = [second]
-            if third is not None:
-                remaining.append(third)
+            release_fetch.set()
+            release_replacement.set()
+            remaining = []
+            if not search_task.done():
+                remaining.append(search_task)
+            if replacement is not None:
+                remaining.append(replacement)
             await asyncio.gather(*remaining, return_exceptions=True)
 
     @pytest.mark.asyncio
@@ -594,6 +694,143 @@ class TestNeptuneSimilarityCapacity:
             if third is not None:
                 remaining.append(third)
             await asyncio.gather(*remaining, return_exceptions=True)
+
+    def test_cancelled_scorer_releases_capacity_after_origin_loop_closes(self):
+        capacity = AsyncCapacityLimiter(1, max_waiters=1)
+        scorer_started = threading.Event()
+        release_scorer = threading.Event()
+        scorer_finished = threading.Event()
+        replacement_started = threading.Event()
+        replacement_results: list[str] = []
+        replacement_errors: list[BaseException] = []
+        origin_loop = asyncio.new_event_loop()
+
+        def scorer():
+            scorer_started.set()
+            release_scorer.wait(timeout=2)
+            scorer_finished.set()
+            return []
+
+        async def score_operation():
+            return await run_neptune_similarity_scorer(scorer)
+
+        async def cancel_after_start():
+            task = asyncio.create_task(run_neptune_similarity_pipeline(score_operation))
+            deadline = asyncio.get_running_loop().time() + 1
+            while not scorer_started.is_set():
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError('similarity scorer did not start')
+                await asyncio.sleep(0.001)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        async def replacement_operation():
+            replacement_started.set()
+            return 'replacement'
+
+        def run_replacement():
+            try:
+                replacement_results.append(
+                    asyncio.run(run_neptune_similarity_pipeline(replacement_operation))
+                )
+            except BaseException as error:
+                replacement_errors.append(error)
+
+        replacement_thread = threading.Thread(target=run_replacement)
+        try:
+            with patch.object(search_utils, '_NEPTUNE_SIMILARITY_CAPACITY', capacity):
+                origin_loop.run_until_complete(cancel_after_start())
+                assert not scorer_finished.is_set()
+                origin_loop.close()
+
+                replacement_thread.start()
+                assert not replacement_started.wait(timeout=0.05)
+
+                release_scorer.set()
+                assert scorer_finished.wait(timeout=1)
+                assert replacement_started.wait(timeout=1)
+                replacement_thread.join(timeout=1)
+
+            assert not replacement_thread.is_alive()
+            assert replacement_results == ['replacement']
+            assert not replacement_errors
+        finally:
+            release_scorer.set()
+            if not origin_loop.is_closed():
+                origin_loop.close()
+            if replacement_thread.ident is not None:
+                replacement_thread.join(timeout=1)
+
+    def test_cancelled_query_releases_capacity_after_origin_loop_closes(self):
+        capacity = AsyncCapacityLimiter(1, max_waiters=1)
+        query_started = threading.Event()
+        release_query = threading.Event()
+        query_finished = threading.Event()
+        replacement_started = threading.Event()
+        replacement_results: list[str] = []
+        replacement_errors: list[BaseException] = []
+        origin_loop = asyncio.new_event_loop()
+
+        def run_query(query, params):
+            query_started.set()
+            release_query.wait(timeout=2)
+            query_finished.set()
+            return ([{'ok': True}], None, None)
+
+        driver = object.__new__(NeptuneDriver)
+        driver._run_query = run_query
+
+        async def query_operation():
+            return await driver.execute_query('RETURN 1')
+
+        async def cancel_after_start():
+            task = asyncio.create_task(run_neptune_similarity_pipeline(query_operation))
+            deadline = asyncio.get_running_loop().time() + 1
+            while not query_started.is_set():
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError('Neptune query did not start')
+                await asyncio.sleep(0.001)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        async def replacement_operation():
+            replacement_started.set()
+            return 'replacement'
+
+        def run_replacement():
+            try:
+                replacement_results.append(
+                    asyncio.run(run_neptune_similarity_pipeline(replacement_operation))
+                )
+            except BaseException as error:
+                replacement_errors.append(error)
+
+        replacement_thread = threading.Thread(target=run_replacement)
+        try:
+            with patch.object(search_utils, '_NEPTUNE_SIMILARITY_CAPACITY', capacity):
+                origin_loop.run_until_complete(cancel_after_start())
+                assert not query_finished.is_set()
+                origin_loop.close()
+
+                replacement_thread.start()
+                assert not replacement_started.wait(timeout=0.05)
+
+                release_query.set()
+                assert query_finished.wait(timeout=1)
+                assert replacement_started.wait(timeout=1)
+                replacement_thread.join(timeout=1)
+
+            assert not replacement_thread.is_alive()
+            assert replacement_results == ['replacement']
+            assert not replacement_errors
+        finally:
+            release_query.set()
+            if not origin_loop.is_closed():
+                origin_loop.close()
+            if replacement_thread.ident is not None:
+                replacement_thread.join(timeout=1)
 
     @pytest.mark.asyncio
     async def test_cancelled_queued_acquisition_does_not_leak_capacity(self):
@@ -657,21 +894,23 @@ class TestNeptuneSimilarityCapacity:
 
     @pytest.mark.asyncio
     async def test_direct_neptune_search_holds_capacity_through_hydration(self, monkeypatch):
-        hydration_started = asyncio.Event()
-        release_hydration = asyncio.Event()
+        capacity = AsyncCapacityLimiter(2, max_waiters=2)
+        hydration_started = threading.Event()
+        release_hydration = threading.Event()
         holder_started = asyncio.Event()
         release_holder = asyncio.Event()
         third_started = asyncio.Event()
         release_third = asyncio.Event()
+        parser_called = threading.Event()
         query_count = 0
 
-        async def execute_query(query, **kwargs):
+        def run_query(query, params):
             nonlocal query_count
             query_count += 1
             if query_count == 1:
                 return ([{'id': 7, 'embedding': '1.0,0.0'}], None, None)
             hydration_started.set()
-            await release_hydration.wait()
+            release_hydration.wait(timeout=2)
             return ([{'uuid': 'hydrated'}], None, None)
 
         async def held_operation(started, release):
@@ -683,13 +922,18 @@ class TestNeptuneSimilarityCapacity:
             'score_neptune_similarity_records',
             lambda search_vector, records, min_score: [{'id': 7, 'score': 1.0}],
         )
-        monkeypatch.setattr(neptune_search_ops, 'entity_node_from_record', lambda record: record)
-        executor = MagicMock()
-        executor.execute_query = execute_query
+        monkeypatch.setattr(search_utils, '_NEPTUNE_SIMILARITY_CAPACITY', capacity)
+        monkeypatch.setattr(
+            neptune_search_ops,
+            'entity_node_from_record',
+            lambda record: parser_called.set() or record,
+        )
+        driver = object.__new__(NeptuneDriver)
+        driver._run_query = run_query
 
         search_task = asyncio.create_task(
             NeptuneSearchOperations().node_similarity_search(
-                executor,
+                driver,
                 [1.0, 0.0],
                 SearchFilters(),
             )
@@ -697,7 +941,7 @@ class TestNeptuneSimilarityCapacity:
         holder_task = None
         third_task = None
         try:
-            await asyncio.wait_for(hydration_started.wait(), 1)
+            assert await asyncio.to_thread(hydration_started.wait, 1)
             holder_task = asyncio.create_task(
                 run_neptune_similarity_pipeline(
                     lambda: held_operation(holder_started, release_holder)
@@ -718,6 +962,7 @@ class TestNeptuneSimilarityCapacity:
 
             release_hydration.set()
             await asyncio.wait_for(third_started.wait(), 1)
+            assert not parser_called.is_set()
         finally:
             release_hydration.set()
             release_holder.set()
