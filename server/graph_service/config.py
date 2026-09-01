@@ -185,28 +185,22 @@ class Settings(BaseSettings):
                 + ', '.join(invalid_for_http)
             )
 
-        if self.opr_auth_required and self.opr_auth_mode is OprAuthMode.STATIC:
-            too_short = [
-                name
-                for name in _PRIVILEGED_SECRET_NAMES
-                if len(secrets[name].encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
-            ]
-            if too_short:
-                raise ValueError(
-                    'OPR_AUTH_REQUIRED=true requires privileged values of at least '
-                    f'{_MIN_PRIVILEGED_SECRET_BYTES} bytes: ' + ', '.join(too_short)
-                )
-
-        # Preserve the pre-existing safety check for deployments that opt in
-        # to the writer epoch without enabling the complete OPR auth profile.
-        writer_fleet_epoch = secrets['OPR_WRITER_FLEET_EPOCH']
-        if (
-            writer_fleet_epoch
-            and len(writer_fleet_epoch.encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
-        ):
+        # Any configured privileged value is active even when the complete
+        # OPR auth profile is disabled. Keep empty values available to the
+        # temporary DEV compatibility bridge, but never admit a weak active
+        # credential (including the admin token or writer epoch).
+        too_short = [
+            name
+            for name in _PRIVILEGED_SECRET_NAMES
+            if secrets[name] and len(secrets[name].encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
+        ]
+        if too_short:
             raise ValueError(
-                f'OPR_WRITER_FLEET_EPOCH must be at least {_MIN_PRIVILEGED_SECRET_BYTES} bytes'
+                'configured privileged values must be at least '
+                f'{_MIN_PRIVILEGED_SECRET_BYTES} bytes: ' + ', '.join(too_short)
             )
+
+        writer_fleet_epoch = secrets['OPR_WRITER_FLEET_EPOCH']
 
         if self.opr_auth_mode is OprAuthMode.LZ_JWT:
             if not self.opr_auth_required:

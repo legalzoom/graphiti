@@ -33,6 +33,10 @@ from graph_service.zep_graphiti import ZepGraphiti
 TODAY = date(2026, 9, 1)
 REMOVE_BY = TODAY + timedelta(days=7)
 WRITER_FLEET_EPOCH = 'writer-fleet-epoch-' + ('e' * 32)
+READ_TOKEN = 'configured-read-token-' + ('r' * 32)
+WRITE_TOKEN = 'configured-write-token-' + ('w' * 32)
+RECONCILIATION_TOKEN = 'configured-reconcile-token-' + ('c' * 32)
+RETIREMENT_TOKEN = 'configured-retirement-token-' + ('t' * 32)
 
 
 def _settings_values(**overrides) -> dict:
@@ -285,30 +289,30 @@ async def test_legacy_compatibility_never_bypasses_admin(
         (
             Permission.READ,
             'opr_read_token',
-            'configured-read-token',
-            'Bearer configured-read-token',
+            READ_TOKEN,
+            f'Bearer {READ_TOKEN}',
             None,
         ),
         (
             Permission.WRITE,
             'opr_write_token',
-            'configured-write-token',
-            'Bearer configured-write-token',
+            WRITE_TOKEN,
+            f'Bearer {WRITE_TOKEN}',
             None,
         ),
         (
             Permission.RECONCILE,
             'opr_reconciliation_token',
-            'configured-reconcile-token',
+            RECONCILIATION_TOKEN,
             None,
-            'configured-reconcile-token',
+            RECONCILIATION_TOKEN,
         ),
         (
             Permission.RETIRE,
             'opr_retirement_token',
-            'configured-retirement-token',
+            RETIREMENT_TOKEN,
             None,
-            'configured-retirement-token',
+            RETIREMENT_TOKEN,
         ),
     ],
 )
@@ -328,6 +332,32 @@ async def test_legacy_compatibility_enforces_each_configured_credential(
     assert exc_info.value.status_code == 403
 
     await authorizer.require(permission, authorization, legacy_token=legacy_token)
+
+
+@pytest.mark.parametrize(
+    'setting_name',
+    [
+        'opr_read_token',
+        'opr_write_token',
+        'opr_reconciliation_token',
+        'opr_retirement_token',
+        'opr_writer_fleet_epoch',
+        'graphiti_admin_token',
+    ],
+)
+def test_legacy_compatibility_rejects_each_short_non_empty_privileged_value(
+    monkeypatch: pytest.MonkeyPatch,
+    setting_name: str,
+):
+    sentinel = 'short-active-secret'
+
+    with pytest.raises(
+        ValueError,
+        match='configured privileged values must be at least 32 bytes',
+    ) as exc_info:
+        _settings(monkeypatch, **{setting_name: sentinel})
+
+    assert sentinel not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
