@@ -14,15 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import asyncio
 import logging
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from time import time
-from typing import Any
+from typing import Any, TypeVar
 
 import numpy as np
 from numpy._typing import NDArray
 from typing_extensions import LiteralString
 
+from graphiti_core.async_limiter import AsyncCapacityLease, AsyncCapacityLimiter
 from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
@@ -66,6 +70,68 @@ DEFAULT_MIN_SCORE = 0.6
 DEFAULT_MMR_LAMBDA = 0.5
 MAX_SEARCH_DEPTH = 3
 MAX_QUERY_LENGTH = 128
+NEPTUNE_SIMILARITY_CONCURRENCY = 2
+T = TypeVar('T')
+
+# This cancellation-aware limiter is shared across event loops in the process. The scorer executor
+# is separate from asyncio's default executor, so CPU-heavy parsing cannot starve Neptune I/O.
+_NEPTUNE_SIMILARITY_CAPACITY = AsyncCapacityLimiter(NEPTUNE_SIMILARITY_CONCURRENCY)
+_NEPTUNE_SIMILARITY_EXECUTOR = ThreadPoolExecutor(
+    max_workers=NEPTUNE_SIMILARITY_CONCURRENCY,
+    thread_name_prefix='graphiti-neptune-similarity',
+)
+
+
+async def _acquire_neptune_similarity_lease() -> AsyncCapacityLease:
+    """Acquire bounded capacity with cancellation-removable async admission."""
+    return await _NEPTUNE_SIMILARITY_CAPACITY.acquire()
+
+
+def _consume_background_result(future: asyncio.Future[Any]) -> None:
+    if future.cancelled():
+        return
+    exception = future.exception()
+    if exception is not None:
+        logger.error(
+            'Detached Neptune similarity work failed after caller cancellation',
+            exc_info=exception,
+        )
+
+
+async def run_neptune_similarity_pipeline(operation: Callable[[], Awaitable[T]]) -> T:
+    """Run one Neptune search phase under bounded, cancellation-safe capacity.
+
+    Cancellation while queued never starts ``operation``. Once it starts, caller cancellation is
+    propagated immediately while the shielded task keeps its slot through fetch, scoring,
+    hydration, and model parsing. This also lets synchronous Neptune queries finish before release.
+    """
+    lease = await _acquire_neptune_similarity_lease()
+
+    async def run_and_release() -> T:
+        try:
+            return await operation()
+        finally:
+            lease.release()
+
+    operation_task = asyncio.create_task(run_and_release())
+    try:
+        return await asyncio.shield(operation_task)
+    except asyncio.CancelledError:
+        operation_task.add_done_callback(_consume_background_result)
+        raise
+
+
+async def run_neptune_similarity_scorer(
+    scorer: Callable[..., list[dict[str, Any]]], *args: Any
+) -> list[dict[str, Any]]:
+    """Run CPU-heavy parsing/scoring on the dedicated bounded executor."""
+    loop = asyncio.get_running_loop()
+    scoring_future = loop.run_in_executor(_NEPTUNE_SIMILARITY_EXECUTOR, scorer, *args)
+    try:
+        return await asyncio.shield(scoring_future)
+    except asyncio.CancelledError:
+        scoring_future.add_done_callback(_consume_background_result)
+        raise
 
 
 def calculate_cosine_similarity(vector1: list[float], vector2: list[float]) -> float:
@@ -80,6 +146,66 @@ def calculate_cosine_similarity(vector1: list[float], vector2: list[float]) -> f
         return 0  # Handle cases where one or both vectors are zero vectors
 
     return dot_product / (norm_vector1 * norm_vector2)
+
+
+def score_neptune_similarity_records(
+    search_vector: list[float],
+    records: list[dict[str, Any]],
+    min_score: float,
+) -> list[dict[str, Any]]:
+    """Parse and score Neptune embeddings without mutating the input records.
+
+    Executor cancellation does not stop a running worker, so this helper deliberately only reads
+    its inputs and builds a new result list.
+    """
+    search_array = np.asarray(search_vector, dtype=np.float64)
+    search_norm = np.linalg.norm(search_array)
+    scored_records: list[dict[str, Any]] = []
+    for record in records:
+        embedding = record['embedding']
+        if not embedding:
+            continue
+
+        # NumPy performs the conversion in C while split keeps malformed tokens fail-fast, matching
+        # the previous float-per-token behavior without rebuilding a Python float list.
+        parsed_embedding = np.asarray(embedding.split(','), dtype=np.float64)
+        if parsed_embedding.size != search_array.size:
+            raise ValueError(
+                f'Neptune embedding {record["id"]!r} has dimension '
+                f'{parsed_embedding.size}; expected {search_array.size}'
+            )
+        embedding_norm = np.linalg.norm(parsed_embedding)
+        score = (
+            0
+            if search_norm == 0 or embedding_norm == 0
+            else np.dot(search_array, parsed_embedding) / (search_norm * embedding_norm)
+        )
+        if score > min_score:
+            scored_records.append({'id': record['id'], 'score': score})
+
+    return scored_records
+
+
+def score_neptune_edge_match_records(
+    records: list[dict[str, Any]], min_score: float
+) -> list[dict[str, Any]]:
+    """Score Neptune edge matches in a cancellation-safe worker helper."""
+    scored_records: list[dict[str, Any]] = []
+    for record in records:
+        score = calculate_cosine_similarity(
+            list(map(float, record['source_embedding'].split(','))),
+            record['target_embedding'],
+        )
+        if score > min_score:
+            scored_records.append(
+                {
+                    'id': record['id'],
+                    'score': score,
+                    'uuid': record['search_edge_uuid'],
+                }
+            )
+
+    return scored_records
 
 
 def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver):
@@ -223,7 +349,9 @@ async def edge_fulltext_search(
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
     if driver.provider == GraphProvider.NEPTUNE:
-        res = driver.run_aoss_query('edge_name_and_fact', query)  # pyright: ignore reportAttributeAccessIssue
+        res = await driver.run_aoss_query(  # pyright: ignore reportAttributeAccessIssue
+            'edge_name_and_fact', query, limit=limit
+        )
         if res['hits']['total']['value'] > 0:
             input_ids = []
             for r in res['hits']['hits']:
@@ -343,36 +471,32 @@ async def edge_similarity_search(
         search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
 
     if driver.provider == GraphProvider.NEPTUNE:
-        query = (
-            """
-                            MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-                            """
-            + filter_query
-            + """
-            RETURN DISTINCT id(e) as id, e.fact_embedding as embedding
-            """
-        )
-        resp, header, _ = await driver.execute_query(
-            query,
-            search_vector=search_vector,
-            limit=limit,
-            min_score=min_score,
-            routing_='r',
-            **filter_params,
-        )
 
-        if len(resp) > 0:
-            # Calculate Cosine similarity then return the edge ids
-            input_ids = []
-            for r in resp:
-                if r['embedding']:
-                    score = calculate_cosine_similarity(
-                        search_vector, list(map(float, r['embedding'].split(',')))
-                    )
-                    if score > min_score:
-                        input_ids.append({'id': r['id'], 'score': score})
+        async def execute_neptune_similarity_search() -> list[EntityEdge]:
+            query = (
+                """
+                                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+                                """
+                + filter_query
+                + """
+                RETURN DISTINCT id(e) as id, e.fact_embedding as embedding
+                """
+            )
+            resp, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+                **filter_params,
+            )
+            if not resp:
+                return []
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_similarity_records, search_vector, resp, min_score
+            )
 
-            # Match the edge ides and return the values
+            # Match the edge ids and return the values
             query = """
                 UNWIND $ids as i
                 MATCH ()-[r]->()
@@ -392,7 +516,7 @@ async def edge_similarity_search(
                     properties(r) AS attributes
                 ORDER BY i.score DESC
                 LIMIT $limit
-                    """
+            """
             records, _, _ = await driver.execute_query(
                 query,
                 ids=input_ids,
@@ -402,8 +526,9 @@ async def edge_similarity_search(
                 routing_='r',
                 **filter_params,
             )
-        else:
-            return []
+            return [get_entity_edge_from_record(record, driver.provider) for record in records]
+
+        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
     else:
         query = (
             match_query
@@ -594,7 +719,9 @@ async def node_fulltext_search(
         yield_query = 'WITH node AS n, score'
 
     if driver.provider == GraphProvider.NEPTUNE:
-        res = driver.run_aoss_query('node_name_and_summary', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
+        res = await driver.run_aoss_query(  # pyright: ignore reportAttributeAccessIssue
+            'node_name_and_summary', query, limit=limit
+        )
         if res['hits']['total']['value'] > 0:
             input_ids = []
             for r in res['hits']['hits']:
@@ -683,36 +810,32 @@ async def node_similarity_search(
         search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
 
     if driver.provider == GraphProvider.NEPTUNE:
-        query = (
-            """
-                                                                                                                                    MATCH (n:Entity)
-                                                                                                                                    """
-            + filter_query
-            + """
-            RETURN DISTINCT id(n) as id, n.name_embedding as embedding
-            """
-        )
-        resp, header, _ = await driver.execute_query(
-            query,
-            params=filter_params,
-            search_vector=search_vector,
-            limit=limit,
-            min_score=min_score,
-            routing_='r',
-        )
 
-        if len(resp) > 0:
-            # Calculate Cosine similarity then return the edge ids
-            input_ids = []
-            for r in resp:
-                if r['embedding']:
-                    score = calculate_cosine_similarity(
-                        search_vector, list(map(float, r['embedding'].split(',')))
-                    )
-                    if score > min_score:
-                        input_ids.append({'id': r['id'], 'score': score})
+        async def execute_neptune_similarity_search() -> list[EntityNode]:
+            query = (
+                """
+                                                                                                                                        MATCH (n:Entity)
+                                                                                                                                        """
+                + filter_query
+                + """
+                RETURN DISTINCT id(n) as id, n.name_embedding as embedding
+                """
+            )
+            resp, _, _ = await driver.execute_query(
+                query,
+                params=filter_params,
+                search_vector=search_vector,
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+            )
+            if not resp:
+                return []
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_similarity_records, search_vector, resp, min_score
+            )
 
-            # Match the edge ides and return the values
+            # Match the node ids and return the values
             query = (
                 """
                                                                                                                                                                 UNWIND $ids as i
@@ -726,7 +849,7 @@ async def node_similarity_search(
                     LIMIT $limit
                 """
             )
-            records, header, _ = await driver.execute_query(
+            records, _, _ = await driver.execute_query(
                 query,
                 ids=input_ids,
                 search_vector=search_vector,
@@ -735,8 +858,9 @@ async def node_similarity_search(
                 routing_='r',
                 **filter_params,
             )
-        else:
-            return []
+            return [get_entity_node_from_record(record, driver.provider) for record in records]
+
+        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
     else:
         query = (
             """
@@ -891,7 +1015,9 @@ async def episode_fulltext_search(
         filter_params['group_ids'] = group_ids
 
     if driver.provider == GraphProvider.NEPTUNE:
-        res = driver.run_aoss_query('episode_content', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
+        res = await driver.run_aoss_query(  # pyright: ignore reportAttributeAccessIssue
+            'episode_content', query, limit=limit
+        )
         if res['hits']['total']['value'] > 0:
             input_ids = []
             for r in res['hits']['hits']:
@@ -987,7 +1113,9 @@ async def community_fulltext_search(
         yield_query = 'WITH node AS c, score'
 
     if driver.provider == GraphProvider.NEPTUNE:
-        res = driver.run_aoss_query('community_name', query, limit=limit)  # pyright: ignore reportAttributeAccessIssue
+        res = await driver.run_aoss_query(  # pyright: ignore reportAttributeAccessIssue
+            'community_name', query, limit=limit
+        )
         if res['hits']['total']['value'] > 0:
             # Calculate Cosine similarity then return the edge ids
             input_ids = []
@@ -1072,36 +1200,32 @@ async def community_similarity_search(
         query_params['group_ids'] = group_ids
 
     if driver.provider == GraphProvider.NEPTUNE:
-        query = (
-            """
-                                                                                                                                    MATCH (n:Community)
-                                                                                                                                    """
-            + neptune_group_filter_query
-            + """
-            RETURN DISTINCT id(n) as id, n.name_embedding as embedding
-            """
-        )
-        resp, header, _ = await driver.execute_query(
-            query,
-            search_vector=search_vector,
-            limit=limit,
-            min_score=min_score,
-            routing_='r',
-            **query_params,
-        )
 
-        if len(resp) > 0:
-            # Calculate Cosine similarity then return the edge ids
-            input_ids = []
-            for r in resp:
-                if r['embedding']:
-                    score = calculate_cosine_similarity(
-                        search_vector, list(map(float, r['embedding'].split(',')))
-                    )
-                    if score > min_score:
-                        input_ids.append({'id': r['id'], 'score': score})
+        async def execute_neptune_similarity_search() -> list[CommunityNode]:
+            query = (
+                """
+                                                                                                                                        MATCH (n:Community)
+                                                                                                                                        """
+                + neptune_group_filter_query
+                + """
+                RETURN DISTINCT id(n) as id, n.name_embedding as embedding
+                """
+            )
+            resp, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+                **query_params,
+            )
+            if not resp:
+                return []
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_similarity_records, search_vector, resp, min_score
+            )
 
-            # Match the edge ides and return the values
+            # Match the community ids and return the values
             query = """
                     UNWIND $ids as i
                     MATCH (comm:Community)
@@ -1115,8 +1239,8 @@ async def community_similarity_search(
                         comm.name_embedding AS name_embedding
                     ORDER BY i.score DESC
                     LIMIT $limit
-                """
-            records, header, _ = await driver.execute_query(
+            """
+            records, _, _ = await driver.execute_query(
                 query,
                 ids=input_ids,
                 search_vector=search_vector,
@@ -1125,8 +1249,9 @@ async def community_similarity_search(
                 routing_='r',
                 **query_params,
             )
-        else:
-            return []
+            return [get_community_node_from_record(record) for record in records]
+
+        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
     else:
         search_vector_var = '$search_vector'
         if driver.provider == GraphProvider.KUZU:
@@ -1413,38 +1538,34 @@ async def get_relevant_edges(
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
 
     if driver.provider == GraphProvider.NEPTUNE:
-        query = (
-            """
-                                                                                                                                    UNWIND $edges AS edge
-                                                                                                                                    MATCH (n:Entity {uuid: edge.source_node_uuid})-[e:RELATES_TO {group_id: edge.group_id}]-(m:Entity {uuid: edge.target_node_uuid})
-                                                                                                                                    """
-            + filter_query
-            + """
-            WITH e, edge
-            RETURN DISTINCT id(e) as id, e.fact_embedding as source_embedding, edge.uuid as search_edge_uuid,
-            edge.fact_embedding as target_embedding
-            """
-        )
-        resp, _, _ = await driver.execute_query(
-            query,
-            edges=[edge.model_dump() for edge in edges],
-            limit=limit,
-            min_score=min_score,
-            routing_='r',
-            **filter_params,
-        )
 
-        # Calculate Cosine similarity then return the edge ids
-        input_ids = []
-        for r in resp:
-            score = calculate_cosine_similarity(
-                list(map(float, r['source_embedding'].split(','))), r['target_embedding']
+        async def execute_neptune_similarity_search() -> list[list[EntityEdge]]:
+            query = (
+                """
+                                                                                                                                        UNWIND $edges AS edge
+                                                                                                                                        MATCH (n:Entity {uuid: edge.source_node_uuid})-[e:RELATES_TO {group_id: edge.group_id}]-(m:Entity {uuid: edge.target_node_uuid})
+                                                                                                                                        """
+                + filter_query
+                + """
+                WITH e, edge
+                RETURN DISTINCT id(e) as id, e.fact_embedding as source_embedding, edge.uuid as search_edge_uuid,
+                edge.fact_embedding as target_embedding
+                """
             )
-            if score > min_score:
-                input_ids.append({'id': r['id'], 'score': score, 'uuid': r['search_edge_uuid']})
+            resp, _, _ = await driver.execute_query(
+                query,
+                edges=[edge.model_dump() for edge in edges],
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+                **filter_params,
+            )
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_edge_match_records, resp, min_score
+            )
 
-        # Match the edge ides and return the values
-        query = """
+            # Match the edge ids and return the values
+            query = """
         UNWIND $ids AS edge
         MATCH ()-[e]->()
         WHERE id(e) = edge.id
@@ -1466,17 +1587,27 @@ async def get_relevant_edges(
                 invalid_at: e.invalid_at,
                 attributes: properties(e)
             })[..$limit] AS matches
-                """
+            """
 
-        results, _, _ = await driver.execute_query(
-            query,
-            ids=input_ids,
-            edges=[edge.model_dump() for edge in edges],
-            limit=limit,
-            min_score=min_score,
-            routing_='r',
-            **filter_params,
-        )
+            results, _, _ = await driver.execute_query(
+                query,
+                ids=input_ids,
+                edges=[edge.model_dump() for edge in edges],
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+                **filter_params,
+            )
+            relevant_edges_dict: dict[str, list[EntityEdge]] = {
+                result['search_edge_uuid']: [
+                    get_entity_edge_from_record(record, driver.provider)
+                    for record in result['matches']
+                ]
+                for result in results
+            }
+            return [relevant_edges_dict.get(edge.uuid, []) for edge in edges]
+
+        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
     else:
         if driver.provider == GraphProvider.KUZU:
             embedding_size = (
@@ -1598,40 +1729,36 @@ async def get_edge_invalidation_candidates(
         filter_query = ' AND ' + (' AND '.join(filter_queries))
 
     if driver.provider == GraphProvider.NEPTUNE:
-        query = (
-            """
-                                                                                                                                    UNWIND $edges AS edge
-                                                                                                                                    MATCH (n:Entity)-[e:RELATES_TO {group_id: edge.group_id}]->(m:Entity)
-                                                                                                                                    WHERE n.uuid IN [edge.source_node_uuid, edge.target_node_uuid] OR m.uuid IN [edge.target_node_uuid, edge.source_node_uuid]
-                                                                                                                                    """
-            + filter_query
-            + """
-            WITH e, edge
-            RETURN DISTINCT id(e) as id, e.fact_embedding as source_embedding,
-            edge.fact_embedding as target_embedding,
-            edge.uuid as search_edge_uuid
-            """
-        )
-        resp, _, _ = await driver.execute_query(
-            query,
-            edges=[edge.model_dump() for edge in edges],
-            limit=limit,
-            min_score=min_score,
-            routing_='r',
-            **filter_params,
-        )
 
-        # Calculate Cosine similarity then return the edge ids
-        input_ids = []
-        for r in resp:
-            score = calculate_cosine_similarity(
-                list(map(float, r['source_embedding'].split(','))), r['target_embedding']
+        async def execute_neptune_similarity_search() -> list[list[EntityEdge]]:
+            query = (
+                """
+                                                                                                                                        UNWIND $edges AS edge
+                                                                                                                                        MATCH (n:Entity)-[e:RELATES_TO {group_id: edge.group_id}]->(m:Entity)
+                                                                                                                                        WHERE n.uuid IN [edge.source_node_uuid, edge.target_node_uuid] OR m.uuid IN [edge.target_node_uuid, edge.source_node_uuid]
+                                                                                                                                        """
+                + filter_query
+                + """
+                WITH e, edge
+                RETURN DISTINCT id(e) as id, e.fact_embedding as source_embedding,
+                edge.fact_embedding as target_embedding,
+                edge.uuid as search_edge_uuid
+                """
             )
-            if score > min_score:
-                input_ids.append({'id': r['id'], 'score': score, 'uuid': r['search_edge_uuid']})
+            resp, _, _ = await driver.execute_query(
+                query,
+                edges=[edge.model_dump() for edge in edges],
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+                **filter_params,
+            )
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_edge_match_records, resp, min_score
+            )
 
-        # Match the edge ides and return the values
-        query = """
+            # Match the edge ids and return the values
+            query = """
         UNWIND $ids AS edge
         MATCH ()-[e]->()
         WHERE id(e) = edge.id
@@ -1653,16 +1780,26 @@ async def get_edge_invalidation_candidates(
                 invalid_at: e.invalid_at,
                 attributes: properties(e)
             })[..$limit] AS matches
-                """
-        results, _, _ = await driver.execute_query(
-            query,
-            ids=input_ids,
-            edges=[edge.model_dump() for edge in edges],
-            limit=limit,
-            min_score=min_score,
-            routing_='r',
-            **filter_params,
-        )
+            """
+            results, _, _ = await driver.execute_query(
+                query,
+                ids=input_ids,
+                edges=[edge.model_dump() for edge in edges],
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+                **filter_params,
+            )
+            relevant_edges_dict: dict[str, list[EntityEdge]] = {
+                result['search_edge_uuid']: [
+                    get_entity_edge_from_record(record, driver.provider)
+                    for record in result['matches']
+                ]
+                for result in results
+            }
+            return [relevant_edges_dict.get(edge.uuid, []) for edge in edges]
+
+        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
     else:
         if driver.provider == GraphProvider.KUZU:
             embedding_size = (

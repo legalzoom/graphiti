@@ -48,7 +48,7 @@ class RecordingDriver:
 class RecordingNeptuneDriver(RecordingDriver):
     provider = GraphProvider.NEPTUNE
 
-    def run_aoss_query(self, index_name: str, query: str):
+    async def run_aoss_query(self, index_name: str, query: str, limit: int = 10):
         return {
             'hits': {
                 'total': {'value': 1},
