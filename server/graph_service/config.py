@@ -185,14 +185,20 @@ class Settings(BaseSettings):
                 + ', '.join(invalid_for_http)
             )
 
-        # Any configured privileged value is active even when the complete
-        # OPR auth profile is disabled. Keep empty values available to the
-        # temporary DEV compatibility bridge, but never admit a weak active
-        # credential (including the admin token or writer epoch).
+        # The writer epoch is always an active rollout fence and retains its
+        # universal minimum. Apply the identity-token minimum only to required
+        # static profiles and the temporary DEV bridge. This preserves legacy
+        # optional static configs and lets JWT migrations carry ignored legacy
+        # identity values.
+        enforce_static_identity_minimum = self.opr_auth_mode is OprAuthMode.STATIC and (
+            self.opr_auth_required or self.opr_dev_legacy_auth_compatibility_enabled
+        )
         too_short = [
             name
             for name in _PRIVILEGED_SECRET_NAMES
-            if secrets[name] and len(secrets[name].encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
+            if secrets[name]
+            and len(secrets[name].encode('utf-8')) < _MIN_PRIVILEGED_SECRET_BYTES
+            and (name == 'OPR_WRITER_FLEET_EPOCH' or enforce_static_identity_minimum)
         ]
         if too_short:
             raise ValueError(
