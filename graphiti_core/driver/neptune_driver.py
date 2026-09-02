@@ -27,6 +27,7 @@ from typing import Any
 import boto3
 from botocore.config import Config
 from opensearchpy import OpenSearch, Urllib3AWSV4SignerAuth, Urllib3HttpConnection, helpers
+from opensearchpy.exceptions import NotFoundError
 
 from graphiti_core.async_limiter import (
     AsyncCapacityLease,
@@ -64,6 +65,7 @@ from graphiti_core.driver.operations.has_episode_edge_ops import HasEpisodeEdgeO
 from graphiti_core.driver.operations.next_episode_edge_ops import NextEpisodeEdgeOperations
 from graphiti_core.driver.operations.saga_node_ops import SagaNodeOperations
 from graphiti_core.driver.operations.search_ops import SearchOperations
+from graphiti_core.embedder.client import EMBEDDING_DIM
 
 logger = logging.getLogger(__name__)
 DEFAULT_SIZE = 10
@@ -206,6 +208,78 @@ aoss_indices = [
     },
 ]
 
+# The OpenSearch Serverless collection backing these indexes must be of type
+# VECTORSEARCH. A SEARCH type collection rejects the knn_vector field type.
+VECTOR_EMBEDDING_FIELD = 'embedding'
+VECTOR_INDEX_SPACE_TYPE = 'cosinesimil'
+VECTOR_INDEX_ENGINE = 'faiss'
+VECTOR_INDEX_METHOD = 'hnsw'
+
+
+class VectorIndexUnsupportedError(RuntimeError):
+    """Raised when the AOSS collection rejects a knn_vector index mapping.
+
+    An OpenSearch Serverless collection of type SEARCH rejects knn_vector
+    fields; only a VECTORSEARCH collection accepts them. There is no scan
+    fallback: a rejected mapping is a deployment configuration error, not a
+    degraded mode to run in.
+    """
+
+
+def _mapping_has_knn_vector(body: dict[str, Any]) -> bool:
+    properties = body.get('mappings', {}).get('properties', {})
+    return any(prop.get('type') == 'knn_vector' for prop in properties.values())
+
+
+def _vector_index_body(dimension: int) -> dict[str, Any]:
+    return {
+        'settings': {'index': {'knn': True}},
+        'mappings': {
+            'properties': {
+                'uuid': {'type': 'keyword'},
+                'group_id': {'type': 'keyword'},
+                VECTOR_EMBEDDING_FIELD: {
+                    'type': 'knn_vector',
+                    'dimension': dimension,
+                    'space_type': VECTOR_INDEX_SPACE_TYPE,
+                    'method': {
+                        'name': VECTOR_INDEX_METHOD,
+                        'engine': VECTOR_INDEX_ENGINE,
+                    },
+                },
+            }
+        },
+    }
+
+
+# knn_vector indexes for Neptune similarity search. OpenSearch cannot enable
+# `index.knn` on an existing index, so these are separate indexes from the
+# four text indexes above rather than added fields on them.
+vector_aoss_indices = [
+    {
+        'index_name': 'node_name_embedding',
+        'body': _vector_index_body(EMBEDDING_DIM),
+    },
+    {
+        'index_name': 'edge_fact_embedding',
+        'body': _vector_index_body(EMBEDDING_DIM),
+    },
+]
+
+aoss_indices = aoss_indices + vector_aoss_indices
+
+
+def cosine_similarity_from_knn_score(score: float) -> float:
+    """Convert an OpenSearch k-NN score back to cosine similarity.
+
+    The vector indexes use the cosinesimil space with the faiss engine, where
+    OpenSearch scores as ``1 / (1 + d)`` and ``d = 1 - cosine_similarity``.
+    Solving for cosine similarity gives ``2 - (1 / score)``.
+    """
+    if score <= 0:
+        return -1.0
+    return 2.0 - (1.0 / score)
+
 
 class NeptuneDatabaseClient:
     """Lightweight Neptune Database query client using boto3 directly.
@@ -287,6 +361,8 @@ class NeptuneDriver(GraphDriver):
 
         if not aoss_host:
             raise ValueError('You must provide an AOSS endpoint to create an OpenSearch driver.')
+
+        self._aoss_host = aoss_host
 
         session = boto3.Session()
         self.aoss_client = OpenSearch(
@@ -467,14 +543,38 @@ class NeptuneDriver(GraphDriver):
         # No matter what happens above, always return True
         return self.delete_aoss_indices()
 
+    def _create_aoss_index(self, index: dict[str, Any]) -> None:
+        index_name = index['index_name']
+        client = self.aoss_client
+        if client.indices.exists(index=index_name):
+            return
+        try:
+            client.indices.create(index=index_name, body=index['body'])
+        except Exception as e:
+            if _mapping_has_knn_vector(index['body']):
+                raise VectorIndexUnsupportedError(
+                    f"OpenSearch host '{self._aoss_host}' rejected creating vector index "
+                    f"'{index_name}': {e}. If this is an illegal_argument or "
+                    'mapper_parsing error for the knn_vector field, the AOSS collection '
+                    'must be of type VECTORSEARCH; a SEARCH type collection rejects '
+                    'knn_vector mappings.'
+                ) from e
+            raise
+
     async def create_aoss_indices(self):
         for index in aoss_indices:
-            index_name = index['index_name']
-            client = self.aoss_client
-            if not client.indices.exists(index=index_name):
-                client.indices.create(index=index_name, body=index['body'])
+            self._create_aoss_index(index)
         # Sleep for 1 minute to let the index creation complete
         await asyncio.sleep(60)
+
+    async def create_vector_aoss_indices(self) -> None:
+        """Create (or confirm existing) node_name_embedding and edge_fact_embedding only.
+
+        Used to check whether the AOSS collection accepts knn_vector fields without
+        creating the four text indexes or waiting for index propagation.
+        """
+        for index in vector_aoss_indices:
+            self._create_aoss_index(index)
 
     async def delete_aoss_indices(self):
         for index in aoss_indices:
@@ -489,44 +589,93 @@ class NeptuneDriver(GraphDriver):
             await self.delete_aoss_indices()
         await self.create_aoss_indices()
 
+    async def _execute_aoss_search(self, index_name: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Run a search body on the bounded AOSS executor and return the raw response.
+
+        Shared by full-text (multi_match) and k-NN queries so both stay behind the
+        same capacity limiter and executor.
+        """
+        lease = await _AOSS_QUERY_CAPACITY.acquire()
+        loop = asyncio.get_running_loop()
+        try:
+            thread_future = _AOSS_QUERY_EXECUTOR.submit(
+                partial(
+                    self.aoss_client.search,
+                    body=body,
+                    index=index_name,
+                ),
+            )
+        except BaseException:
+            lease.release()
+            raise
+        search_future = asyncio.wrap_future(thread_future, loop=loop)
+
+        # Cancelling the waiter cannot stop a running thread. The request is read-only and
+        # its body is per-call. Keep the slot until abandoned work actually finishes.
+        try:
+            response = await asyncio.shield(search_future)
+        except asyncio.CancelledError:
+            search_future.add_done_callback(_consume_aoss_wrapper_result)
+            thread_future.add_done_callback(partial(_finish_detached_aoss_query, lease=lease))
+            raise
+        except BaseException:
+            lease.release()
+            raise
+        else:
+            lease.release()
+            return response
+
     async def run_aoss_query(self, name: str, query_text: str, limit: int = 10) -> dict[str, Any]:
         for index in aoss_indices:
             if name.lower() == index['index_name']:
                 query = deepcopy(index['query'])
                 query['query']['multi_match']['query'] = query_text
                 query['size'] = max(0, min(limit, MAX_AOSS_QUERY_SIZE))
-                lease = await _AOSS_QUERY_CAPACITY.acquire()
-                loop = asyncio.get_running_loop()
-                try:
-                    thread_future = _AOSS_QUERY_EXECUTOR.submit(
-                        partial(
-                            self.aoss_client.search,
-                            body=query,
-                            index=index['index_name'],
-                        ),
-                    )
-                except BaseException:
-                    lease.release()
-                    raise
-                search_future = asyncio.wrap_future(thread_future, loop=loop)
-
-                # Cancelling the waiter cannot stop a running thread. The request is read-only and
-                # its body is per-call. Keep the slot until abandoned work actually finishes.
-                try:
-                    response = await asyncio.shield(search_future)
-                except asyncio.CancelledError:
-                    search_future.add_done_callback(_consume_aoss_wrapper_result)
-                    thread_future.add_done_callback(
-                        partial(_finish_detached_aoss_query, lease=lease)
-                    )
-                    raise
-                except BaseException:
-                    lease.release()
-                    raise
-                else:
-                    lease.release()
-                    return response
+                return await self._execute_aoss_search(index['index_name'], query)
         return {}
+
+    async def run_aoss_knn_query(
+        self,
+        name: str,
+        vector: list[float],
+        limit: int,
+        min_score: float,
+        group_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run a k-NN similarity query against a vector index.
+
+        Returns candidates as ``{'id': uuid, 'score': cosine_similarity}``, filtered to
+        scores above ``min_score`` and ordered by descending score. Raises RuntimeError
+        naming the index and the backfill command when the index does not exist. An
+        existing but empty index returns no results.
+        """
+        size = max(0, min(limit, MAX_AOSS_QUERY_SIZE))
+        knn_clause: dict[str, Any] = {'vector': vector, 'k': size}
+        if group_ids is not None:
+            knn_clause['filter'] = {'terms': {'group_id': group_ids}}
+        body = {
+            'size': size,
+            '_source': ['uuid'],
+            'query': {'knn': {VECTOR_EMBEDDING_FIELD: knn_clause}},
+        }
+
+        try:
+            response = await self._execute_aoss_search(name, body)
+        except NotFoundError as e:
+            raise RuntimeError(
+                f"OpenSearch vector index '{name}' does not exist. Create it by calling "
+                'NeptuneDriver.build_indices_and_constraints, then backfill existing '
+                'embeddings with `python -m graph_service.backfill_embeddings '
+                f'--group-id <group_id>`. ({e})'
+            ) from e
+
+        scored: list[dict[str, Any]] = []
+        for hit in response['hits']['hits']:
+            cosine = cosine_similarity_from_knn_score(hit['_score'])
+            if cosine > min_score:
+                scored.append({'id': hit['_source']['uuid'], 'score': cosine})
+        scored.sort(key=lambda item: item['score'], reverse=True)
+        return scored
 
     def save_to_aoss(self, name: str, data: list[dict]) -> int:
         for index in aoss_indices:
