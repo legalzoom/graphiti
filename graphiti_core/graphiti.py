@@ -27,11 +27,10 @@ from typing_extensions import LiteralString
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.decorators import handle_multiple_group_ids
-from graphiti_core.driver.driver import GraphDriver
+from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.driver.neo4j_driver import Neo4jDriver
 from graphiti_core.edges import (
     CommunityEdge,
-    Edge,
     EntityEdge,
     EpisodicEdge,
     HasEpisodeEdge,
@@ -54,7 +53,6 @@ from graphiti_core.nodes import (
     EntityNode,
     EpisodeType,
     EpisodicNode,
-    Node,
     SagaNode,
     create_entity_node_embeddings,
 )
@@ -222,6 +220,21 @@ class Graphiti:
             self.embedder = embedder
         else:
             self.embedder = OpenAIEmbedder()
+
+        driver_embedding_dim = getattr(self.driver, 'embedding_dim', None)
+        embedder_config = getattr(self.embedder, 'config', None)
+        embedder_embedding_dim = getattr(embedder_config, 'embedding_dim', None)
+        if (
+            self.driver.provider == GraphProvider.NEPTUNE
+            and driver_embedding_dim is not None
+            and embedder_embedding_dim is not None
+            and driver_embedding_dim != embedder_embedding_dim
+        ):
+            raise ValueError(
+                'NeptuneDriver embedding_dim '
+                f'({driver_embedding_dim}) must match the configured embedder dimension '
+                f'({embedder_embedding_dim})'
+            )
         if cross_encoder:
             self.cross_encoder = cross_encoder
         else:
@@ -1805,7 +1818,7 @@ class Graphiti:
                 if record['episode_count'] == 1:
                     nodes_to_delete.append(node)
 
-        await Edge.delete_by_uuids(self.driver, [edge.uuid for edge in edges_to_delete])
-        await Node.delete_by_uuids(self.driver, [node.uuid for node in nodes_to_delete])
+        await EntityEdge.delete_by_uuids(self.driver, [edge.uuid for edge in edges_to_delete])
+        await EntityNode.delete_by_uuids(self.driver, [node.uuid for node in nodes_to_delete])
 
         await episode.delete(self.driver)

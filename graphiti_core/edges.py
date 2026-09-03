@@ -19,16 +19,26 @@ import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
 from time import time
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
+from graphiti_core.driver.neptune.projection_versions import (
+    clear_projection_sync_pending,
+    validate_batch_size,
+    validate_projection_operation_interface,
+)
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError, NodeGroupMismatchError
-from graphiti_core.helpers import parse_db_date, query_result_record_count
+from graphiti_core.helpers import (
+    get_neptune_projection_versions,
+    parse_db_date,
+    query_result_record_count,
+    without_neptune_internal_properties,
+)
 from graphiti_core.models.edges.edge_db_queries import (
     COMMUNITY_EDGE_RETURN,
     EPISODIC_EDGE_RETURN,
@@ -57,11 +67,43 @@ class Edge(BaseModel, ABC):
     async def save(self, driver: GraphDriver): ...
 
     async def delete(self, driver: GraphDriver):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_delete(self, driver)
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and isinstance(self, EntityEdge)
+            and hasattr(type(driver), 'entity_edge_ops')
+            and entity_edge_ops is not None
+        ):
+            return await entity_edge_ops.delete(driver, self)
+
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and hasattr(type(driver), 'entity_edge_ops')
+            and entity_edge_ops is not None
+        ):
+            records, _, _ = await driver.execute_query(
+                'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() RETURN e.uuid AS uuid',
+                uuid=self.uuid,
+            )
+            if records:
+                await entity_edge_ops.delete_by_uuids(driver, [self.uuid])
+            await driver.execute_query(
+                """
+                MATCH ()-[e:MENTIONS|HAS_MEMBER {uuid: $uuid}]->()
+                DELETE e
+                """,
+                uuid=self.uuid,
+            )
+            logger.debug(f'Deleted Edge: {self.uuid}')
+            return
 
         if driver.provider == GraphProvider.KUZU:
             await driver.execute_query(
@@ -90,7 +132,14 @@ class Edge(BaseModel, ABC):
         logger.debug(f'Deleted Edge: {self.uuid}')
 
     @classmethod
-    async def delete_by_uuids(cls, driver: GraphDriver, uuids: list[str]):
+    async def delete_by_uuids(
+        cls,
+        driver: GraphDriver,
+        uuids: list[str],
+        batch_size: int = 100,
+    ):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_delete_by_uuids(
@@ -98,6 +147,53 @@ class Edge(BaseModel, ABC):
                 )
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and issubclass(cls, EntityEdge)
+            and hasattr(type(driver), 'entity_edge_ops')
+            and entity_edge_ops is not None
+        ):
+            return await cast(Any, entity_edge_ops).delete_by_uuids(
+                driver,
+                uuids,
+                batch_size=batch_size,
+            )
+
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_batch_size(batch_size)
+            if entity_edge_ops is None:
+                raise RuntimeError('Neptune entity edge operations are unavailable')
+            unique_uuids = list(dict.fromkeys(uuids))
+            for start in range(0, len(unique_uuids), batch_size):
+                chunk = unique_uuids[start : start + batch_size]
+                records, _, _ = await driver.execute_query(
+                    """
+                    MATCH ()-[e:RELATES_TO]->()
+                    WHERE e.uuid IN $uuids
+                    RETURN e.uuid AS uuid
+                    """,
+                    uuids=chunk,
+                )
+                entity_uuids = [
+                    record['uuid'] for record in records if isinstance(record.get('uuid'), str)
+                ]
+                await cast(Any, entity_edge_ops).delete_by_uuids(
+                    driver,
+                    entity_uuids,
+                    batch_size=batch_size,
+                )
+                await driver.execute_query(
+                    """
+                    MATCH ()-[e:MENTIONS|HAS_MEMBER]->()
+                    WHERE e.uuid IN $uuids
+                    DELETE e
+                    """,
+                    uuids=chunk,
+                )
+            logger.debug(f'Deleted Edges: {uuids}')
+            return
 
         if driver.provider == GraphProvider.KUZU:
             await driver.execute_query(
@@ -298,11 +394,17 @@ class EntityEdge(Edge):
         return self.fact_embedding
 
     async def load_fact_embedding(self, driver: GraphDriver):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_load_embeddings(self, driver)
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_edge_ops is not None:
+            return await entity_edge_ops.load_embeddings(driver, self)
 
         query = """
             MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
@@ -333,11 +435,21 @@ class EntityEdge(Edge):
         self.fact_embedding = records[0]['fact_embedding']
 
     async def save(self, driver: GraphDriver):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_save(self, driver)
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and hasattr(type(driver), 'entity_edge_ops')
+            and entity_edge_ops is not None
+        ):
+            return await entity_edge_ops.save(driver, self)
 
         edge_data: dict[str, Any] = {
             'source_uuid': self.source_node_uuid,
@@ -370,7 +482,14 @@ class EntityEdge(Edge):
                 edge_data=edge_data,
             )
 
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and await query_result_record_count(result) != 1
+        ):
+            raise NodeGroupMismatchError()
+
         if driver.provider == GraphProvider.NEPTUNE:
+            projection_version = get_neptune_projection_versions(result)[self.uuid]
             driver.save_to_aoss(  # pyright: ignore reportAttributeAccessIssue
                 'edge_name_and_fact',
                 [
@@ -383,16 +502,33 @@ class EntityEdge(Edge):
                 ],
             )
             if self.fact_embedding is not None:
-                driver.save_to_aoss(  # pyright: ignore reportAttributeAccessIssue
+                await driver.save_vector_to_aoss_async(  # pyright: ignore reportAttributeAccessIssue
                     'edge_fact_embedding',
                     [
                         {
                             'uuid': self.uuid,
                             'group_id': self.group_id,
                             'embedding': self.fact_embedding,
+                            '_version': projection_version,
                         }
                     ],
                 )
+            else:
+                await driver.save_vector_to_aoss_async(  # pyright: ignore reportAttributeAccessIssue
+                    'edge_fact_embedding',
+                    [
+                        {
+                            'uuid': self.uuid,
+                            'group_id': self.group_id,
+                            '_version': projection_version,
+                        }
+                    ],
+                )
+            await clear_projection_sync_pending(
+                driver,
+                'edge',
+                {self.uuid: projection_version},
+            )
 
         logger.debug(f'Saved edge to Graph: {self.uuid}')
 
@@ -400,11 +536,17 @@ class EntityEdge(Edge):
 
     @classmethod
     async def get_by_uuid(cls, driver: GraphDriver, uuid: str):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_get_by_uuid(cls, driver, uuid)
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_edge_ops is not None:
+            return await entity_edge_ops.get_by_uuid(driver, uuid)
 
         match_query = """
             MATCH (n:Entity)-[e:RELATES_TO {uuid: $uuid}]->(m:Entity)
@@ -434,6 +576,8 @@ class EntityEdge(Edge):
     async def get_between_nodes(
         cls, driver: GraphDriver, source_node_uuid: str, target_node_uuid: str
     ):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_get_between_nodes(
@@ -441,6 +585,14 @@ class EntityEdge(Edge):
                 )
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_edge_ops is not None:
+            return await entity_edge_ops.get_between_nodes(
+                driver,
+                source_node_uuid,
+                target_node_uuid,
+            )
 
         match_query = """
             MATCH (n:Entity {uuid: $source_node_uuid})-[e:RELATES_TO]->(m:Entity {uuid: $target_node_uuid})
@@ -469,11 +621,17 @@ class EntityEdge(Edge):
 
     @classmethod
     async def get_by_uuids(cls, driver: GraphDriver, uuids: list[str]):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_get_by_uuids(cls, driver, uuids)
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_edge_ops is not None:
+            return await entity_edge_ops.get_by_uuids(driver, uuids)
 
         if len(uuids) == 0:
             return []
@@ -510,6 +668,8 @@ class EntityEdge(Edge):
         uuid_cursor: str | None = None,
         with_embeddings: bool = False,
     ):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_get_by_group_ids(
@@ -517,6 +677,20 @@ class EntityEdge(Edge):
                 )
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_edge_ops is not None:
+            edges = await entity_edge_ops.get_by_group_ids(
+                driver,
+                group_ids,
+                limit,
+                uuid_cursor,
+            )
+            if with_embeddings:
+                await entity_edge_ops.load_embeddings_bulk(driver, edges)
+            if len(edges) == 0:
+                raise GroupsEdgesNotFoundError(group_ids)
+            return edges
 
         cursor_query: LiteralString = 'AND e.uuid < $uuid' if uuid_cursor else ''
         limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
@@ -565,6 +739,8 @@ class EntityEdge(Edge):
 
     @classmethod
     async def get_by_node_uuid(cls, driver: GraphDriver, node_uuid: str):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.edge_get_by_node_uuid(
@@ -572,6 +748,10 @@ class EntityEdge(Edge):
                 )
             except NotImplementedError:
                 pass
+
+        entity_edge_ops = getattr(driver, 'entity_edge_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_edge_ops is not None:
+            return await entity_edge_ops.get_by_node_uuid(driver, node_uuid)
 
         match_query = """
             MATCH (n:Entity {uuid: $node_uuid})-[e:RELATES_TO]-(m:Entity)
@@ -997,8 +1177,11 @@ def get_entity_edge_from_record(record: Any, provider: GraphProvider) -> EntityE
     episodes = record['episodes']
     if provider == GraphProvider.KUZU:
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
+    elif provider == GraphProvider.NEPTUNE:
+        attributes = without_neptune_internal_properties(record['attributes'])
     else:
-        attributes = record['attributes']
+        attributes = dict(record['attributes'] or {})
+    if provider != GraphProvider.KUZU:
         attributes.pop('uuid', None)
         attributes.pop('source_node_uuid', None)
         attributes.pop('target_node_uuid', None)

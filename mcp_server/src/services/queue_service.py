@@ -10,6 +10,9 @@ from services.graphiti_scope import graphiti_for_group
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 30.0
+MAX_WORKER_CANCEL_WAIT_SECONDS = 1.0
+
 
 class QueueService:
     """Service for managing sequential episode processing queues by group_id."""
@@ -22,6 +25,7 @@ class QueueService:
         self._worker_tasks: dict[str, asyncio.Task[None]] = {}
         # Store the graphiti client after initialization
         self._graphiti_client: Any = None
+        self._accepting_tasks = True
 
     async def add_episode_task(
         self, group_id: str, process_func: Callable[[], Awaitable[None]]
@@ -35,6 +39,9 @@ class QueueService:
         Returns:
             The position in the queue
         """
+        if not self._accepting_tasks:
+            raise RuntimeError('Queue service is shutting down and is not accepting new work')
+
         # Initialize queue for this group_id if it doesn't exist
         if group_id not in self._episode_queues:
             self._episode_queues[group_id] = asyncio.Queue()
@@ -60,12 +67,13 @@ class QueueService:
         from the queue one at a time.
         """
         logger.info(f'Starting episode queue worker for group_id: {group_id}')
+        queue = self._episode_queues[group_id]
 
         try:
             while True:
                 # Get the next episode processing function from the queue
                 # This will wait if the queue is empty
-                process_func = await self._episode_queues[group_id].get()
+                process_func = await queue.get()
 
                 try:
                     # Process the episode
@@ -76,7 +84,7 @@ class QueueService:
                     )
                 finally:
                     # Mark the task as done regardless of success/failure
-                    self._episode_queues[group_id].task_done()
+                    queue.task_done()
         except asyncio.CancelledError:
             logger.info(f'Episode queue worker for group_id {group_id} was cancelled')
         except Exception as e:
@@ -97,6 +105,88 @@ class QueueService:
         """Check if a worker is running for a group_id."""
         worker = self._worker_tasks.get(group_id)
         return worker is not None and not worker.done()
+
+    @staticmethod
+    def _consume_detached_worker_result(worker: asyncio.Task[None]) -> None:
+        """Retrieve a late worker result after bounded shutdown has returned."""
+        if worker.cancelled():
+            return
+        error = worker.exception()
+        if error is not None:
+            logger.error(
+                'Detached episode queue worker failed after shutdown (error_type=%s)',
+                type(error).__name__,
+            )
+
+    async def shutdown(
+        self,
+        timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Stop admission, drain queued work when possible, then stop every worker.
+
+        The queue workers share the Graphiti client owned by ``GraphitiService``. Cooperative
+        workers stop before that service closes its graph driver. A worker that ignores repeated
+        cancellation is detached after a bounded grace period. The return value is false when any
+        detached worker may still be using that shared client, so the caller can leave the client
+        open rather than closing its driver underneath in-flight consistency work.
+        """
+        if timeout_seconds < 0:
+            raise ValueError('timeout_seconds must be non-negative')
+
+        self._accepting_tasks = False
+        queues = list(self._episode_queues.values())
+        if queues:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(queue.join() for queue in queues)),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    'Timed out after %.1fs draining episode queues; cancelling workers',
+                    timeout_seconds,
+                )
+
+        workers = list(self._worker_tasks.values())
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+        all_workers_stopped = True
+        if workers:
+            cancel_wait_seconds = min(timeout_seconds, MAX_WORKER_CANCEL_WAIT_SECONDS)
+            done, pending = await asyncio.wait(workers, timeout=cancel_wait_seconds)
+            if done:
+                await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                all_workers_stopped = False
+                logger.critical(
+                    '%d episode queue worker(s) did not stop within %.1fs after cancellation; '
+                    'detaching them and leaving their shared graph client open',
+                    len(pending),
+                    cancel_wait_seconds,
+                )
+                for worker in pending:
+                    worker.add_done_callback(self._consume_detached_worker_result)
+                    # A second request stops jobs that only swallowed the first cancellation.
+                    # Do not await again: a hostile job may suppress cancellation repeatedly.
+                    worker.cancel()
+
+        # A timeout can leave functions that never started in a queue. Balance their unfinished
+        # task counts before releasing the queues; the functions themselves have not created
+        # coroutine objects and require no additional cleanup.
+        for queue in queues:
+            while not queue.empty():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                else:
+                    queue.task_done()
+
+        self._episode_queues.clear()
+        self._worker_tasks.clear()
+        self._graphiti_client = None
+        return all_workers_stopped
 
     async def initialize(self, graphiti_client: Any) -> None:
         """Initialize the queue service with a graphiti client.

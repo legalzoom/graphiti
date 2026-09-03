@@ -20,6 +20,9 @@ from datetime import datetime
 from typing_extensions import LiteralString
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
+from graphiti_core.driver.neptune.projection_versions import (
+    validate_projection_operation_interface,
+)
 from graphiti_core.models.nodes.node_db_queries import (
     EPISODIC_NODE_RETURN,
     EPISODIC_NODE_RETURN_NEPTUNE,
@@ -32,11 +35,19 @@ logger = logging.getLogger(__name__)
 
 
 async def clear_data(driver: GraphDriver, group_ids: list[str] | None = None):
+    if driver.provider == GraphProvider.NEPTUNE:
+        validate_projection_operation_interface(driver)
     if driver.graph_operations_interface:
         try:
             return await driver.graph_operations_interface.clear_data(driver, group_ids)
         except NotImplementedError:
             pass
+
+    if driver.provider == GraphProvider.NEPTUNE:
+        graph_ops = driver.graph_ops
+        if graph_ops is None:
+            raise RuntimeError('Neptune graph maintenance operations are unavailable')
+        return await graph_ops.clear_data(driver, group_ids)
 
     async with driver.session() as session:
 

@@ -11,14 +11,19 @@ import logging
 import os
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, TypeVar
+from typing import Any, Optional, TypeVar, cast
 from uuid import uuid4
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.neptune.vector_reconciliation import (
+    ProjectionReconciliationDriver,
+    run_pending_projection_reconciler,
+)
 from graphiti_core.edges import EntityEdge
 from graphiti_core.errors import NodeNotFoundError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode, SagaNode
@@ -365,11 +370,19 @@ semaphore: asyncio.Semaphore
 class GraphitiService:
     """Graphiti service using the unified configuration system."""
 
-    def __init__(self, config: GraphitiConfig, semaphore_limit: int = 10):
+    def __init__(
+        self,
+        config: GraphitiConfig,
+        semaphore_limit: int = 10,
+        *,
+        start_background_tasks: bool = True,
+    ):
         self.config = config
         self.semaphore_limit = semaphore_limit
+        self.start_background_tasks = start_background_tasks
         self.semaphore = asyncio.Semaphore(semaphore_limit)
         self.client: Graphiti | None = None
+        self.vector_reconciler: asyncio.Task[None] | None = None
         self.entity_types: dict[str, type[BaseModel]] | None = None
         self.edge_types: dict[str, type[BaseModel]] | None = None
         self.edge_type_map: dict[tuple[str, str], list[str]] | None = None
@@ -438,6 +451,11 @@ class GraphitiService:
                         aoss_host=db_config['aoss_host'],
                         port=db_config['port'],
                         aoss_port=db_config['aoss_port'],
+                        vector_aoss_host=db_config['vector_aoss_host'],
+                        vector_aoss_port=db_config['vector_aoss_port'],
+                        embedding_dim=self.config.embedder.dimensions,
+                        vector_search_enabled=db_config['vector_search_enabled'],
+                        vector_projection_enabled=db_config['vector_projection_enabled'],
                     )
 
                     self.client = Graphiti(
@@ -512,6 +530,16 @@ class GraphitiService:
             # Build indices
             await self.client.build_indices_and_constraints()
 
+            if self.start_background_tasks and self.client.driver.provider == GraphProvider.NEPTUNE:
+                neptune_driver = cast(ProjectionReconciliationDriver, self.client.driver)
+                self.vector_reconciler = asyncio.create_task(
+                    run_pending_projection_reconciler(
+                        neptune_driver,
+                        db_config['vector_reconcile_interval_seconds'],
+                    ),
+                    name='neptune-vector-projection-reconciler',
+                )
+
             logger.info('Successfully initialized Graphiti client')
 
             # Log configuration details
@@ -553,6 +581,24 @@ class GraphitiService:
         if self.client is None:
             raise RuntimeError('Failed to initialize Graphiti client')
         return self.client
+
+    async def shutdown(self, *, close_client: bool = True) -> None:
+        """Stop background repair, then close the client when no worker still owns it."""
+        reconciler = self.vector_reconciler
+        self.vector_reconciler = None
+        if reconciler is not None:
+            reconciler.cancel()
+            with suppress(asyncio.CancelledError):
+                await reconciler
+
+        client = self.client
+        self.client = None
+        if client is not None and close_client:
+            await client.close()
+        elif client is not None:
+            logger.critical(
+                'Leaving Graphiti client open because an episode worker may still be using it'
+            )
 
 
 @secured_tool(ToolScope.WRITE, group_parameter='group_id')
@@ -1692,10 +1738,13 @@ async def initialize_server() -> ServerConfig:
     # Handle graph destruction if requested
     if hasattr(config, 'destroy_graph') and config.destroy_graph:
         logger.warning('Destroying all Graphiti graphs as requested...')
-        temp_service = GraphitiService(config, SEMAPHORE_LIMIT)
-        await temp_service.initialize()
-        client = await temp_service.get_client()
-        await clear_data(client.driver)
+        temp_service = GraphitiService(config, SEMAPHORE_LIMIT, start_background_tasks=False)
+        try:
+            await temp_service.initialize()
+            client = await temp_service.get_client()
+            await clear_data(client.driver)
+        finally:
+            await temp_service.shutdown()
         logger.info('All graphs destroyed')
 
     # Initialize services
@@ -1722,46 +1771,58 @@ async def initialize_server() -> ServerConfig:
 
 async def run_mcp_server():
     """Run the MCP server in the current event loop."""
-    # Initialize the server
-    mcp_config = await initialize_server()
+    try:
+        # Initialize the server
+        mcp_config = await initialize_server()
 
-    # Run the server with configured transport
-    logger.info(f'Starting MCP server with transport: {mcp_config.transport}')
-    if mcp_config.transport == 'stdio':
-        await mcp.run_stdio_async()
-    elif mcp_config.transport == 'sse':
-        logger.info(
-            f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}'
-        )
-        logger.info(f'Access the server at: http://{mcp.settings.host}:{mcp.settings.port}/sse')
-        await mcp.run_sse_async()
-    elif mcp_config.transport == 'http':
-        # Use localhost for display if binding to 0.0.0.0
-        display_host = 'localhost' if mcp.settings.host == '0.0.0.0' else mcp.settings.host
-        logger.info(
-            f'Running MCP server with streamable HTTP transport on {mcp.settings.host}:{mcp.settings.port}'
-        )
-        logger.info('=' * 60)
-        logger.info('MCP Server Access Information:')
-        logger.info(f'  Base URL: http://{display_host}:{mcp.settings.port}/')
-        logger.info(f'  MCP Endpoint: http://{display_host}:{mcp.settings.port}/mcp/')
-        logger.info('  Transport: HTTP (streamable)')
+        # Run the server with configured transport
+        logger.info(f'Starting MCP server with transport: {mcp_config.transport}')
+        if mcp_config.transport == 'stdio':
+            await mcp.run_stdio_async()
+        elif mcp_config.transport == 'sse':
+            logger.info(
+                f'Running MCP server with SSE transport on {mcp.settings.host}:{mcp.settings.port}'
+            )
+            logger.info(f'Access the server at: http://{mcp.settings.host}:{mcp.settings.port}/sse')
+            await mcp.run_sse_async()
+        elif mcp_config.transport == 'http':
+            # Use localhost for display if binding to 0.0.0.0
+            display_host = 'localhost' if mcp.settings.host == '0.0.0.0' else mcp.settings.host
+            logger.info(
+                'Running MCP server with streamable HTTP transport on %s:%s',
+                mcp.settings.host,
+                mcp.settings.port,
+            )
+            logger.info('=' * 60)
+            logger.info('MCP Server Access Information:')
+            logger.info(f'  Base URL: http://{display_host}:{mcp.settings.port}/')
+            logger.info(f'  MCP Endpoint: http://{display_host}:{mcp.settings.port}/mcp/')
+            logger.info('  Transport: HTTP (streamable)')
 
-        # Show FalkorDB Browser UI access if enabled
-        if config.database.provider.lower() == 'falkordb' and os.environ.get('BROWSER', '1') == '1':
-            logger.info(f'  FalkorDB Browser UI: http://{display_host}:3000/')
+            # Show FalkorDB Browser UI access if enabled
+            if (
+                config.database.provider.lower() == 'falkordb'
+                and os.environ.get('BROWSER', '1') == '1'
+            ):
+                logger.info(f'  FalkorDB Browser UI: http://{display_host}:3000/')
 
-        logger.info('=' * 60)
-        logger.info('For MCP clients, connect to the /mcp/ endpoint above')
+            logger.info('=' * 60)
+            logger.info('For MCP clients, connect to the /mcp/ endpoint above')
 
-        # Configure uvicorn logging to match our format
-        configure_uvicorn_logging()
+            # Configure uvicorn logging to match our format
+            configure_uvicorn_logging()
 
-        await mcp.run_streamable_http_async()
-    else:
-        raise ValueError(
-            f'Unsupported transport: {mcp_config.transport}. Use "sse", "stdio", or "http"'
-        )
+            await mcp.run_streamable_http_async()
+        else:
+            raise ValueError(
+                f'Unsupported transport: {mcp_config.transport}. Use "sse", "stdio", or "http"'
+            )
+    finally:
+        queue_workers_stopped = True
+        if queue_service is not None:
+            queue_workers_stopped = await queue_service.shutdown()
+        if graphiti_service is not None:
+            await graphiti_service.shutdown(close_client=queue_workers_stopped)
 
 
 def main():

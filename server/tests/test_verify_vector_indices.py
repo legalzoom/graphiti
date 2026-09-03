@@ -37,12 +37,20 @@ def _install_fake_driver(monkeypatch, driver) -> Mock:
 
 
 @pytest.mark.asyncio
-async def test_pass_when_vector_indices_are_created(monkeypatch):
+async def test_pass_when_vector_indices_are_created(monkeypatch, caplog):
+    caplog.set_level('INFO')
     driver = Mock()
     driver.create_vector_aoss_indices = AsyncMock(return_value=None)
     driver.close = AsyncMock(return_value=None)
     constructor = _install_fake_driver(monkeypatch, driver)
-    monkeypatch.setattr(config, 'get_settings', lambda: _settings())
+    monkeypatch.setattr(
+        config,
+        'get_settings',
+        lambda: _settings(
+            vector_aoss_host='vector-search.example',
+            vector_aoss_port=9443,
+        ),
+    )
 
     exit_code = await verify_vector_indices._main_async()
 
@@ -52,9 +60,13 @@ async def test_pass_when_vector_indices_are_created(monkeypatch):
         aoss_host='search.example',
         port=8182,
         aoss_port=443,
+        vector_aoss_host='vector-search.example',
+        vector_aoss_port=9443,
     )
     driver.create_vector_aoss_indices.assert_awaited_once()
     driver.close.assert_awaited_once()
+    assert 'on host vector-search.example' in caplog.text
+    assert 'on host search.example' not in caplog.text
 
 
 @pytest.mark.asyncio

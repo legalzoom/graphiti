@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from graphiti_core.driver.driver import GraphProvider
 from pydantic import ValidationError
 from starlette.responses import JSONResponse
 
@@ -826,6 +827,7 @@ async def test_app_lifespan_builds_exactly_one_graphiti_client_and_closes_it(mon
             SimpleNamespace(
                 build_indices_and_constraints=AsyncMock(),
                 close=AsyncMock(),
+                driver=SimpleNamespace(provider=GraphProvider.NEO4J),
             ),
         )
         built.append(client)
@@ -887,7 +889,11 @@ async def test_merged_lifespan_drains_inflight_job_before_closing_client(monkeyp
     close = AsyncMock()
     client = cast(
         ZepGraphiti,
-        SimpleNamespace(build_indices_and_constraints=AsyncMock(), close=close),
+        SimpleNamespace(
+            build_indices_and_constraints=AsyncMock(),
+            close=close,
+            driver=SimpleNamespace(provider=GraphProvider.NEO4J),
+        ),
     )
     monkeypatch.setattr(graph_service_main, 'build_graphiti_client', lambda _settings: client)
 
@@ -941,6 +947,7 @@ async def test_client_close_has_its_own_shutdown_deadline(monkeypatch, caplog):
         SimpleNamespace(
             build_indices_and_constraints=AsyncMock(),
             close=AsyncMock(side_effect=slow_close),
+            driver=SimpleNamespace(provider=GraphProvider.NEO4J),
         ),
     )
     monkeypatch.setattr(graph_service_main, 'build_graphiti_client', lambda _settings: client)
@@ -976,6 +983,7 @@ def test_app_builds_one_client_for_many_requests_and_drains_jobs_against_it(monk
             SimpleNamespace(
                 build_indices_and_constraints=AsyncMock(),
                 close=AsyncMock(),
+                driver=SimpleNamespace(provider=GraphProvider.NEO4J),
                 assert_episode_uuid_group=AsyncMock(),
                 add_episode=AsyncMock(),
             ),

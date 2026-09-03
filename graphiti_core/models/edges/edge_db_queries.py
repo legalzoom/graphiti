@@ -73,13 +73,44 @@ def get_entity_edge_save_query(provider: GraphProvider, has_aoss: bool = False) 
             """
         case GraphProvider.NEPTUNE:
             return """
+                MERGE (projection:GraphitiProjectionVersion {
+                    projection_id: "edge:" + $edge_data.uuid
+                })
+                SET projection._graphiti_projection_lock = true
+                REMOVE projection._graphiti_projection_lock
+                WITH projection,
+                    coalesce(projection.generation, 0) + 1 AS projection_version
+                SET projection.generation = projection_version
+                WITH projection_version
                 MATCH (source:Entity {uuid: $edge_data.source_uuid})
                 MATCH (target:Entity {uuid: $edge_data.target_uuid})
+                SET source._graphiti_endpoint_lock = true,
+                    target._graphiti_endpoint_lock = true
+                REMOVE source._graphiti_endpoint_lock,
+                    target._graphiti_endpoint_lock
+                WITH source, target, projection_version
+                WHERE coalesce(source._graphiti_vector_delete_pending, false) = false
+                  AND coalesce(target._graphiti_vector_delete_pending, false) = false
                 MERGE (source)-[e:RELATES_TO {uuid: $edge_data.uuid}]->(target)
-                SET e = removeKeyFromMap(removeKeyFromMap($edge_data, "fact_embedding"), "episodes")
+                SET e._graphiti_projection_lock = true
+                REMOVE e._graphiti_projection_lock
+                WITH e, projection_version
+                WHERE coalesce(e._graphiti_vector_delete_pending, false) = false
+                SET e = removeKeyFromMap(
+                    removeKeyFromMap(
+                        removeKeyFromMap(
+                            $edge_data,
+                            "_graphiti_projection_version"
+                        ),
+                        "fact_embedding"
+                    ),
+                    "episodes"
+                )
                 SET e.fact_embedding = join([x IN coalesce($edge_data.fact_embedding, []) | toString(x) ], ",")
                 SET e.episodes = join($edge_data.episodes, ",")
-                RETURN $edge_data.uuid AS uuid
+                SET e._graphiti_projection_version = projection_version
+                SET e._graphiti_vector_sync_pending = projection_version
+                RETURN e.uuid AS uuid, projection_version
             """
         case GraphProvider.KUZU:
             return """
@@ -138,13 +169,44 @@ def get_entity_edge_save_bulk_query(provider: GraphProvider, has_aoss: bool = Fa
         case GraphProvider.NEPTUNE:
             return """
                 UNWIND $entity_edges AS edge
+                MERGE (projection:GraphitiProjectionVersion {
+                    projection_id: "edge:" + edge.uuid
+                })
+                SET projection._graphiti_projection_lock = true
+                REMOVE projection._graphiti_projection_lock
+                WITH edge, projection,
+                    coalesce(projection.generation, 0) + 1 AS projection_version
+                SET projection.generation = projection_version
+                WITH edge, projection_version
                 MATCH (source:Entity {uuid: edge.source_node_uuid})
                 MATCH (target:Entity {uuid: edge.target_node_uuid})
+                SET source._graphiti_endpoint_lock = true,
+                    target._graphiti_endpoint_lock = true
+                REMOVE source._graphiti_endpoint_lock,
+                    target._graphiti_endpoint_lock
+                WITH source, target, edge, projection_version
+                WHERE coalesce(source._graphiti_vector_delete_pending, false) = false
+                  AND coalesce(target._graphiti_vector_delete_pending, false) = false
                 MERGE (source)-[r:RELATES_TO {uuid: edge.uuid}]->(target)
-                SET r = removeKeyFromMap(removeKeyFromMap(edge, "fact_embedding"), "episodes")
+                SET r._graphiti_projection_lock = true
+                REMOVE r._graphiti_projection_lock
+                WITH r, edge, projection_version
+                WHERE coalesce(r._graphiti_vector_delete_pending, false) = false
+                SET r = removeKeyFromMap(
+                    removeKeyFromMap(
+                        removeKeyFromMap(
+                            edge,
+                            "_graphiti_projection_version"
+                        ),
+                        "fact_embedding"
+                    ),
+                    "episodes"
+                )
                 SET r.fact_embedding = join([x IN coalesce(edge.fact_embedding, []) | toString(x) ], ",")
                 SET r.episodes = join(edge.episodes, ",")
-                RETURN edge.uuid AS uuid
+                SET r._graphiti_projection_version = projection_version
+                SET r._graphiti_vector_sync_pending = projection_version
+                RETURN r.uuid AS uuid, projection_version
             """
         case GraphProvider.KUZU:
             return """

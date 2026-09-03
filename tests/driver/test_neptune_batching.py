@@ -33,6 +33,24 @@ class FakeExecutor:
         self.calls.append((cypher_query_, kwargs))
         if self._responses is not None:
             return self._responses.pop(0)
+        if 'nodes' in kwargs:
+            return (
+                [
+                    {'uuid': node['uuid'], 'projection_version': index + 1}
+                    for index, node in enumerate(kwargs['nodes'])
+                ],
+                None,
+                None,
+            )
+        if 'entity_edges' in kwargs:
+            return (
+                [
+                    {'uuid': edge['uuid'], 'projection_version': index + 1}
+                    for index, edge in enumerate(kwargs['entity_edges'])
+                ],
+                None,
+                None,
+            )
         return [], None, None
 
 

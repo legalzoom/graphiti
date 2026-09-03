@@ -415,14 +415,80 @@ from graphiti_core.driver.neptune_driver import NeptuneDriver
 # Create a Neptune driver
 driver = NeptuneDriver(
     host='<NEPTUNE_ENDPOINT>',
-    aoss_host='<AMAZON_OPENSEARCH_SERVERLESS_HOST>',
+    # Existing BM25/text collection. This collection may be type SEARCH.
+    aoss_host='<AMAZON_OPENSEARCH_SERVERLESS_TEXT_HOST>',
+    # Separate collection of type VECTORSEARCH for knn_vector indexes.
+    vector_aoss_host='<AMAZON_OPENSEARCH_SERVERLESS_VECTOR_HOST>',
     port=8182,      # Optional, defaults to 8182
     aoss_port=443,  # Optional, defaults to 443
+    vector_aoss_port=443,
+    # Safe rollout defaults: maintain neither vector projections nor vector reads yet.
+    vector_projection_enabled=False,
+    vector_search_enabled=False,
 )
 
 # Pass the driver to Graphiti
 graphiti = Graphiti(graph_driver=driver)
 ```
+
+OpenSearch Serverless `SEARCH` collections reject `knn_vector` mappings. You can keep an existing
+`SEARCH` collection for Graphiti's four text indexes, but configure a separate `VECTORSEARCH`
+collection with `vector_aoss_host` (or `VECTOR_AOSS_HOST` in the server and MCP deployments) for
+`node_name_embedding` and `edge_fact_embedding`.
+
+Use this staged rollout; do not enable vector reads before the final step. Run the service commands
+below from the repository root so they use the server project's environment:
+
+1. Provision the `VECTORSEARCH` collection, grant the same workload access, set
+   `VECTOR_AOSS_HOST`, and run
+   `uv --directory server run python -m graph_service.verify_vector_indices`.
+2. Deploy every writer with vector projections enabled and vector reads disabled
+   (`NEPTUNE_VECTOR_PROJECTION_ENABLED=true` and `NEPTUNE_VECTOR_SEARCH_ENABLED=false`).
+3. Quiesce ingestion and deletion for every group. The read flag is driver-wide, so a one-group
+   backfill is not sufficient for initial rollout.
+4. Keep all writes and deletes quiesced while deleting/recreating only the two vector indexes and
+   running the all-groups initial backfill plus its automatic final reconciliation pass. The reset
+   removes historical AOSS-only documents that an upsert-only backfill cannot discover:
+
+   ```bash
+   uv --directory server run python -m graph_service.backfill_embeddings \
+       --all-groups \
+       --reset-vector-indices \
+       --acknowledge-ingestion-and-deletion-quiesced
+   ```
+
+   `--group-id <group_id>` remains available for a later targeted repair, but completing one group
+   does not make driver-wide vector reads safe. A targeted exact repair must purge stale
+   AOSS-only documents for that quiesced group:
+
+   ```bash
+   uv --directory server run python -m graph_service.backfill_embeddings \
+       --group-id <group_id> \
+       --reset-group-vector-documents \
+       --acknowledge-ingestion-and-deletion-quiesced
+   ```
+5. Only after the all-groups reset and both passes succeed, enable vector reads with
+   `NEPTUNE_VECTOR_SEARCH_ENABLED=true`, then resume ingestion and deletion.
+
+Every REST or MCP process with vector projections enabled immediately repairs durable failed-save
+and failed-delete markers at startup and then every
+`NEPTUNE_VECTOR_RECONCILE_INTERVAL_SECONDS` (30 seconds by default). The repair isolates malformed
+records so one poison embedding cannot block unrelated projections. Operators can trigger the same
+shared repair once without quiescing ingestion:
+
+```bash
+uv --directory server run python -m graph_service.backfill_embeddings --all-groups --pending-only
+```
+
+Use `--group-id <group_id> --pending-only` to limit an operational retry to one group. The command
+returns nonzero while any individual marker still needs repair.
+
+For a normal rollback, disable vector reads but keep vector projections and projection deletions
+enabled so the derived indexes do not drift. If you revert to code that does not maintain those
+projections and deletions, treat the vector indexes as untrusted: before enabling vector reads
+again, run the all-groups command above so it explicitly deletes/recreates only the vector indexes
+and repeats the quiesced two-pass backfill. Never delete the existing text indexes as part of
+vector rollback.
 
 Contributing a new graph backend? See [Adding a graph driver](CONTRIBUTING.md#adding-a-graph-driver).
 

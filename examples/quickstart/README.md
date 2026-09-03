@@ -19,7 +19,9 @@ This example demonstrates the basic functionality of Graphiti, including:
 - **For FalkorDB**:
   - FalkorDB server running (see [FalkorDB documentation](https://docs.falkordb.com) for setup)
 - **For Amazon Neptune**:
-  - Amazon server running (see [Amazon Neptune documentation](https://aws.amazon.com/neptune/developer-resources/) for setup)
+  - Amazon Neptune running (see [Amazon Neptune documentation](https://aws.amazon.com/neptune/developer-resources/) for setup)
+  - An OpenSearch Serverless text collection (an existing collection may be type `SEARCH`)
+  - A separate OpenSearch Serverless collection of type `VECTORSEARCH` for vector indexes
 
 
 ## Setup Instructions
@@ -45,10 +47,16 @@ export NEO4J_PASSWORD=password
 export FALKORDB_URI=falkor://localhost:6379
 
 # Optional Amazon Neptune connection parameters
-NEPTUNE_HOST=your_neptune_host
-NEPTUNE_PORT=your_port_or_8182
-AOSS_HOST=your_aoss_host
-AOSS_PORT=your_port_or_443
+export NEPTUNE_HOST=your_neptune_host
+export NEPTUNE_PORT=your_port_or_8182
+export AOSS_HOST=your_text_search_collection_host
+export AOSS_PORT=your_port_or_443
+export VECTOR_AOSS_HOST=your_vectorsearch_collection_host
+export VECTOR_AOSS_PORT=your_port_or_443
+
+# Safe defaults. Change these only in the staged rollout described below.
+export NEPTUNE_VECTOR_PROJECTION_ENABLED=false
+export NEPTUNE_VECTOR_SEARCH_ENABLED=false
 
 # To use a different database, modify the driver constructor in the script
 ```
@@ -68,6 +76,49 @@ python quickstart_falkordb.py
 # For Amazon Neptune
 python quickstart_neptune.py
 ```
+
+### Neptune vector rollout
+
+The four BM25/text indexes can remain in an existing `SEARCH` collection addressed by
+`AOSS_HOST`. OpenSearch Serverless accepts `knn_vector` mappings only in a `VECTORSEARCH`
+collection, so `VECTOR_AOSS_HOST` must address that separate collection whenever vector
+projections or reads are enabled.
+
+Roll out vector search in this order. Run the service commands below from the repository root so
+they use the server project's environment:
+
+1. Provision the `VECTORSEARCH` collection, configure `VECTOR_AOSS_HOST`, and verify its indexes
+   with `uv --directory server run python -m graph_service.verify_vector_indices`.
+2. Enable projections on all writers while keeping reads off
+   (`NEPTUNE_VECTOR_PROJECTION_ENABLED=true`, `NEPTUNE_VECTOR_SEARCH_ENABLED=false`).
+3. Quiesce ingestion and deletion for every group; the read flag applies to the whole driver.
+4. With both still quiesced, reset only the two vector indexes and run the all-groups initial
+   backfill plus its automatic final reconciliation pass:
+
+   ```bash
+   uv --directory server run python -m graph_service.backfill_embeddings \
+       --all-groups \
+       --reset-vector-indices \
+       --acknowledge-ingestion-and-deletion-quiesced
+   ```
+
+   A later one-group exact repair must use `--group-id <group_id>
+   --reset-group-vector-documents --acknowledge-ingestion-and-deletion-quiesced`; it does not, by
+   itself, make driver-wide reads safe.
+5. Enable reads only after the all-groups reset and both passes succeed, then resume ingestion and
+   deletion.
+
+REST and MCP processes with projections enabled automatically retry durable failed saves and
+deletes at startup and every 30 seconds by default. Configure the interval with
+`NEPTUNE_VECTOR_RECONCILE_INTERVAL_SECONDS`. For a one-off retry that does not require quiescing,
+run `uv --directory server run python -m graph_service.backfill_embeddings --all-groups
+--pending-only` (or combine `--group-id <group_id>` with `--pending-only`). A nonzero exit means at
+least one marker remains.
+
+To roll back, turn reads off but keep projections and projection deletions on. If you revert to
+code that does not maintain them, repeat the all-groups reset and quiesced two-pass backfill before
+enabling reads again. Do not delete the text indexes for a vector rollback. The quickstart creates
+missing indexes idempotently and does not delete existing graph data or indexes.
 
 ## What This Example Demonstrates
 

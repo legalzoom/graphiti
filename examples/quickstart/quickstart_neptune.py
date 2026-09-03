@@ -45,17 +45,37 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+
+def _boolean_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, str(default)).strip().lower()
+    if value not in {'true', 'false'}:
+        raise ValueError(f'{name} must be true or false')
+    return value == 'true'
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise ValueError(f'{name} must be set')
+    return value
+
+
 # Neptune and OpenSearch connection parameters
-neptune_uri = os.environ.get('NEPTUNE_HOST')
+neptune_uri = _required_env('NEPTUNE_HOST')
 neptune_port = int(os.environ.get('NEPTUNE_PORT', 8182))
-aoss_host = os.environ.get('AOSS_HOST')
+aoss_host = _required_env('AOSS_HOST')
+aoss_port = int(os.environ.get('AOSS_PORT', 443))
+vector_aoss_host = os.environ.get('VECTOR_AOSS_HOST')
+vector_aoss_port = int(os.environ.get('VECTOR_AOSS_PORT', aoss_port))
+vector_projection_enabled = _boolean_env('NEPTUNE_VECTOR_PROJECTION_ENABLED')
+vector_search_enabled = _boolean_env('NEPTUNE_VECTOR_SEARCH_ENABLED')
 
-if not neptune_uri:
-    raise ValueError('NEPTUNE_HOST must be set')
 
-
-if not aoss_host:
-    raise ValueError('AOSS_HOST must be set')
+if (vector_projection_enabled or vector_search_enabled) and not vector_aoss_host:
+    raise ValueError(
+        'VECTOR_AOSS_HOST must identify a VECTORSEARCH collection when vector projections '
+        'or reads are enabled'
+    )
 
 
 async def main():
@@ -68,14 +88,22 @@ async def main():
     #################################################
 
     # Initialize Graphiti with Neptune connection
-    driver = NeptuneDriver(host=neptune_uri, aoss_host=aoss_host, port=neptune_port)
+    driver = NeptuneDriver(
+        host=neptune_uri,
+        aoss_host=aoss_host,
+        port=neptune_port,
+        aoss_port=aoss_port,
+        vector_aoss_host=vector_aoss_host,
+        vector_aoss_port=vector_aoss_port,
+        vector_projection_enabled=vector_projection_enabled,
+        vector_search_enabled=vector_search_enabled,
+    )
 
     graphiti = Graphiti(graph_driver=driver)
 
     try:
-        # Initialize the graph database with graphiti's indices. This only needs to be done once.
-        await driver.delete_aoss_indices()
-        await driver._delete_all_data()
+        # Idempotently create missing indexes. The quickstart intentionally preserves existing
+        # graph data and indexes; vector index deletion is an explicit rollback operation.
         await graphiti.build_indices_and_constraints()
 
         #################################################

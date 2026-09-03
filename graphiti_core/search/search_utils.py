@@ -299,11 +299,19 @@ async def get_mentioned_nodes(
             pass
 
     episode_uuids = [episode.uuid for episode in episodes]
+    pending_delete_filter = (
+        'AND coalesce(n._graphiti_vector_delete_pending, false) = false'
+        if driver.provider == GraphProvider.NEPTUNE
+        else ''
+    )
 
     records, _, _ = await driver.execute_query(
         """
         MATCH (episode:Episodic)-[:MENTIONS]->(n:Entity)
         WHERE episode.uuid IN $uuids
+        """
+        + pending_delete_filter
+        + """
         RETURN DISTINCT
         """
         + get_entity_node_return_query(driver.provider),
@@ -326,11 +334,19 @@ async def get_communities_by_nodes(
             pass
 
     node_uuids = [node.uuid for node in nodes]
+    pending_delete_filter = (
+        'AND coalesce(m._graphiti_vector_delete_pending, false) = false'
+        if driver.provider == GraphProvider.NEPTUNE
+        else ''
+    )
 
     records, _, _ = await driver.execute_query(
         """
         MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)
         WHERE m.uuid IN $uuids
+        """
+        + pending_delete_filter
+        + """
         RETURN DISTINCT
         """
         + COMMUNITY_NODE_RETURN,
@@ -378,6 +394,15 @@ async def edge_fulltext_search(
     if group_ids is not None:
         filter_queries.append('e.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
+
+    if driver.provider == GraphProvider.NEPTUNE:
+        filter_queries.extend(
+            [
+                'coalesce(e._graphiti_vector_delete_pending, false) = false',
+                'coalesce(n._graphiti_vector_delete_pending, false) = false',
+                'coalesce(m._graphiti_vector_delete_pending, false) = false',
+            ]
+        )
 
     filter_query = ''
     if filter_queries:
@@ -489,13 +514,22 @@ async def edge_similarity_search(
         filter_queries.append('e.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
 
-        if source_node_uuid is not None:
-            filter_params['source_uuid'] = source_node_uuid
-            filter_queries.append('n.uuid = $source_uuid')
+    if source_node_uuid is not None:
+        filter_params['source_uuid'] = source_node_uuid
+        filter_queries.append('n.uuid = $source_uuid')
 
-        if target_node_uuid is not None:
-            filter_params['target_uuid'] = target_node_uuid
-            filter_queries.append('m.uuid = $target_uuid')
+    if target_node_uuid is not None:
+        filter_params['target_uuid'] = target_node_uuid
+        filter_queries.append('m.uuid = $target_uuid')
+
+    if driver.provider == GraphProvider.NEPTUNE:
+        filter_queries.extend(
+            [
+                'coalesce(e._graphiti_vector_delete_pending, false) = false',
+                'coalesce(n._graphiti_vector_delete_pending, false) = false',
+                'coalesce(m._graphiti_vector_delete_pending, false) = false',
+            ]
+        )
 
     filter_query = ''
     if filter_queries:
@@ -507,9 +541,65 @@ async def edge_similarity_search(
 
     if driver.provider == GraphProvider.NEPTUNE:
 
+        async def execute_neptune_filtered_similarity_scan() -> list[EntityEdge]:
+            """Preserve filter-before-score semantics for predicates AOSS cannot express."""
+            query = (
+                """
+                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+                """
+                + filter_query
+                + """
+                RETURN DISTINCT id(e) AS id, e.fact_embedding AS embedding
+                """
+            )
+            resp, _, _ = await driver.execute_query(
+                query,
+                search_vector=search_vector,
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+                **filter_params,
+            )
+            if not resp:
+                return []
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_similarity_records, search_vector, resp, min_score
+            )
+            if not input_ids:
+                return []
+
+            query = (
+                """
+                UNWIND $ids AS i
+                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+                WHERE id(e) = i.id
+                  AND coalesce(e._graphiti_vector_delete_pending, false) = false
+                  AND coalesce(n._graphiti_vector_delete_pending, false) = false
+                  AND coalesce(m._graphiti_vector_delete_pending, false) = false
+                RETURN
+                """
+                + get_entity_edge_return_query(GraphProvider.NEPTUNE)
+                + """
+                ORDER BY i.score DESC
+                LIMIT $limit
+                """
+            )
+            records, _, _ = await driver.execute_query(
+                query,
+                ids=input_ids,
+                limit=limit,
+                routing_='r',
+            )
+            return [get_entity_edge_from_record(record, driver.provider) for record in records]
+
         async def execute_neptune_similarity_search() -> list[EntityEdge]:
             knn_matches = await driver.run_aoss_knn_query(  # pyright: ignore reportAttributeAccessIssue
-                'edge_fact_embedding', search_vector, limit, min_score, group_ids
+                'edge_fact_embedding',
+                search_vector,
+                limit,
+                min_score,
+                group_ids,
+                search_filter.edge_uuids,
             )
             if not knn_matches:
                 return []
@@ -524,6 +614,7 @@ async def edge_similarity_search(
                 UNWIND $ids AS i
                 MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
                 WHERE e.uuid = i.id
+                  AND e._graphiti_vector_sync_pending IS NULL
                 """
                 + extra_filter
                 + """
@@ -544,7 +635,28 @@ async def edge_similarity_search(
             )
             return [get_entity_edge_from_record(record, driver.provider) for record in records]
 
-        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
+        has_residual_filters = (
+            any(
+                value is not None
+                for value in (
+                    search_filter.edge_types,
+                    search_filter.node_labels,
+                    search_filter.valid_at,
+                    search_filter.invalid_at,
+                    search_filter.created_at,
+                    search_filter.expired_at,
+                )
+            )
+            or source_node_uuid is not None
+            or target_node_uuid is not None
+        )
+        vector_search_enabled = getattr(driver, 'vector_search_enabled', True) is not False
+        operation = (
+            execute_neptune_filtered_similarity_scan
+            if has_residual_filters or not vector_search_enabled
+            else execute_neptune_similarity_search
+        )
+        return await run_neptune_similarity_pipeline(operation)
     else:
         query = (
             match_query
@@ -605,6 +717,15 @@ async def edge_bfs_search(
         filter_queries.append('e.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
 
+    if driver.provider == GraphProvider.NEPTUNE:
+        filter_queries.extend(
+            [
+                'coalesce(e._graphiti_vector_delete_pending, false) = false',
+                'coalesce(n._graphiti_vector_delete_pending, false) = false',
+                'coalesce(m._graphiti_vector_delete_pending, false) = false',
+            ]
+        )
+
     filter_query = ''
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
@@ -654,7 +775,11 @@ async def edge_bfs_search(
                 f"""
                 UNWIND $bfs_origin_node_uuids AS origin_uuid
                 MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS *1..{bfs_max_depth}]->(n:Entity)
-                WHERE origin:Entity OR origin:Episodic
+                WHERE (origin:Entity OR origin:Episodic)
+                  AND all(path_relationship IN relationships(path) WHERE
+                      coalesce(path_relationship._graphiti_vector_delete_pending, false) = false)
+                  AND all(path_node IN nodes(path) WHERE
+                      coalesce(path_node._graphiti_vector_delete_pending, false) = false)
                 UNWIND relationships(path) AS rel
                 MATCH (n:Entity)-[e:RELATES_TO {{uuid: rel.uuid}}]-(m:Entity)
                 """
@@ -726,6 +851,9 @@ async def node_fulltext_search(
         filter_queries.append('n.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
 
+    if driver.provider == GraphProvider.NEPTUNE:
+        filter_queries.append('coalesce(n._graphiti_vector_delete_pending, false) = false')
+
     filter_query = ''
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
@@ -743,12 +871,18 @@ async def node_fulltext_search(
             for r in res['hits']['hits']:
                 input_ids.append({'id': r['_source']['uuid'], 'score': r['_score']})
 
-            # Match the edge ides and return the values
+            neptune_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
+            # Hydrate only candidates that still satisfy the graph-side filters. This second
+            # check closes the race where a delete starts after AOSS returns its candidate IDs.
             query = (
                 """
                                 UNWIND $ids as i
                                 MATCH (n:Entity)
                                 WHERE n.uuid=i.id
+                                """
+                + neptune_filter
+                + """
                                 RETURN
                                 """
                 + get_entity_node_return_query(driver.provider)
@@ -817,6 +951,9 @@ async def node_similarity_search(
         filter_queries.append('n.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
 
+    if driver.provider == GraphProvider.NEPTUNE:
+        filter_queries.append('coalesce(n._graphiti_vector_delete_pending, false) = false')
+
     filter_query = ''
     if filter_queries:
         filter_query = ' WHERE ' + (' AND '.join(filter_queries))
@@ -826,6 +963,55 @@ async def node_similarity_search(
         search_vector_var = f'CAST($search_vector AS FLOAT[{len(search_vector)}])'
 
     if driver.provider == GraphProvider.NEPTUNE:
+
+        async def execute_neptune_filtered_similarity_scan() -> list[EntityNode]:
+            """Preserve label-filter-before-score semantics until labels are indexed."""
+            query = (
+                """
+                MATCH (n:Entity)
+                """
+                + filter_query
+                + """
+                RETURN DISTINCT id(n) AS id, n.name_embedding AS embedding
+                """
+            )
+            resp, _, _ = await driver.execute_query(
+                query,
+                params=filter_params,
+                search_vector=search_vector,
+                limit=limit,
+                min_score=min_score,
+                routing_='r',
+            )
+            if not resp:
+                return []
+            input_ids = await run_neptune_similarity_scorer(
+                score_neptune_similarity_records, search_vector, resp, min_score
+            )
+            if not input_ids:
+                return []
+
+            query = (
+                """
+                UNWIND $ids AS i
+                MATCH (n:Entity)
+                WHERE id(n) = i.id
+                  AND coalesce(n._graphiti_vector_delete_pending, false) = false
+                RETURN
+                """
+                + get_entity_node_return_query(driver.provider)
+                + """
+                ORDER BY i.score DESC
+                LIMIT $limit
+                """
+            )
+            records, _, _ = await driver.execute_query(
+                query,
+                ids=input_ids,
+                limit=limit,
+                routing_='r',
+            )
+            return [get_entity_node_from_record(record, driver.provider) for record in records]
 
         async def execute_neptune_similarity_search() -> list[EntityNode]:
             knn_matches = await driver.run_aoss_knn_query(  # pyright: ignore reportAttributeAccessIssue
@@ -843,6 +1029,7 @@ async def node_similarity_search(
                 UNWIND $ids AS i
                 MATCH (n:Entity)
                 WHERE n.uuid = i.id
+                  AND n._graphiti_vector_sync_pending IS NULL
                 """
                 + extra_filter
                 + """
@@ -863,7 +1050,13 @@ async def node_similarity_search(
             )
             return [get_entity_node_from_record(record, driver.provider) for record in records]
 
-        return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
+        vector_search_enabled = getattr(driver, 'vector_search_enabled', True) is not False
+        operation = (
+            execute_neptune_filtered_similarity_scan
+            if search_filter.node_labels is not None or not vector_search_enabled
+            else execute_neptune_similarity_search
+        )
+        return await run_neptune_similarity_pipeline(operation)
     else:
         query = (
             """
@@ -926,6 +1119,18 @@ async def node_bfs_search(
         filter_queries.append('origin.group_id IN $group_ids')
         filter_params['group_ids'] = group_ids
 
+    if driver.provider == GraphProvider.NEPTUNE:
+        filter_queries.extend(
+            [
+                'coalesce(n._graphiti_vector_delete_pending, false) = false',
+                'coalesce(origin._graphiti_vector_delete_pending, false) = false',
+                'all(path_relationship IN relationships(path) WHERE '
+                'coalesce(path_relationship._graphiti_vector_delete_pending, false) = false)',
+                'all(path_node IN nodes(path) WHERE '
+                'coalesce(path_node._graphiti_vector_delete_pending, false) = false)',
+            ]
+        )
+
     filter_query = ''
     if filter_queries:
         filter_query = ' AND ' + (' AND '.join(filter_queries))
@@ -942,8 +1147,8 @@ async def node_bfs_search(
         match_queries = [
             f"""
             UNWIND $bfs_origin_node_uuids AS origin_uuid
-            MATCH (origin {{uuid: origin_uuid}})-[e:RELATES_TO|MENTIONS*1..{bfs_max_depth}]->(n:Entity)
-            WHERE origin:Entity OR origin.Episode
+            MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS*1..{bfs_max_depth}]->(n:Entity)
+            WHERE (origin:Entity OR origin:Episodic)
             AND n.group_id = origin.group_id
             """
         ]

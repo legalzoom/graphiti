@@ -108,6 +108,18 @@ def is_non_openai_provider(base_url: str | None) -> bool:
     return not any(domain in base_url for domain in openai_domains)
 
 
+def _parse_boolean_environment_override(name: str, value: str | None, *, default: bool) -> bool:
+    """Parse one explicit boolean environment override without truthy-string surprises."""
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {'true', '1', 'yes', 'on'}:
+        return True
+    if normalized in {'false', '0', 'no', 'off'}:
+        return False
+    raise ValueError(f'{name} must be one of true/false, 1/0, yes/no, or on/off')
+
+
 def reasoning_effort_for_model(model: str) -> str | None:
     """Reasoning effort to send for a reasoning model, or None if not one.
 
@@ -364,6 +376,8 @@ class EmbedderFactory:
                 return AzureOpenAIEmbedderClient(
                     azure_client=azure_client,
                     model=config.model or 'text-embedding-3-small',
+                    embedding_dim=config.dimensions,
+                    send_dimensions=azure_config.send_dimensions,
                 )
 
             case 'gemini':
@@ -563,8 +577,43 @@ class DatabaseDriverFactory:
 
                 host = os.environ.get('NEPTUNE_HOST') or neptune_config.host
                 aoss_host = os.environ.get('AOSS_HOST') or neptune_config.aoss_host
+                vector_aoss_host = (
+                    os.environ.get('VECTOR_AOSS_HOST') or neptune_config.vector_aoss_host
+                )
                 port = int(os.environ.get('NEPTUNE_PORT', str(neptune_config.port)))
                 aoss_port = int(os.environ.get('AOSS_PORT', str(neptune_config.aoss_port)))
+                vector_aoss_port_override = os.environ.get('VECTOR_AOSS_PORT')
+                configured_vector_aoss_port = (
+                    int(vector_aoss_port_override)
+                    if vector_aoss_port_override
+                    else neptune_config.vector_aoss_port
+                )
+                vector_aoss_port = (
+                    (443 if configured_vector_aoss_port is None else configured_vector_aoss_port)
+                    if vector_aoss_host
+                    else aoss_port
+                )
+                vector_search_enabled = _parse_boolean_environment_override(
+                    'NEPTUNE_VECTOR_SEARCH_ENABLED',
+                    os.environ.get('NEPTUNE_VECTOR_SEARCH_ENABLED'),
+                    default=neptune_config.vector_search_enabled,
+                )
+                vector_projection_enabled = _parse_boolean_environment_override(
+                    'NEPTUNE_VECTOR_PROJECTION_ENABLED',
+                    os.environ.get('NEPTUNE_VECTOR_PROJECTION_ENABLED'),
+                    default=neptune_config.vector_projection_enabled,
+                )
+                vector_reconcile_interval_seconds = float(
+                    os.environ.get(
+                        'NEPTUNE_VECTOR_RECONCILE_INTERVAL_SECONDS',
+                        str(neptune_config.vector_reconcile_interval_seconds),
+                    )
+                )
+                if not 0 < vector_reconcile_interval_seconds <= 3600:
+                    raise ValueError(
+                        'NEPTUNE_VECTOR_RECONCILE_INTERVAL_SECONDS must be greater than zero '
+                        'and no more than 3600'
+                    )
 
                 if not host or not aoss_host:
                     raise ValueError(
@@ -575,8 +624,13 @@ class DatabaseDriverFactory:
                     'driver': 'neptune',
                     'host': host,
                     'aoss_host': aoss_host,
+                    'vector_aoss_host': vector_aoss_host,
                     'port': port,
                     'aoss_port': aoss_port,
+                    'vector_aoss_port': vector_aoss_port,
+                    'vector_projection_enabled': vector_projection_enabled,
+                    'vector_search_enabled': vector_search_enabled,
+                    'vector_reconcile_interval_seconds': vector_reconcile_interval_seconds,
                 }
 
             case 'falkordb':

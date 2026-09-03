@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from enum import Enum
 from time import time
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -30,6 +30,11 @@ from graphiti_core.driver.driver import (
     GraphDriver,
     GraphProvider,
 )
+from graphiti_core.driver.neptune.projection_versions import (
+    clear_projection_sync_pending,
+    validate_batch_size,
+    validate_projection_operation_interface,
+)
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import (
     EpisodeTombstonedError,
@@ -38,9 +43,11 @@ from graphiti_core.errors import (
 )
 from graphiti_core.helpers import (
     EPISODE_AOSS_WRITE_VERSION,
+    get_neptune_projection_versions,
     parse_db_date,
     query_result_record_count,
     validate_node_labels,
+    without_neptune_internal_properties,
 )
 from graphiti_core.models.nodes.node_db_queries import (
     COMMUNITY_NODE_RETURN,
@@ -118,11 +125,48 @@ class Node(BaseModel, ABC):
     async def save(self, driver: GraphDriver): ...
 
     async def delete(self, driver: GraphDriver):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_delete(self, driver)
             except NotImplementedError:
                 pass
+
+        entity_node_ops = getattr(driver, 'entity_node_ops', None)
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and isinstance(self, EntityNode)
+            and hasattr(type(driver), 'entity_node_ops')
+            and entity_node_ops is not None
+        ):
+            return await entity_node_ops.delete(driver, self)
+
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and hasattr(type(driver), 'entity_node_ops')
+            and entity_node_ops is not None
+        ):
+            records, _, _ = await driver.execute_query(
+                'MATCH (n:Entity {uuid: $uuid}) RETURN n.uuid AS uuid',
+                uuid=self.uuid,
+            )
+            if records:
+                await entity_node_ops.delete_by_uuids(driver, [self.uuid])
+            for label in ['Episodic', 'Community']:
+                await driver.execute_query(
+                    f"""
+                    MATCH (n:{label} {{uuid: $uuid}})
+                    SET n._opr_conditional_delete_lock = true
+                    REMOVE n._opr_conditional_delete_lock
+                    WITH n
+                    WHERE coalesce(n.opr_deleted, false) = false
+                    DETACH DELETE n
+                    """,
+                    uuid=self.uuid,
+                )
+            logger.debug(f'Deleted Node: {self.uuid}')
+            return
 
         match driver.provider:
             case GraphProvider.NEO4J:
@@ -151,6 +195,7 @@ class Node(BaseModel, ABC):
                         """,
                         uuid=self.uuid,
                     )
+
                 # Entity edges are actually nodes in Kuzu, so simple `DETACH DELETE` will not work.
                 # Explicitly delete the "edge" nodes first, then the entity node.
                 await driver.execute_query(
@@ -193,6 +238,8 @@ class Node(BaseModel, ABC):
 
     @classmethod
     async def delete_by_group_id(cls, driver: GraphDriver, group_id: str, batch_size: int = 100):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_delete_by_group_id(
@@ -200,6 +247,30 @@ class Node(BaseModel, ABC):
                 )
             except NotImplementedError:
                 pass
+
+        entity_node_ops = getattr(driver, 'entity_node_ops', None)
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and issubclass(cls, EntityNode)
+            and hasattr(type(driver), 'entity_node_ops')
+            and entity_node_ops is not None
+        ):
+            return await entity_node_ops.delete_by_group_id(
+                driver,
+                group_id,
+                batch_size=batch_size,
+            )
+
+        if driver.provider == GraphProvider.NEPTUNE:
+            graph_ops = driver.graph_ops
+            if graph_ops is None:
+                raise RuntimeError('Neptune graph maintenance operations are unavailable')
+            # Neptune extends the maintenance operation with bounded-page control.
+            return await cast(Any, graph_ops).clear_data(
+                driver,
+                [group_id],
+                batch_size=batch_size,
+            )
 
         match driver.provider:
             case GraphProvider.NEO4J:
@@ -229,6 +300,7 @@ class Node(BaseModel, ABC):
                         """,
                         group_id=group_id,
                     )
+
                 # Entity edges are actually nodes in Kuzu, so simple `DETACH DELETE` will not work.
                 # Explicitly delete the "edge" nodes first, then the entity node.
                 await driver.execute_query(
@@ -262,6 +334,8 @@ class Node(BaseModel, ABC):
 
     @classmethod
     async def delete_by_uuids(cls, driver: GraphDriver, uuids: list[str], batch_size: int = 100):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_delete_by_uuids(
@@ -269,6 +343,58 @@ class Node(BaseModel, ABC):
                 )
             except NotImplementedError:
                 pass
+
+        entity_node_ops = getattr(driver, 'entity_node_ops', None)
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and issubclass(cls, EntityNode)
+            and hasattr(type(driver), 'entity_node_ops')
+            and entity_node_ops is not None
+        ):
+            return await entity_node_ops.delete_by_uuids(
+                driver,
+                uuids,
+                batch_size=batch_size,
+            )
+
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_batch_size(batch_size)
+            if entity_node_ops is None:
+                raise RuntimeError('Neptune entity node operations are unavailable')
+            unique_uuids = list(dict.fromkeys(uuids))
+            for start in range(0, len(unique_uuids), batch_size):
+                chunk = unique_uuids[start : start + batch_size]
+                records, _, _ = await driver.execute_query(
+                    """
+                    MATCH (n:Entity)
+                    WHERE n.uuid IN $uuids
+                    RETURN n.uuid AS uuid
+                    """,
+                    uuids=chunk,
+                )
+                entity_uuids = [
+                    record['uuid'] for record in records if isinstance(record.get('uuid'), str)
+                ]
+                await entity_node_ops.delete_by_uuids(
+                    driver,
+                    entity_uuids,
+                    batch_size=batch_size,
+                )
+                for label in ['Episodic', 'Community']:
+                    await driver.execute_query(
+                        f"""
+                        MATCH (n:{label})
+                        WHERE n.uuid IN $uuids
+                        WITH n ORDER BY n.uuid
+                        SET n._opr_conditional_delete_lock = true
+                        REMOVE n._opr_conditional_delete_lock
+                        WITH n
+                        WHERE coalesce(n.opr_deleted, false) = false
+                        DETACH DELETE n
+                        """,
+                        uuids=chunk,
+                    )
+            return
 
         match driver.provider:
             case GraphProvider.FALKORDB:
@@ -326,7 +452,6 @@ class Node(BaseModel, ABC):
                         """,
                         uuids=uuids,
                     )
-
                     # Now delete the nodes in batches
                     await session.run(
                         """
@@ -611,11 +736,17 @@ class EntityNode(Node):
         return self.name_embedding
 
     async def load_name_embedding(self, driver: GraphDriver):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_load_embeddings(self, driver)
             except NotImplementedError:
                 pass
+
+        entity_node_ops = getattr(driver, 'entity_node_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_node_ops is not None:
+            return await entity_node_ops.load_embeddings(driver, self)
 
         if driver.provider == GraphProvider.NEPTUNE:
             query: LiteralString = """
@@ -640,11 +771,21 @@ class EntityNode(Node):
         self.name_embedding = records[0]['name_embedding']
 
     async def save(self, driver: GraphDriver):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_save(self, driver)
             except NotImplementedError:
                 pass
+
+        entity_node_ops = getattr(driver, 'entity_node_ops', None)
+        if (
+            driver.provider == GraphProvider.NEPTUNE
+            and hasattr(type(driver), 'entity_node_ops')
+            and entity_node_ops is not None
+        ):
+            return await entity_node_ops.save(driver, self)
 
         entity_data: dict[str, Any] = {
             'uuid': self.uuid,
@@ -677,6 +818,7 @@ class EntityNode(Node):
             raise NodeGroupMismatchError()
 
         if driver.provider == GraphProvider.NEPTUNE:
+            projection_version = get_neptune_projection_versions(result)[self.uuid]
             driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'node_name_and_summary',
                 [
@@ -689,16 +831,33 @@ class EntityNode(Node):
                 ],
             )
             if self.name_embedding is not None:
-                driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+                await driver.save_vector_to_aoss_async(  # pyright: ignore[reportAttributeAccessIssue]
                     'node_name_embedding',
                     [
                         {
                             'uuid': self.uuid,
                             'group_id': self.group_id,
                             'embedding': self.name_embedding,
+                            '_version': projection_version,
                         }
                     ],
                 )
+            else:
+                await driver.save_vector_to_aoss_async(  # pyright: ignore[reportAttributeAccessIssue]
+                    'node_name_embedding',
+                    [
+                        {
+                            'uuid': self.uuid,
+                            'group_id': self.group_id,
+                            '_version': projection_version,
+                        }
+                    ],
+                )
+            await clear_projection_sync_pending(
+                driver,
+                'node',
+                {self.uuid: projection_version},
+            )
 
         logger.debug(f'Saved Node to Graph: {self.uuid}')
 
@@ -706,11 +865,17 @@ class EntityNode(Node):
 
     @classmethod
     async def get_by_uuid(cls, driver: GraphDriver, uuid: str):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_get_by_uuid(cls, driver, uuid)
             except NotImplementedError:
                 pass
+
+        entity_node_ops = getattr(driver, 'entity_node_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_node_ops is not None:
+            return await entity_node_ops.get_by_uuid(driver, uuid)
 
         records, _, _ = await driver.execute_query(
             """
@@ -731,6 +896,8 @@ class EntityNode(Node):
 
     @classmethod
     async def get_by_uuids(cls, driver: GraphDriver, uuids: list[str], group_id: str | None = None):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_get_by_uuids(
@@ -738,6 +905,10 @@ class EntityNode(Node):
                 )
             except NotImplementedError:
                 pass
+
+        entity_node_ops = getattr(driver, 'entity_node_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_node_ops is not None:
+            return await entity_node_ops.get_by_uuids(driver, uuids)
 
         records, _, _ = await driver.execute_query(
             """
@@ -763,6 +934,8 @@ class EntityNode(Node):
         uuid_cursor: str | None = None,
         with_embeddings: bool = False,
     ):
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_operation_interface(driver)
         if driver.graph_operations_interface:
             try:
                 return await driver.graph_operations_interface.node_get_by_group_ids(
@@ -770,6 +943,18 @@ class EntityNode(Node):
                 )
             except NotImplementedError:
                 pass
+
+        entity_node_ops = getattr(driver, 'entity_node_ops', None)
+        if driver.provider == GraphProvider.NEPTUNE and entity_node_ops is not None:
+            nodes = await entity_node_ops.get_by_group_ids(
+                driver,
+                group_ids,
+                limit,
+                uuid_cursor,
+            )
+            if with_embeddings:
+                await entity_node_ops.load_embeddings_bulk(driver, nodes)
+            return nodes
 
         cursor_query: LiteralString = 'AND n.uuid < $uuid' if uuid_cursor else ''
         limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
@@ -1173,8 +1358,11 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
 def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityNode:
     if provider == GraphProvider.KUZU:
         attributes = json.loads(record['attributes']) if record['attributes'] else {}
+    elif provider == GraphProvider.NEPTUNE:
+        attributes = without_neptune_internal_properties(record['attributes'])
     else:
-        attributes = record['attributes']
+        attributes = dict(record['attributes'] or {})
+    if provider != GraphProvider.KUZU:
         attributes.pop('uuid', None)
         attributes.pop('name', None)
         attributes.pop('group_id', None)
@@ -1183,7 +1371,7 @@ def get_entity_node_from_record(record: Any, provider: GraphProvider) -> EntityN
         attributes.pop('created_at', None)
         attributes.pop('labels', None)
 
-    labels = record.get('labels', [])
+    labels = list(record.get('labels', []))
     group_id = record.get('group_id')
     if 'Entity_' + group_id.replace('-', '') in labels:
         labels.remove('Entity_' + group_id.replace('-', ''))

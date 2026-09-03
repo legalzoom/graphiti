@@ -47,13 +47,14 @@ jobs:
             --ignore=tests/utils/maintenance/test_temporal_operations_int.py \
             --ignore=tests/cross_encoder/test_bge_reranker_client_int.py \
             --ignore=tests/evals/
-      - name: Run graph-service retirement and authorization unit tests
+      - name: Run focused graph-service unit tests
         working-directory: server
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           uv sync --extra dev
           uv run pytest \
+            tests/test_backfill_embeddings.py \
             tests/test_async_capacity_overload.py \
             tests/test_conditional_episode_delete.py \
             tests/test_dev_legacy_auth_compatibility.py \
@@ -61,14 +62,22 @@ jobs:
             tests/test_jwt_auth.py \
             tests/test_neptune_config.py \
             tests/test_route_authorization.py \
+            tests/test_verify_vector_indices.py \
             -m "not integration"
-      - name: Run conditional-write driver unit tests
+      - name: Run focused driver unit tests
         run: |
           uv run pytest \
             tests/driver/test_episode_retirement_guards.py \
             tests/driver/test_neptune_batching.py \
             tests/driver/test_neptune_driver.py \
+            tests/driver/test_neptune_pending_delete_visibility.py \
+            tests/driver/test_neptune_projection_security.py \
+            tests/driver/test_neptune_search_ops_delegation.py \
+            tests/driver/test_neptune_vector_projection_lifecycle.py \
+            tests/driver/test_neptune_vector_reconciliation.py \
             -m "not integration"
+          # Real OpenSearch/AOSS k-NN behavior remains an explicit manual integration
+          # gate; see tests/driver/test_neptune_knn_similarity_int.py for setup.
 
   database-integration-tests:
     runs-on: ubuntu-latest

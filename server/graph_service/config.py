@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     neptune_port: int | None = Field(None)
     aoss_host: str | None = Field(None)
     aoss_port: int | None = Field(None)
+    vector_aoss_host: str | None = Field(None)
+    vector_aoss_port: int | None = Field(None)
+    # Enable projections after the target collection passes vector-index verification. Keep
+    # search disabled until dual-writes are active and both backfill passes succeed.
+    neptune_vector_projection_enabled: bool = False
+    neptune_vector_search_enabled: bool = False
+    neptune_vector_reconcile_interval_seconds: float = Field(default=30.0, gt=0, le=3600)
     db_backend: str = Field('neo4j')
     # Opt-in for downstream deployments that use the protected OPR graph.
     # Keeping the default false preserves the upstream graph service for users

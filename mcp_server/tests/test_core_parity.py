@@ -331,6 +331,73 @@ class TestQueueServiceThreading:
         await worker
         assert not service.is_worker_running('same-group')
 
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_admission_and_drains_before_workers_exit(self):
+        service = QueueService()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        completed: list[str] = []
+
+        async def process_episode() -> None:
+            started.set()
+            await release.wait()
+            completed.append('episode')
+
+        await service.add_episode_task('group', process_episode)
+        await started.wait()
+
+        shutdown = asyncio.create_task(service.shutdown(timeout_seconds=1))
+        await asyncio.sleep(0)
+
+        with pytest.raises(RuntimeError, match='not accepting new work'):
+            await service.add_episode_task('group', process_episode)
+
+        assert not shutdown.done()
+        release.set()
+        assert await shutdown is True
+
+        assert completed == ['episode']
+        assert not service.is_worker_running('group')
+        assert service.get_queue_size('group') == 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_is_bounded_when_worker_suppresses_cancellation(self, caplog):
+        service = QueueService()
+        started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def cancellation_suppressing_job() -> None:
+            started.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+
+        await service.add_episode_task('stuck-group', cancellation_suppressing_job)
+        await started.wait()
+        worker = service._worker_tasks['stuck-group']
+        caplog.set_level('CRITICAL', logger='services.queue_service')
+
+        all_workers_stopped = await asyncio.wait_for(
+            service.shutdown(timeout_seconds=0.01), timeout=0.25
+        )
+
+        assert all_workers_stopped is False
+        assert cancellation_seen.is_set()
+        assert not worker.done()
+        assert 'detaching them and leaving their shared graph client open' in caplog.text
+        assert not service.is_worker_running('stuck-group')
+        assert service.get_queue_size('stuck-group') == 0
+
+        # Let the deliberately non-cooperative job finish, then stop the detached worker at its
+        # next queue wait so this test does not leak a task into the event loop.
+        release.set()
+        await asyncio.sleep(0)
+        worker.cancel()
+        await asyncio.wait_for(worker, timeout=1)
+
 
 class TestEpisodeContextGroupIntegrity:
     @staticmethod

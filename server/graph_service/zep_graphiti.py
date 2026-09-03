@@ -659,6 +659,10 @@ def _create_graphiti_client(settings: ZepEnvDep) -> ZepGraphiti:
             aoss_host=settings.aoss_host,
             port=settings.neptune_port or 8182,
             aoss_port=settings.aoss_port or 443,
+            vector_aoss_host=settings.vector_aoss_host,
+            vector_aoss_port=settings.vector_aoss_port,
+            vector_search_enabled=settings.neptune_vector_search_enabled,
+            vector_projection_enabled=settings.neptune_vector_projection_enabled,
         )
         return ZepGraphiti(graph_driver=driver)  # type: ignore
     else:

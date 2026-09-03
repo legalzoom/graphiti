@@ -17,13 +17,21 @@ limitations under the License.
 from typing import Any
 
 from graphiti_core.edges import EntityEdge
-from graphiti_core.helpers import parse_db_date
+from graphiti_core.helpers import parse_db_date, without_neptune_internal_properties
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
 
 
-def entity_node_from_record(record: Any) -> EntityNode:
+def entity_node_from_record(
+    record: Any,
+    *,
+    strip_neptune_internal_properties: bool = False,
+) -> EntityNode:
     """Parse an entity node from a database record."""
-    attributes = record['attributes']
+    attributes = (
+        without_neptune_internal_properties(record['attributes'])
+        if strip_neptune_internal_properties
+        else dict(record['attributes'] or {})
+    )
     attributes.pop('uuid', None)
     attributes.pop('name', None)
     attributes.pop('group_id', None)
@@ -32,7 +40,7 @@ def entity_node_from_record(record: Any) -> EntityNode:
     attributes.pop('created_at', None)
     attributes.pop('labels', None)
 
-    labels = record.get('labels', [])
+    labels = list(record.get('labels', []))
     group_id = record.get('group_id')
     dynamic_label = 'Entity_' + group_id.replace('-', '')
     if dynamic_label in labels:
@@ -50,9 +58,22 @@ def entity_node_from_record(record: Any) -> EntityNode:
     )
 
 
-def entity_edge_from_record(record: Any) -> EntityEdge:
+def entity_node_from_neptune_record(record: Any) -> EntityNode:
+    """Parse a Neptune entity node without exposing projection lifecycle properties."""
+    return entity_node_from_record(record, strip_neptune_internal_properties=True)
+
+
+def entity_edge_from_record(
+    record: Any,
+    *,
+    strip_neptune_internal_properties: bool = False,
+) -> EntityEdge:
     """Parse an entity edge from a database record."""
-    attributes = record['attributes']
+    attributes = (
+        without_neptune_internal_properties(record['attributes'])
+        if strip_neptune_internal_properties
+        else dict(record['attributes'] or {})
+    )
     attributes.pop('uuid', None)
     attributes.pop('source_node_uuid', None)
     attributes.pop('target_node_uuid', None)
@@ -83,6 +104,11 @@ def entity_edge_from_record(record: Any) -> EntityEdge:
         reference_time=parse_db_date(record.get('reference_time')),
         attributes=attributes,
     )
+
+
+def entity_edge_from_neptune_record(record: Any) -> EntityEdge:
+    """Parse a Neptune entity edge without exposing projection lifecycle properties."""
+    return entity_edge_from_record(record, strip_neptune_internal_properties=True)
 
 
 def episodic_node_from_record(record: Any) -> EpisodicNode:

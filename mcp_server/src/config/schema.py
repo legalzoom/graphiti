@@ -100,6 +100,13 @@ class AzureOpenAIProviderConfig(BaseModel):
     api_version: str = '2024-10-21'
     deployment_name: str | None = None
     use_azure_ad: bool = False
+    send_dimensions: bool = Field(
+        default=False,
+        description=(
+            'Send the optional dimensions request argument. Enable only for an embedding '
+            'deployment that supports configurable dimensions.'
+        ),
+    )
 
 
 class AnthropicProviderConfig(BaseModel):
@@ -209,6 +216,37 @@ class NeptuneProviderConfig(BaseModel):
     aoss_host: str | None = Field(default=None, description='OpenSearch Serverless (AOSS) host')
     port: int = 8182
     aoss_port: int = 443
+    vector_aoss_host: str | None = Field(
+        default=None,
+        description='Optional separate VECTORSEARCH collection host for embeddings',
+    )
+    vector_aoss_port: int | None = Field(
+        default=None,
+        description=(
+            'Optional VECTORSEARCH collection port; inherits aoss_port for the primary host '
+            'and defaults to 443 for a separate host'
+        ),
+    )
+    vector_projection_enabled: bool = Field(
+        default=False,
+        description=(
+            'Create and maintain Neptune vector projections after AOSS verification; enable '
+            'this before backfilling and before vector search'
+        ),
+    )
+    vector_search_enabled: bool = Field(
+        default=False,
+        description=(
+            'Enable Neptune vector similarity reads after the AOSS collection and historical '
+            'backfill have been verified'
+        ),
+    )
+    vector_reconcile_interval_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=3600,
+        description='Seconds between durable vector projection repair sweeps',
+    )
 
 
 class DatabaseProvidersConfig(BaseModel):

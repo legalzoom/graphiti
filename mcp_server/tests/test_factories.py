@@ -9,17 +9,21 @@ import pytest
 # Add the src directory to the path (mirrors the other factory tests)
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
+from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
 from config.schema import (
     AzureOpenAIProviderConfig,
+    EmbedderConfig,
+    EmbedderProvidersConfig,
     LLMConfig,
     LLMProvidersConfig,
     OpenAIProviderConfig,
 )
 from services.factories import (
+    EmbedderFactory,
     LLMClientFactory,
     is_non_openai_provider,
     reasoning_effort_for_model,
@@ -166,3 +170,27 @@ class TestAzureReasoningEffort:
         client = LLMClientFactory.create(self._config('gpt-4.1'))
         assert isinstance(client, AzureOpenAILLMClient)
         assert client.reasoning is None
+
+
+def test_azure_embedder_dimensions_request_is_opt_in():
+    provider = AzureOpenAIProviderConfig(
+        api_key='test-key',
+        api_url='https://example.openai.azure.com',
+    )
+    config = EmbedderConfig(
+        provider='azure_openai',
+        model='legacy-deployment',
+        dimensions=1536,
+        providers=EmbedderProvidersConfig(azure_openai=provider),
+    )
+
+    client = EmbedderFactory.create(config)
+
+    assert isinstance(client, AzureOpenAIEmbedderClient)
+    assert client.embedding_dim == 1536
+    assert client.send_dimensions is False
+
+    provider.send_dimensions = True
+    opted_in_client = EmbedderFactory.create(config)
+    assert isinstance(opted_in_client, AzureOpenAIEmbedderClient)
+    assert opted_in_client.send_dimensions is True
