@@ -508,56 +508,37 @@ async def edge_similarity_search(
     if driver.provider == GraphProvider.NEPTUNE:
 
         async def execute_neptune_similarity_search() -> list[EntityEdge]:
+            knn_matches = await driver.run_aoss_knn_query(  # pyright: ignore reportAttributeAccessIssue
+                'edge_fact_embedding', search_vector, limit, min_score, group_ids
+            )
+            if not knn_matches:
+                return []
+
+            # edge_search_filter_query_constructor predicates and the source/target uuid
+            # filters below reference n/e/m, which the edge_fact_embedding index cannot
+            # express, so they are applied here instead.
+            extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
             query = (
                 """
-                                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
-                                """
-                + filter_query
-                + """
-                RETURN DISTINCT id(e) as id, e.fact_embedding as embedding
+                UNWIND $ids AS i
+                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+                WHERE e.uuid = i.id
                 """
-            )
-            resp, _, _ = await driver.execute_query(
-                query,
-                search_vector=search_vector,
-                limit=limit,
-                min_score=min_score,
-                routing_='r',
-                **filter_params,
-            )
-            if not resp:
-                return []
-            input_ids = await run_neptune_similarity_scorer(
-                score_neptune_similarity_records, search_vector, resp, min_score
-            )
-
-            # Match the edge ids and return the values
-            query = """
-                UNWIND $ids as i
-                MATCH ()-[r]->()
-                WHERE id(r) = i.id
+                + extra_filter
+                + """
                 RETURN
-                    r.uuid AS uuid,
-                    r.group_id AS group_id,
-                    startNode(r).uuid AS source_node_uuid,
-                    endNode(r).uuid AS target_node_uuid,
-                    r.created_at AS created_at,
-                    r.name AS name,
-                    r.fact AS fact,
-                    split(r.episodes, ",") AS episodes,
-                    r.expired_at AS expired_at,
-                    r.valid_at AS valid_at,
-                    r.invalid_at AS invalid_at,
-                    properties(r) AS attributes
+                """
+                + get_entity_edge_return_query(GraphProvider.NEPTUNE)
+                + """
                 ORDER BY i.score DESC
                 LIMIT $limit
-            """
+                """
+            )
             records, _, _ = await driver.execute_query(
                 query,
-                ids=input_ids,
-                search_vector=search_vector,
+                ids=knn_matches,
                 limit=limit,
-                min_score=min_score,
                 routing_='r',
                 **filter_params,
             )
@@ -847,49 +828,36 @@ async def node_similarity_search(
     if driver.provider == GraphProvider.NEPTUNE:
 
         async def execute_neptune_similarity_search() -> list[EntityNode]:
-            query = (
-                """
-                                                                                                                                        MATCH (n:Entity)
-                                                                                                                                        """
-                + filter_query
-                + """
-                RETURN DISTINCT id(n) as id, n.name_embedding as embedding
-                """
+            knn_matches = await driver.run_aoss_knn_query(  # pyright: ignore reportAttributeAccessIssue
+                'node_name_embedding', search_vector, limit, min_score, group_ids
             )
-            resp, _, _ = await driver.execute_query(
-                query,
-                params=filter_params,
-                search_vector=search_vector,
-                limit=limit,
-                min_score=min_score,
-                routing_='r',
-            )
-            if not resp:
+            if not knn_matches:
                 return []
-            input_ids = await run_neptune_similarity_scorer(
-                score_neptune_similarity_records, search_vector, resp, min_score
-            )
 
-            # Match the node ids and return the values
+            # node_labels is the only node_search_filter_query_constructor predicate the
+            # node_name_embedding index cannot express, so it is applied here instead.
+            extra_filter = (' AND ' + ' AND '.join(filter_queries)) if filter_queries else ''
+
             query = (
                 """
-                                                                                                                                                                UNWIND $ids as i
-                                                                                                                                                                MATCH (n:Entity)
-                                                                                                                                                                WHERE id(n)=i.id
-                                                                                                                                                                RETURN
-                                                                                                                                                                """
+                UNWIND $ids AS i
+                MATCH (n:Entity)
+                WHERE n.uuid = i.id
+                """
+                + extra_filter
+                + """
+                RETURN
+                """
                 + get_entity_node_return_query(driver.provider)
                 + """
-                    ORDER BY i.score DESC
-                    LIMIT $limit
+                ORDER BY i.score DESC
+                LIMIT $limit
                 """
             )
             records, _, _ = await driver.execute_query(
                 query,
-                ids=input_ids,
-                search_vector=search_vector,
+                ids=knn_matches,
                 limit=limit,
-                min_score=min_score,
                 routing_='r',
                 **filter_params,
             )

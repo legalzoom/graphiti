@@ -382,6 +382,17 @@ class EntityEdge(Edge):
                     }
                 ],
             )
+            if self.fact_embedding is not None:
+                driver.save_to_aoss(  # pyright: ignore reportAttributeAccessIssue
+                    'edge_fact_embedding',
+                    [
+                        {
+                            'uuid': self.uuid,
+                            'group_id': self.group_id,
+                            'embedding': self.fact_embedding,
+                        }
+                    ],
+                )
 
         logger.debug(f'Saved edge to Graph: {self.uuid}')
 

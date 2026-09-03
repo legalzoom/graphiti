@@ -688,6 +688,17 @@ class EntityNode(Node):
                     }
                 ],
             )
+            if self.name_embedding is not None:
+                driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+                    'node_name_embedding',
+                    [
+                        {
+                            'uuid': self.uuid,
+                            'group_id': self.group_id,
+                            'embedding': self.name_embedding,
+                        }
+                    ],
+                )
 
         logger.debug(f'Saved Node to Graph: {self.uuid}')
 

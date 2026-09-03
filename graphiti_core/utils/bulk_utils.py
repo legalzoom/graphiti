@@ -297,6 +297,19 @@ async def add_nodes_and_edges_bulk_tx(
                     for n in nodes
                 ],
             )
+            embedded_nodes = [n for n in nodes if n.get('name_embedding') is not None]
+            if embedded_nodes:
+                driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+                    'node_name_embedding',
+                    [
+                        {
+                            'uuid': n['uuid'],
+                            'group_id': n.get('group_id', ''),
+                            'embedding': n['name_embedding'],
+                        }
+                        for n in embedded_nodes
+                    ],
+                )
         if edges:
             driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'edge_name_and_fact',
@@ -310,6 +323,19 @@ async def add_nodes_and_edges_bulk_tx(
                     for e in edges
                 ],
             )
+            embedded_edges = [e for e in edges if e.get('fact_embedding') is not None]
+            if embedded_edges:
+                driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+                    'edge_fact_embedding',
+                    [
+                        {
+                            'uuid': e['uuid'],
+                            'group_id': e.get('group_id', ''),
+                            'embedding': e['fact_embedding'],
+                        }
+                        for e in embedded_edges
+                    ],
+                )
 
 
 async def extract_nodes_and_edges_bulk(

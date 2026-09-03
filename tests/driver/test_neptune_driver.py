@@ -23,6 +23,8 @@ from graphiti_core.driver.neptune_driver import (
     NeptuneAnalyticsClient,
     NeptuneDatabaseClient,
     NeptuneDriver,
+    VectorIndexUnsupportedError,
+    cosine_similarity_from_knn_score,
 )
 from graphiti_core.helpers import EPISODE_AOSS_WRITE_VERSION
 from graphiti_core.nodes import EpisodeType, EpisodicNode
@@ -1074,47 +1076,123 @@ async def test_neptune_similarity_scoring_does_not_block_event_loop(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_legacy_neptune_similarity_scoring_does_not_block_event_loop(monkeypatch):
-    records = [{'id': str(i), 'embedding': '1.0,0.0'} for i in range(40)]
+async def test_node_similarity_search_neptune_queries_knn_index_then_fetches_by_uuid():
+    """node_similarity_search's NEPTUNE branch is k-NN backed: no client-side embedding
+    scan. It queries the node_name_embedding vector index for candidate uuids, then
+    fetches the matching nodes from Neptune in uuid order, preserving the knn score
+    order."""
     driver = MagicMock()
     driver.provider = GraphProvider.NEPTUNE
     driver.search_interface = None
+    driver.run_aoss_knn_query = AsyncMock(
+        return_value=[{'id': 'node-2', 'score': 0.95}, {'id': 'node-1', 'score': 0.4}]
+    )
     driver.execute_query = AsyncMock(
-        side_effect=[
-            (records, None, None),
-            ([], None, None),
-        ]
-    )
-
-    def slow_similarity_scoring(search_vector, records, min_score):
-        time.sleep(0.08)
-        return []
-
-    monkeypatch.setattr(
-        search_utils,
-        'score_neptune_similarity_records',
-        slow_similarity_scoring,
-    )
-    tick = asyncio.Event()
-
-    async def mark_event_loop_progress():
-        await asyncio.sleep(0.01)
-        tick.set()
-
-    search_task = asyncio.create_task(
-        search_utils.node_similarity_search(
-            driver,
-            [1.0, 0.0],
-            SearchFilters(),
-            min_score=1.0,
+        return_value=(
+            [
+                {
+                    'uuid': 'node-2',
+                    'name': 'n2',
+                    'group_id': 'g1',
+                    'created_at': datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    'summary': '',
+                    'labels': ['Entity'],
+                    'attributes': {},
+                },
+                {
+                    'uuid': 'node-1',
+                    'name': 'n1',
+                    'group_id': 'g1',
+                    'created_at': datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    'summary': '',
+                    'labels': ['Entity'],
+                    'attributes': {},
+                },
+            ],
+            None,
+            None,
         )
     )
-    marker_task = asyncio.create_task(mark_event_loop_progress())
 
-    await asyncio.wait_for(tick.wait(), timeout=0.03)
-    assert not search_task.done()
-    assert await search_task == []
-    await marker_task
+    results = await search_utils.node_similarity_search(
+        driver,
+        [1.0, 0.0],
+        SearchFilters(),
+        group_ids=['g1'],
+        limit=10,
+        min_score=0.3,
+    )
+
+    driver.run_aoss_knn_query.assert_awaited_once_with(
+        'node_name_embedding', [1.0, 0.0], 10, 0.3, ['g1']
+    )
+    assert driver.execute_query.await_count == 1
+    fetch_kwargs = driver.execute_query.await_args.kwargs
+    assert fetch_kwargs['ids'] == [{'id': 'node-2', 'score': 0.95}, {'id': 'node-1', 'score': 0.4}]
+    assert [n.uuid for n in results] == ['node-2', 'node-1']
+
+
+@pytest.mark.asyncio
+async def test_node_similarity_search_neptune_skips_fetch_when_knn_query_has_no_matches():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.search_interface = None
+    driver.run_aoss_knn_query = AsyncMock(return_value=[])
+    driver.execute_query = AsyncMock()
+
+    results = await search_utils.node_similarity_search(
+        driver, [1.0, 0.0], SearchFilters(), min_score=0.3
+    )
+
+    assert results == []
+    driver.execute_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edge_similarity_search_neptune_queries_knn_index_then_fetches_by_uuid():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.search_interface = None
+    driver.run_aoss_knn_query = AsyncMock(return_value=[{'id': 'edge-1', 'score': 0.9}])
+    driver.execute_query = AsyncMock(
+        return_value=(
+            [
+                {
+                    'uuid': 'edge-1',
+                    'source_node_uuid': 'n1',
+                    'target_node_uuid': 'n2',
+                    'group_id': 'g1',
+                    'name': 'REL',
+                    'fact': 'a fact',
+                    'episodes': [],
+                    'created_at': datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    'expired_at': None,
+                    'valid_at': None,
+                    'invalid_at': None,
+                    'reference_time': None,
+                    'attributes': {},
+                }
+            ],
+            None,
+            None,
+        )
+    )
+
+    results = await search_utils.edge_similarity_search(
+        driver,
+        [1.0, 0.0],
+        None,
+        None,
+        SearchFilters(),
+        group_ids=['g1'],
+        limit=5,
+        min_score=0.3,
+    )
+
+    driver.run_aoss_knn_query.assert_awaited_once_with(
+        'edge_fact_embedding', [1.0, 0.0], 5, 0.3, ['g1']
+    )
+    assert [e.uuid for e in results] == ['edge-1']
 
 
 def test_episode_aoss_write_uses_external_generation_when_supplied():
@@ -1219,3 +1297,93 @@ class TestNeptuneClientTimeouts:
         assert NEPTUNE_BOTO_CONFIG.read_timeout > 120
         assert NEPTUNE_BOTO_CONFIG.retries['mode'] == 'standard'
         assert NEPTUNE_BOTO_CONFIG.retries['max_attempts'] >= 1
+
+
+class TestCosineSimilarityFromKnnScore:
+    """The vector indexes use the faiss engine's cosinesimil space, where
+    OpenSearch scores as 1 / (1 + d) and d = 1 - cosine_similarity."""
+
+    @pytest.mark.parametrize(
+        ('cosine', 'expected_score'),
+        [(1.0, 1.0), (0.0, 0.5), (-1.0, 1 / 3)],
+    )
+    def test_round_trips_reference_cosine_values(self, cosine, expected_score):
+        d = 1 - cosine
+        score = 1 / (1 + d)
+        assert score == pytest.approx(expected_score)
+        assert cosine_similarity_from_knn_score(score) == pytest.approx(cosine)
+
+    def test_zero_score_does_not_raise(self):
+        assert cosine_similarity_from_knn_score(0.0) == -1.0
+
+
+class TestVectorIndexUnsupportedError:
+    """A SEARCH type AOSS collection rejects knn_vector mappings. Index creation
+    must surface one specific, actionable error instead of silently degrading."""
+
+    def test_vector_index_rejection_raises_named_error(self):
+        driver = object.__new__(NeptuneDriver)
+        driver._aoss_host = 'aoss.example.com'
+        driver.aoss_client = MagicMock()
+        driver.aoss_client.indices.exists.return_value = False
+        driver.aoss_client.indices.create.side_effect = Exception(
+            'illegal_argument_exception: mapper [embedding] of type [knn_vector] is not supported'
+        )
+
+        with pytest.raises(VectorIndexUnsupportedError) as exc_info:
+            driver._create_aoss_index(
+                {
+                    'index_name': 'node_name_embedding',
+                    'body': {
+                        'mappings': {
+                            'properties': {'embedding': {'type': 'knn_vector', 'dimension': 4}}
+                        }
+                    },
+                }
+            )
+
+        message = str(exc_info.value)
+        assert 'aoss.example.com' in message
+        assert 'node_name_embedding' in message
+        assert 'VECTORSEARCH' in message
+
+    def test_text_index_creation_failure_is_not_reclassified(self):
+        driver = object.__new__(NeptuneDriver)
+        driver._aoss_host = 'aoss.example.com'
+        driver.aoss_client = MagicMock()
+        driver.aoss_client.indices.exists.return_value = False
+        driver.aoss_client.indices.create.side_effect = Exception('boom')
+
+        with pytest.raises(Exception, match='boom'):
+            driver._create_aoss_index(
+                {
+                    'index_name': 'node_name_and_summary',
+                    'body': {'mappings': {'properties': {'name': {'type': 'text'}}}},
+                }
+            )
+
+    def test_existing_index_is_not_recreated(self):
+        driver = object.__new__(NeptuneDriver)
+        driver._aoss_host = 'aoss.example.com'
+        driver.aoss_client = MagicMock()
+        driver.aoss_client.indices.exists.return_value = True
+
+        driver._create_aoss_index(
+            {'index_name': 'node_name_embedding', 'body': {'mappings': {'properties': {}}}}
+        )
+
+        driver.aoss_client.indices.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_vector_aoss_indices_only_touches_vector_indices(self):
+        driver = object.__new__(NeptuneDriver)
+        driver._aoss_host = 'aoss.example.com'
+        driver.aoss_client = MagicMock()
+        driver.aoss_client.indices.exists.return_value = False
+
+        await driver.create_vector_aoss_indices()
+
+        created_names = {
+            call.kwargs['index'] for call in driver.aoss_client.indices.create.call_args_list
+        }
+        assert created_names == {'node_name_embedding', 'edge_fact_embedding'}
