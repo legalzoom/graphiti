@@ -63,6 +63,7 @@ embedder:
       api_key: ${AZURE_OPENAI_API_KEY}
       api_url: ${AZURE_OPENAI_EMBEDDINGS_ENDPOINT}
       api_version: ${AZURE_OPENAI_API_VERSION:2024-10-21}
+      send_dimensions: ${AZURE_OPENAI_SEND_DIMENSIONS:false}
       deployment_name: ${AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT}
       use_azure_ad: ${USE_AZURE_AD:false}
       
@@ -97,6 +98,16 @@ database:
       aoss_host: ${AOSS_HOST:}
       port: ${NEPTUNE_PORT:8182}
       aoss_port: ${AOSS_PORT:443}
+      # Optional separate VECTORSEARCH collection; keep AOSS_HOST for existing text indexes.
+      vector_aoss_host: ${VECTOR_AOSS_HOST:}
+      # Leave unset to inherit AOSS_PORT when no separate host is configured, or use 443
+      # when VECTOR_AOSS_HOST points at a separate collection.
+      vector_aoss_port: ${VECTOR_AOSS_PORT:}
+      # Enable projections after verification, then backfill, then enable search reads.
+      vector_projection_enabled: ${NEPTUNE_VECTOR_PROJECTION_ENABLED:false}
+      vector_search_enabled: ${NEPTUNE_VECTOR_SEARCH_ENABLED:false}
+      # Pending save/delete markers are repaired immediately at startup, then on this interval.
+      vector_reconcile_interval_seconds: ${NEPTUNE_VECTOR_RECONCILE_INTERVAL_SECONDS:30}
 
 graphiti:
   group_id: ${GRAPHITI_GROUP_ID:main}

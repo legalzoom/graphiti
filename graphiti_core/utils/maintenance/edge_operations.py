@@ -861,6 +861,9 @@ async def filter_existing_duplicate_of_edges(
         query: LiteralString = """
             UNWIND $duplicate_node_uuids AS duplicate_tuple
             MATCH (n:Entity {uuid: duplicate_tuple.source})-[r:RELATES_TO {name: 'IS_DUPLICATE_OF'}]->(m:Entity {uuid: duplicate_tuple.target})
+            WHERE coalesce(n._graphiti_vector_delete_pending, false) = false
+              AND coalesce(r._graphiti_vector_delete_pending, false) = false
+              AND coalesce(m._graphiti_vector_delete_pending, false) = false
             RETURN DISTINCT
                 n.uuid AS source_uuid,
                 m.uuid AS target_uuid

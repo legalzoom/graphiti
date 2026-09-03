@@ -224,15 +224,36 @@ def get_entity_node_save_query(provider: GraphProvider, labels: str, has_aoss: b
             for label in validated_labels:
                 label_subquery += f' SET n:{label}\n'
             return f"""
+                MERGE (projection:GraphitiProjectionVersion {{
+                    projection_id: "node:" + $entity_data.uuid
+                }})
+                SET projection._graphiti_projection_lock = true
+                REMOVE projection._graphiti_projection_lock
+                WITH projection,
+                    coalesce(projection.generation, 0) + 1 AS projection_version
+                SET projection.generation = projection_version
+                WITH projection_version
                 MERGE (n:Entity {{uuid: $entity_data.uuid}})
                 SET n._graphiti_group_lock = true
                 REMOVE n._graphiti_group_lock
-                WITH n
-                WHERE n.group_id IS NULL OR n.group_id = $entity_data.group_id
+                WITH n, projection_version
+                WHERE (n.group_id IS NULL OR n.group_id = $entity_data.group_id)
+                  AND coalesce(n._graphiti_vector_delete_pending, false) = false
                 {label_subquery}
-                SET n = removeKeyFromMap(removeKeyFromMap($entity_data, "labels"), "name_embedding")
+                SET n = removeKeyFromMap(
+                    removeKeyFromMap(
+                        removeKeyFromMap(
+                            $entity_data,
+                            "_graphiti_projection_version"
+                        ),
+                        "labels"
+                    ),
+                    "name_embedding"
+                )
                 SET n.name_embedding = join([x IN coalesce($entity_data.name_embedding, []) | toString(x) ], ",")
-                RETURN n.uuid AS uuid
+                SET n._graphiti_projection_version = projection_version
+                SET n._graphiti_vector_sync_pending = projection_version
+                RETURN n.uuid AS uuid, projection_version
             """
         case _:
             save_embedding_query = (
@@ -292,11 +313,36 @@ def get_entity_node_save_bulk_query(
                 queries.append(
                     f"""
                         UNWIND $nodes AS node
+                        MERGE (projection:GraphitiProjectionVersion {{
+                            projection_id: "node:" + node.uuid
+                        }})
+                        SET projection._graphiti_projection_lock = true
+                        REMOVE projection._graphiti_projection_lock
+                        WITH node, projection,
+                            coalesce(projection.generation, 0) + 1 AS projection_version
+                        SET projection.generation = projection_version
+                        WITH node, projection_version
                         MERGE (n:Entity {{uuid: node.uuid}})
+                        SET n._graphiti_group_lock = true
+                        REMOVE n._graphiti_group_lock
+                        WITH n, node, projection_version
+                        WHERE (n.group_id IS NULL OR n.group_id = node.group_id)
+                          AND coalesce(n._graphiti_vector_delete_pending, false) = false
                         {labels}
-                        SET n = removeKeyFromMap(removeKeyFromMap(node, "labels"), "name_embedding")
+                        SET n = removeKeyFromMap(
+                            removeKeyFromMap(
+                                removeKeyFromMap(
+                                    node,
+                                    "_graphiti_projection_version"
+                                ),
+                                "labels"
+                            ),
+                            "name_embedding"
+                        )
                         SET n.name_embedding = join([x IN coalesce(node.name_embedding, []) | toString(x) ], ",")
-                        RETURN n.uuid AS uuid
+                        SET n._graphiti_projection_version = projection_version
+                        SET n._graphiti_vector_sync_pending = projection_version
+                        RETURN n.uuid AS uuid, projection_version
                     """
                 )
             return queries

@@ -15,6 +15,7 @@ from graphiti_core.driver.neo4j.operations.episode_node_ops import Neo4jEpisodeN
 from graphiti_core.driver.neo4j.operations.graph_ops import Neo4jGraphMaintenanceOperations
 from graphiti_core.driver.neptune.operations.episode_node_ops import NeptuneEpisodeNodeOperations
 from graphiti_core.driver.neptune.operations.graph_ops import NeptuneGraphMaintenanceOperations
+from graphiti_core.driver.query_executor import QueryExecutor
 from graphiti_core.helpers import EPISODE_AOSS_TOMBSTONE_VERSION
 from graphiti_core.models.nodes.node_db_queries import (
     get_episode_node_save_bulk_query,
@@ -258,11 +259,26 @@ async def test_legacy_node_delete_preserves_retirement_tombstones(provider: Grap
     ],
 )
 async def test_clear_preserves_retirement_tombstones(operations):
-    executor = SimpleNamespace(execute_query=AsyncMock(return_value=([], None, None)))
+    if isinstance(operations, NeptuneGraphMaintenanceOperations):
+        executor = SimpleNamespace(
+            execute_query=AsyncMock(
+                side_effect=[
+                    ([{'id': 1}], None, None),
+                    ([], None, None),
+                    ([], None, None),
+                ]
+            )
+        )
+    else:
+        executor = SimpleNamespace(execute_query=AsyncMock(return_value=([], None, None)))
 
-    await operations.clear_data(executor)
+    await operations.clear_data(cast(QueryExecutor, executor))
 
-    query = executor.execute_query.await_args.args[0]
+    query = next(
+        call.args[0]
+        for call in executor.execute_query.await_args_list
+        if 'DETACH DELETE' in call.args[0]
+    )
     assert query.index('SET n._opr_conditional_delete_lock') < query.index(
         'coalesce(n.opr_deleted, false) = false'
     )

@@ -47,6 +47,8 @@ async def _main_async() -> int:
         aoss_host=settings.aoss_host,
         port=settings.neptune_port or 8182,
         aoss_port=settings.aoss_port or 443,
+        vector_aoss_host=settings.vector_aoss_host,
+        vector_aoss_port=settings.vector_aoss_port,
     )
     try:
         await driver.create_vector_aoss_indices()
@@ -58,7 +60,7 @@ async def _main_async() -> int:
 
     logger.info(
         'PASS: node_name_embedding and edge_fact_embedding accept knn_vector on host %s',
-        settings.aoss_host,
+        settings.vector_aoss_host or settings.aoss_host,
     )
     return 0
 

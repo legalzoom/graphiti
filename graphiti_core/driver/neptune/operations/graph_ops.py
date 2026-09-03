@@ -20,10 +20,16 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.neptune.projection_versions import validate_batch_size
 from graphiti_core.driver.operations.graph_ops import GraphMaintenanceOperations
 from graphiti_core.driver.operations.graph_utils import Neighbor, label_propagation
 from graphiti_core.driver.query_executor import QueryExecutor
-from graphiti_core.driver.record_parsers import community_node_from_record, entity_node_from_record
+from graphiti_core.driver.record_parsers import (
+    community_node_from_record,
+)
+from graphiti_core.driver.record_parsers import (
+    entity_node_from_neptune_record as entity_node_from_record,
+)
 from graphiti_core.models.nodes.node_db_queries import (
     COMMUNITY_NODE_RETURN_NEPTUNE,
     get_entity_node_return_query,
@@ -40,33 +46,106 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
     def __init__(self, driver: NeptuneDriver | None = None):
         self._driver = driver
 
+    async def _delete_remaining_nodes(
+        self,
+        executor: QueryExecutor,
+        *,
+        group_ids: list[str] | None,
+        batch_size: int,
+    ) -> None:
+        labels: list[str | None] = [None] if group_ids is None else ['Episodic', 'Community']
+        for label in labels:
+            match = 'MATCH (n)' if label is None else f'MATCH (n:{label})'
+            filters = ['NOT n:GraphitiProjectionVersion']
+            if self._driver is not None:
+                filters.append('NOT n:Entity')
+            if group_ids is not None:
+                filters.append('n.group_id IN $group_ids')
+            # Do not let retained retirement tombstones occupy every page forever.
+            filters.append('(n.opr_deleted IS NULL OR n.opr_deleted = false)')
+            select_query = f"""
+                {match}
+                WHERE {' AND '.join(filters)}
+                RETURN id(n) AS id
+                ORDER BY n.uuid
+                LIMIT $batch_size
+            """
+            delete_query = """
+                UNWIND $ids AS candidate_id
+                MATCH (n)
+                WHERE id(n) = candidate_id
+                SET n._opr_conditional_delete_lock = true
+                REMOVE n._opr_conditional_delete_lock
+                WITH n
+                WHERE coalesce(n.opr_deleted, false) = false
+                DETACH DELETE n
+            """
+            while True:
+                result = await executor.execute_query(
+                    select_query,
+                    group_ids=group_ids,
+                    batch_size=batch_size,
+                )
+                records = result[0] if isinstance(result, tuple) else result
+                ids = [
+                    record['id']
+                    for record in records
+                    if isinstance(record, dict) and record.get('id') is not None
+                ]
+                if not ids:
+                    break
+                await executor.execute_query(delete_query, ids=ids)
+
     async def clear_data(
         self,
         executor: QueryExecutor,
         group_ids: list[str] | None = None,
+        batch_size: int = 100,
     ) -> None:
-        if group_ids is None:
-            await executor.execute_query(
-                'MATCH (n) WITH n ORDER BY n.uuid '
-                'SET n._opr_conditional_delete_lock = true '
-                'REMOVE n._opr_conditional_delete_lock '
-                'WITH n WHERE coalesce(n.opr_deleted, false) = false DETACH DELETE n'
-            )
-        else:
-            for label in ['Entity', 'Episodic', 'Community']:
-                await executor.execute_query(
-                    f"""
-                    MATCH (n:{label})
-                    WHERE n.group_id IN $group_ids
-                    WITH n ORDER BY n.uuid
-                    SET n._opr_conditional_delete_lock = true
-                    REMOVE n._opr_conditional_delete_lock
-                    WITH n
-                    WHERE coalesce(n.opr_deleted, false) = false
-                    DETACH DELETE n
-                    """,
-                    group_ids=group_ids,
-                )
+        validate_batch_size(batch_size)
+        if self._driver is not None:
+            entity_node_ops = self._driver.entity_node_ops
+            if entity_node_ops is None:
+                raise RuntimeError('Neptune entity node operations are unavailable')
+            if group_ids is None:
+                # Drain Entity nodes through their version-aware lifecycle in bounded pages.
+                # The durable generation ledger is intentionally retained: it fences delayed
+                # OpenSearch writes and permits safe UUID reuse after a global clear.
+                while True:
+                    result = await executor.execute_query(
+                        """
+                        MATCH (n:Entity)
+                        RETURN n.uuid AS uuid
+                        ORDER BY uuid
+                        LIMIT $batch_size
+                        """,
+                        batch_size=batch_size,
+                    )
+                    records = result[0] if isinstance(result, tuple) else result
+                    uuids = [
+                        record['uuid']
+                        for record in records
+                        if isinstance(record, dict) and isinstance(record.get('uuid'), str)
+                    ]
+                    if not uuids:
+                        break
+                    await entity_node_ops.delete_by_uuids(
+                        executor,
+                        uuids,
+                        batch_size=batch_size,
+                    )
+            else:
+                for group_id in group_ids:
+                    await entity_node_ops.delete_by_group_id(
+                        executor,
+                        group_id,
+                        batch_size=batch_size,
+                    )
+        await self._delete_remaining_nodes(
+            executor,
+            group_ids=group_ids,
+            batch_size=batch_size,
+        )
 
     async def build_indices_and_constraints(
         self,
@@ -77,7 +156,9 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
             return
 
         if delete_existing:
-            await self._driver.delete_aoss_indices()
+            # Vector resets require a quiesced all-groups backfill and are intentionally not part
+            # of this generic index rebuild operation.
+            await self._driver.delete_text_aoss_indices()
 
         await self._driver.create_aoss_indices()
 
@@ -101,6 +182,7 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
                 """
                 MATCH (n:Entity)
                 WHERE n.group_id IS NOT NULL
+                  AND coalesce(n._graphiti_vector_delete_pending, false) = false
                 RETURN
                     collect(DISTINCT n.group_id) AS group_ids
                 """
@@ -116,6 +198,7 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
                 """
                 MATCH (n:Entity)
                 WHERE n.group_id IN $group_ids
+                  AND coalesce(n._graphiti_vector_delete_pending, false) = false
                 RETURN
                 """
                 + get_entity_node_return_query(GraphProvider.NEPTUNE),
@@ -127,6 +210,9 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
                 records, _, _ = await executor.execute_query(
                     """
                     MATCH (n:Entity {group_id: $group_id, uuid: $uuid})-[e:RELATES_TO]-(m: Entity {group_id: $group_id})
+                    WHERE coalesce(n._graphiti_vector_delete_pending, false) = false
+                      AND coalesce(e._graphiti_vector_delete_pending, false) = false
+                      AND coalesce(m._graphiti_vector_delete_pending, false) = false
                     WITH count(e) AS count, m.uuid AS uuid
                     RETURN
                         uuid,
@@ -151,6 +237,7 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
                     """
                     MATCH (n:Entity)
                     WHERE n.uuid IN $uuids
+                      AND coalesce(n._graphiti_vector_delete_pending, false) = false
                     RETURN
                     """
                     + get_entity_node_return_query(GraphProvider.NEPTUNE),
@@ -169,6 +256,7 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
         records, _, _ = await executor.execute_query(
             """
             MATCH (c:Community)-[:HAS_MEMBER]->(n:Entity {uuid: $entity_uuid})
+            WHERE coalesce(n._graphiti_vector_delete_pending, false) = false
             WITH c AS n
             RETURN
             """
@@ -182,7 +270,10 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
         # If the node has no community, find the mode community of surrounding entities
         records, _, _ = await executor.execute_query(
             """
-            MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[:RELATES_TO]-(n:Entity {uuid: $entity_uuid})
+            MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[e:RELATES_TO]-(n:Entity {uuid: $entity_uuid})
+            WHERE coalesce(m._graphiti_vector_delete_pending, false) = false
+              AND coalesce(n._graphiti_vector_delete_pending, false) = false
+              AND coalesce(e._graphiti_vector_delete_pending, false) = false
             WITH c AS n
             RETURN
             """
@@ -201,6 +292,7 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
             """
             MATCH (episode:Episodic)-[:MENTIONS]->(n:Entity)
             WHERE episode.uuid IN $uuids
+              AND coalesce(n._graphiti_vector_delete_pending, false) = false
             RETURN DISTINCT
             """
             + get_entity_node_return_query(GraphProvider.NEPTUNE),
@@ -220,6 +312,7 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
             """
             MATCH (n:Community)-[:HAS_MEMBER]->(m:Entity)
             WHERE m.uuid IN $uuids
+              AND coalesce(m._graphiti_vector_delete_pending, false) = false
             RETURN DISTINCT
             """
             + COMMUNITY_NODE_RETURN_NEPTUNE,

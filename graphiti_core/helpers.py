@@ -43,6 +43,16 @@ DEFAULT_PAGE_LIMIT = 20
 # version; equal ordinary versions may be replayed idempotently.
 EPISODE_AOSS_WRITE_VERSION = 1_000_000_000_000_000
 EPISODE_AOSS_TOMBSTONE_VERSION = EPISODE_AOSS_WRITE_VERSION + 1
+NEPTUNE_INTERNAL_PROPERTY_PREFIX = '_graphiti_'
+
+
+def without_neptune_internal_properties(attributes: dict[str, Any] | None) -> dict[str, Any]:
+    """Copy caller attributes while hiding Neptune projection lifecycle state."""
+    return {
+        key: value
+        for key, value in (attributes or {}).items()
+        if not key.startswith(NEPTUNE_INTERNAL_PROPERTY_PREFIX)
+    }
 
 
 async def query_result_record_count(result: Any) -> int:
@@ -70,6 +80,28 @@ async def query_result_record_count(result: Any) -> int:
         raise TypeError(f'unsupported values result type: {type(resolved).__name__}')
 
     raise TypeError(f'unsupported query result type: {type(result).__name__}')
+
+
+def get_neptune_projection_versions(result: Any) -> dict[str, int]:
+    """Extract graph-committed AOSS projection generations from a Neptune result."""
+    records = result[0] if isinstance(result, tuple) else result
+    if not isinstance(records, list):
+        raise TypeError(f'unsupported Neptune result type: {type(records).__name__}')
+
+    versions: dict[str, int] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise TypeError(f'unsupported Neptune record type: {type(record).__name__}')
+        uuid = record.get('uuid')
+        version = record.get('projection_version')
+        if not isinstance(uuid, str):
+            raise RuntimeError('Neptune projection write did not return a string uuid')
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise RuntimeError(
+                f'Neptune projection write for {uuid!r} did not return a valid generation'
+            )
+        versions[uuid] = version
+    return versions
 
 
 # Content chunking configuration for entity extraction

@@ -28,12 +28,19 @@ from graphiti_core.driver.driver import (
     GraphDriverSession,
     GraphProvider,
 )
+from graphiti_core.driver.neptune.projection_versions import (
+    clear_projection_sync_pending,
+    defer_cancellation_until_complete,
+    validate_projection_attributes,
+    validate_projection_operation_interface,
+)
 from graphiti_core.edges import Edge, EntityEdge, EpisodicEdge, create_entity_edge_embeddings
 from graphiti_core.embedder import EmbedderClient
-from graphiti_core.errors import EpisodeTombstonedError
+from graphiti_core.errors import EpisodeTombstonedError, NodeGroupMismatchError
 from graphiti_core.graphiti_types import GraphitiClients
 from graphiti_core.helpers import (
     EPISODE_AOSS_WRITE_VERSION,
+    get_neptune_projection_versions,
     normalize_l2,
     query_result_record_count,
     semaphore_gather,
@@ -154,6 +161,7 @@ async def add_nodes_and_edges_bulk(
         await session.close()
 
 
+@defer_cancellation_until_complete
 async def add_nodes_and_edges_bulk_tx(
     tx: GraphDriverSession,
     episodic_nodes: list[EpisodicNode],
@@ -163,6 +171,13 @@ async def add_nodes_and_edges_bulk_tx(
     embedder: EmbedderClient,
     driver: GraphDriver,
 ):
+    if driver.provider == GraphProvider.NEPTUNE:
+        validate_projection_operation_interface(driver)
+        # Neptune's vector projection is keyed by UUID. Resolve duplicates before graph and AOSS
+        # writes so both stores commit the same deterministic last-write-wins representation.
+        entity_nodes = list({node.uuid: node for node in entity_nodes}.values())
+        entity_edges = list({edge.uuid: edge for edge in entity_edges}.values())
+
     episodes = [dict(episode) for episode in episodic_nodes]
     for episode in episodes:
         episode['source'] = str(episode['source'].value)
@@ -171,6 +186,8 @@ async def add_nodes_and_edges_bulk_tx(
     nodes = []
 
     for node in entity_nodes:
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_attributes(node.attributes)
         if node.name_embedding is None:
             await node.generate_name_embedding(embedder)
 
@@ -196,6 +213,8 @@ async def add_nodes_and_edges_bulk_tx(
 
     edges = []
     for edge in entity_edges:
+        if driver.provider == GraphProvider.NEPTUNE:
+            validate_projection_attributes(edge.attributes)
         if edge.fact_embedding is None:
             await edge.generate_embedding(embedder)
         edge_data: dict[str, Any] = {
@@ -228,6 +247,9 @@ async def add_nodes_and_edges_bulk_tx(
 
         edges.append(edge_data)
 
+    node_projection_versions: dict[str, int] = {}
+    edge_projection_versions: dict[str, int] = {}
+
     if driver.graph_operations_interface:
         await driver.graph_operations_interface.episodic_node_save_bulk(None, driver, tx, episodes)
         await driver.graph_operations_interface.node_save_bulk(None, driver, tx, nodes)
@@ -254,21 +276,31 @@ async def add_nodes_and_edges_bulk_tx(
         result = await tx.run(get_episode_node_save_bulk_query(driver.provider), episodes=episodes)
         if await query_result_record_count(result) != len(episodes):
             raise EpisodeTombstonedError()
-        await tx.run(
+        node_result = await tx.run(
             get_entity_node_save_bulk_query(driver.provider, nodes),
             nodes=nodes,
         )
+        if driver.provider == GraphProvider.NEPTUNE and nodes:
+            node_projection_versions = get_neptune_projection_versions(node_result)
+            if set(node_projection_versions) != {node['uuid'] for node in nodes}:
+                raise NodeGroupMismatchError()
         await tx.run(
             get_episodic_edge_save_bulk_query(driver.provider),
             episodic_edges=[edge.model_dump() for edge in episodic_edges],
         )
-        await tx.run(
+        edge_result = await tx.run(
             get_entity_edge_save_bulk_query(driver.provider),
             entity_edges=edges,
         )
+        if driver.provider == GraphProvider.NEPTUNE and edges:
+            edge_projection_versions = get_neptune_projection_versions(edge_result)
+            if set(edge_projection_versions) != {edge['uuid'] for edge in edges}:
+                raise NodeGroupMismatchError()
 
     # Sync bulk-written data to AOSS for Neptune full-text search
     if driver.provider == GraphProvider.NEPTUNE:
+        vector_projection_enabled = getattr(driver, 'vector_projection_enabled', True) is not False
+        persisted_edges = edges
         if episodes:
             driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'episode_content',
@@ -285,6 +317,7 @@ async def add_nodes_and_edges_bulk_tx(
                 ],
             )
         if nodes:
+            persisted_nodes = nodes
             driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'node_name_and_summary',
                 [
@@ -294,23 +327,33 @@ async def add_nodes_and_edges_bulk_tx(
                         'summary': n.get('summary', ''),
                         'group_id': n.get('group_id', ''),
                     }
-                    for n in nodes
+                    for n in persisted_nodes
                 ],
             )
-            embedded_nodes = [n for n in nodes if n.get('name_embedding') is not None]
-            if embedded_nodes:
-                driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+            if persisted_nodes and vector_projection_enabled:
+                await driver.save_vector_to_aoss_async(  # pyright: ignore[reportAttributeAccessIssue]
                     'node_name_embedding',
                     [
                         {
                             'uuid': n['uuid'],
                             'group_id': n.get('group_id', ''),
-                            'embedding': n['name_embedding'],
+                            '_version': node_projection_versions[n['uuid']],
+                            **(
+                                {'embedding': n['name_embedding']}
+                                if n.get('name_embedding') is not None
+                                else {}
+                            ),
                         }
-                        for n in embedded_nodes
+                        for n in persisted_nodes
                     ],
                 )
-        if edges:
+                await clear_projection_sync_pending(
+                    driver,
+                    'node',
+                    {n['uuid']: node_projection_versions[n['uuid']] for n in persisted_nodes},
+                    tx,
+                )
+        if persisted_edges:
             driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
                 'edge_name_and_fact',
                 [
@@ -320,21 +363,31 @@ async def add_nodes_and_edges_bulk_tx(
                         'fact': e.get('fact', ''),
                         'group_id': e.get('group_id', ''),
                     }
-                    for e in edges
+                    for e in persisted_edges
                 ],
             )
-            embedded_edges = [e for e in edges if e.get('fact_embedding') is not None]
-            if embedded_edges:
-                driver.save_to_aoss(  # pyright: ignore[reportAttributeAccessIssue]
+            if vector_projection_enabled:
+                await driver.save_vector_to_aoss_async(  # pyright: ignore[reportAttributeAccessIssue]
                     'edge_fact_embedding',
                     [
                         {
                             'uuid': e['uuid'],
                             'group_id': e.get('group_id', ''),
-                            'embedding': e['fact_embedding'],
+                            '_version': edge_projection_versions[e['uuid']],
+                            **(
+                                {'embedding': e['fact_embedding']}
+                                if e.get('fact_embedding') is not None
+                                else {}
+                            ),
                         }
-                        for e in embedded_edges
+                        for e in persisted_edges
                     ],
+                )
+                await clear_projection_sync_pending(
+                    driver,
+                    'edge',
+                    {e['uuid']: edge_projection_versions[e['uuid']] for e in persisted_edges},
+                    tx,
                 )
 
 

@@ -18,7 +18,8 @@ Run OpenSearch locally before running these tests:
         opensearchproject/opensearch:2.19.1
 
 Tests skip themselves if OpenSearch is not reachable on OPENSEARCH_TEST_PORT
-(default 9201).
+(default 9201). CI does not provision OpenSearch or AOSS, so this suite is an
+explicit manual integration gate.
 """
 
 from __future__ import annotations
@@ -68,7 +69,14 @@ def driver(opensearch_client):
     execution (execute_query) is overridden per-test to fake the Neptune side."""
     d = object.__new__(NeptuneDriver)
     d._aoss_host = f'localhost:{OPENSEARCH_TEST_PORT}'
+    d._vector_aoss_host = d._aoss_host
     d.aoss_client = opensearch_client
+    d.vector_aoss_client = opensearch_client
+    d.embedding_dim = DIMENSION
+    d.vector_search_enabled = True
+    d.vector_projection_enabled = True
+    d._vector_aoss_indices = neptune_driver_module._vector_aoss_indices(DIMENSION)
+    d._aoss_indices = neptune_driver_module.text_aoss_indices + d._vector_aoss_indices
     d.provider = GraphProvider.NEPTUNE
     d.search_interface = None
     return d
@@ -81,15 +89,16 @@ def _fresh_index_name(prefix: str) -> str:
 @pytest.fixture
 def node_index(driver):
     name = _fresh_index_name('test_node_name_embedding')
-    driver.aoss_client.indices.create(
-        index=name, body=neptune_driver_module._vector_index_body(DIMENSION)
-    )
+    index = {'index_name': name, 'body': neptune_driver_module._vector_index_body(DIMENSION)}
+    driver._vector_aoss_indices.append(index)
+    driver._aoss_indices.append(index)
+    driver.aoss_client.indices.create(index=name, body=index['body'])
     yield name
     driver.aoss_client.indices.delete(index=name, ignore=[404])
 
 
 @pytest.fixture
-async def real_vector_indices(driver, monkeypatch):
+async def real_vector_indices(driver):
     """Create the actual node_name_embedding/edge_fact_embedding indices used
     by search_utils, sized to the small test dimension, then delete them."""
     small_dimension_indices = [
@@ -102,7 +111,8 @@ async def real_vector_indices(driver, monkeypatch):
             'body': neptune_driver_module._vector_index_body(DIMENSION),
         },
     ]
-    monkeypatch.setattr(neptune_driver_module, 'vector_aoss_indices', small_dimension_indices)
+    driver._vector_aoss_indices = small_dimension_indices
+    driver._aoss_indices = neptune_driver_module.text_aoss_indices + small_dimension_indices
     await driver.create_vector_aoss_indices()
     yield
     driver.aoss_client.indices.delete(index='node_name_embedding', ignore=[404])
@@ -110,7 +120,10 @@ async def real_vector_indices(driver, monkeypatch):
 
 
 def _index_and_refresh(driver, index_name: str, docs: list[dict[str, Any]]) -> None:
-    driver.save_to_aoss(index_name, docs)
+    assert driver.save_vector_to_aoss(
+        index_name,
+        [{**document, '_version': 1} for document in docs],
+    ) == len(docs)
     driver.aoss_client.indices.refresh(index=index_name)
 
 
@@ -301,9 +314,7 @@ class TestNodeAndEdgeSimilaritySearchEndToEnd:
 
 
 def test_cosine_conversion_matches_faiss_cosinesimil_formula():
-    # Sanity check the conversion constant against the documented OpenSearch formula
-    # for the faiss/nmslib cosinesimil space: score = 1 / (1 + d), d = 1 - cosine.
+    # OpenSearch's faiss cosinesimil score is (1 + cosine_similarity) / 2.
     for cosine in (-1.0, -0.3, 0.0, 0.42, 1.0):
-        d = 1 - cosine
-        score = 1 / (1 + d)
+        score = (1 + cosine) / 2
         assert cosine_similarity_from_knn_score(score) == pytest.approx(cosine, abs=1e-9)

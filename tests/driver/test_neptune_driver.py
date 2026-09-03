@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from graphiti_core.async_limiter import AsyncCapacityLimiter
+from graphiti_core.async_limiter import AsyncCapacityLimiter, AsyncCapacityOverloadedError
 from graphiti_core.driver import neptune_driver as neptune_driver_module
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.neptune.operations import search_ops as neptune_search_ops
@@ -20,14 +20,19 @@ from graphiti_core.driver.neptune_driver import (
     AOSS_QUERY_CONCURRENCY,
     MAX_AOSS_QUERY_SIZE,
     NEPTUNE_BOTO_CONFIG,
+    AossProjectionError,
     NeptuneAnalyticsClient,
     NeptuneDatabaseClient,
     NeptuneDriver,
+    VectorIndexConfigurationError,
     VectorIndexUnsupportedError,
     cosine_similarity_from_knn_score,
 )
+from graphiti_core.edges import EntityEdge
+from graphiti_core.errors import NodeGroupMismatchError
+from graphiti_core.graphiti import Graphiti
 from graphiti_core.helpers import EPISODE_AOSS_WRITE_VERSION
-from graphiti_core.nodes import EpisodeType, EpisodicNode
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search import search_utils
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import (
@@ -537,6 +542,80 @@ class TestNeptuneDriverAsyncBoundary:
         finally:
             for lease in leases:
                 lease.release()
+
+    @pytest.mark.asyncio
+    async def test_aoss_vector_mutation_does_not_block_event_loop(self):
+        driver = object.__new__(NeptuneDriver)
+
+        def slow_save(_name, data):
+            time.sleep(0.05)
+            return len(data)
+
+        driver.save_vector_to_aoss = slow_save  # type: ignore[method-assign]
+        tick = asyncio.Event()
+
+        async def mark_event_loop_progress():
+            await asyncio.sleep(0.01)
+            tick.set()
+
+        mutation = asyncio.create_task(
+            driver.save_vector_to_aoss_async('node_name_embedding', [{'uuid': 'node-1'}])
+        )
+        marker = asyncio.create_task(mark_event_loop_progress())
+
+        await asyncio.wait_for(tick.wait(), timeout=0.03)
+        assert not mutation.done()
+        assert await mutation == 1
+        await marker
+
+    @pytest.mark.asyncio
+    async def test_cancelled_aoss_mutation_holds_capacity_and_bounds_waiters(self):
+        driver = object.__new__(NeptuneDriver)
+        capacity = AsyncCapacityLimiter(1, max_waiters=1)
+        started = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        finished = [threading.Event(), threading.Event()]
+
+        def save(_name, data):
+            index = int(data[0]['uuid'])
+            started[index].set()
+            release[index].wait(timeout=2)
+            finished[index].set()
+            return len(data)
+
+        driver.save_vector_to_aoss = save  # type: ignore[method-assign]
+        first = None
+        second = None
+        try:
+            with patch.object(neptune_driver_module, '_AOSS_MUTATION_CAPACITY', capacity):
+                first = asyncio.create_task(
+                    driver.save_vector_to_aoss_async('node_name_embedding', [{'uuid': '0'}])
+                )
+                assert await asyncio.to_thread(started[0].wait, 1)
+
+                second = asyncio.create_task(
+                    driver.save_vector_to_aoss_async('node_name_embedding', [{'uuid': '1'}])
+                )
+                await asyncio.sleep(0)
+                with pytest.raises(AsyncCapacityOverloadedError):
+                    await driver.save_vector_to_aoss_async('node_name_embedding', [{'uuid': '2'}])
+
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+                assert not started[1].is_set()
+
+                release[0].set()
+                assert await asyncio.to_thread(finished[0].wait, 1)
+                assert await asyncio.to_thread(started[1].wait, 1)
+        finally:
+            for event in release:
+                event.set()
+            remaining = [task for task in (first, second) if task is not None and not task.done()]
+            await asyncio.gather(*remaining, return_exceptions=True)
+            for index, event in enumerate(started):
+                if event.is_set():
+                    assert await asyncio.to_thread(finished[index].wait, 1)
 
 
 class TestNeptuneSimilarityCapacity:
@@ -1190,9 +1269,36 @@ async def test_edge_similarity_search_neptune_queries_knn_index_then_fetches_by_
     )
 
     driver.run_aoss_knn_query.assert_awaited_once_with(
-        'edge_fact_embedding', [1.0, 0.0], 5, 0.3, ['g1']
+        'edge_fact_embedding', [1.0, 0.0], 5, 0.3, ['g1'], None
     )
     assert [e.uuid for e in results] == ['edge-1']
+
+
+@pytest.mark.asyncio
+async def test_edge_similarity_source_filter_without_group_uses_exact_neptune_scan():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.search_interface = None
+    driver.vector_search_enabled = True
+    driver.run_aoss_knn_query = AsyncMock()
+    driver.execute_query = AsyncMock(return_value=([], None, None))
+
+    results = await search_utils.edge_similarity_search(
+        driver,
+        [1.0, 0.0],
+        'source-node',
+        None,
+        SearchFilters(),
+        group_ids=None,
+        limit=5,
+        min_score=0.3,
+    )
+
+    assert results == []
+    driver.run_aoss_knn_query.assert_not_awaited()
+    query = driver.execute_query.await_args.args[0]
+    assert 'n.uuid = $source_uuid' in query
+    assert driver.execute_query.await_args.kwargs['source_uuid'] == 'source-node'
 
 
 def test_episode_aoss_write_uses_external_generation_when_supplied():
@@ -1264,6 +1370,204 @@ async def test_bulk_episode_write_uses_external_generation():
     assert payload['_version'] == EPISODE_AOSS_WRITE_VERSION
 
 
+@pytest.mark.asyncio
+async def test_legacy_edge_save_does_not_project_an_unpersisted_edge():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.graph_operations_interface = None
+    driver.execute_query = AsyncMock(return_value=([], None, None))
+    driver.save_vector_to_aoss_async = AsyncMock()
+    edge = EntityEdge(
+        uuid='edge-1',
+        name='RELATES_TO',
+        fact='a fact',
+        fact_embedding=[1.0, 0.0],
+        group_id='g1',
+        source_node_uuid='source',
+        target_node_uuid='target',
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(NodeGroupMismatchError, match='already owned by another group'):
+        await edge.save(driver)
+
+    driver.save_to_aoss.assert_not_called()
+    driver.save_vector_to_aoss_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bulk_node_write_rejects_partial_neptune_result():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.graph_operations_interface = None
+    driver.save_vector_to_aoss_async = AsyncMock()
+    tx = MagicMock()
+    tx.run = AsyncMock(
+        side_effect=[
+            ([], None, None),
+            ([{'uuid': 'node-1', 'projection_version': 7}], None, None),
+        ]
+    )
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    nodes = [
+        EntityNode(
+            uuid='node-1',
+            name='persisted',
+            name_embedding=[1.0, 0.0],
+            group_id='g1',
+            created_at=now,
+        ),
+        EntityNode(
+            uuid='node-2',
+            name='rejected',
+            name_embedding=[0.0, 1.0],
+            group_id='g1',
+            created_at=now,
+        ),
+    ]
+
+    with pytest.raises(NodeGroupMismatchError):
+        await add_nodes_and_edges_bulk_tx(tx, [], [], nodes, [], MagicMock(), driver)
+
+    assert tx.run.await_count == 2
+    driver.save_to_aoss.assert_not_called()
+    driver.save_vector_to_aoss_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bulk_edge_write_rejects_partial_neptune_result():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.graph_operations_interface = None
+    driver.save_vector_to_aoss_async = AsyncMock(return_value=1)
+    driver.delete_from_aoss_async = AsyncMock()
+    tx = MagicMock()
+    tx.run = AsyncMock(
+        side_effect=[
+            ([], None, None),
+            ([], None, None),
+            ([], None, None),
+            ([{'uuid': 'edge-1', 'projection_version': 7}], None, None),
+            ([], None, None),
+        ]
+    )
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    edges = [
+        EntityEdge(
+            uuid='edge-1',
+            name='RELATES_TO',
+            fact='persisted',
+            fact_embedding=[1.0, 0.0],
+            group_id='g1',
+            source_node_uuid='source',
+            target_node_uuid='target',
+            created_at=now,
+        ),
+        EntityEdge(
+            uuid='edge-2',
+            name='RELATES_TO',
+            fact='missing endpoint',
+            fact_embedding=[0.0, 1.0],
+            group_id='g1',
+            source_node_uuid='missing',
+            target_node_uuid='target',
+            created_at=now,
+        ),
+    ]
+
+    with pytest.raises(NodeGroupMismatchError):
+        await add_nodes_and_edges_bulk_tx(tx, [], [], [], edges, MagicMock(), driver)
+
+    driver.save_to_aoss.assert_not_called()
+    driver.save_vector_to_aoss_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bulk_write_with_projection_disabled_keeps_generation_pending():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.graph_operations_interface = None
+    driver.vector_projection_enabled = False
+    driver.save_vector_to_aoss_async = AsyncMock()
+    tx = MagicMock()
+    tx.run = AsyncMock(
+        side_effect=[
+            ([], None, None),
+            ([{'uuid': 'node-1', 'projection_version': 7}], None, None),
+            ([], None, None),
+            ([], None, None),
+        ]
+    )
+    node = EntityNode(
+        uuid='node-1',
+        name='node',
+        name_embedding=[1.0, 0.0],
+        group_id='g1',
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    await add_nodes_and_edges_bulk_tx(tx, [], [], [node], [], MagicMock(), driver)
+
+    assert tx.run.await_count == 4
+    driver.save_to_aoss.assert_called_once_with(
+        'node_name_and_summary',
+        [{'uuid': 'node-1', 'name': 'node', 'summary': '', 'group_id': 'g1'}],
+    )
+    driver.save_vector_to_aoss_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_disabled_legacy_neptune_bulk_operations_keep_fulltext_indexing():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.vector_projection_enabled = False
+    driver.graph_operations_interface = MagicMock()
+    driver.graph_operations_interface.episodic_node_save_bulk = AsyncMock()
+    driver.graph_operations_interface.node_save_bulk = AsyncMock()
+    driver.graph_operations_interface.episodic_edge_save_bulk = AsyncMock()
+    driver.graph_operations_interface.edge_save_bulk = AsyncMock()
+    driver.save_vector_to_aoss_async = AsyncMock()
+    tx = MagicMock()
+    node = EntityNode(
+        uuid='node-1',
+        name='node',
+        name_embedding=[1.0, 0.0],
+        group_id='g1',
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    await add_nodes_and_edges_bulk_tx(tx, [], [], [node], [], MagicMock(), driver)
+
+    driver.save_to_aoss.assert_called_once_with(
+        'node_name_and_summary',
+        [{'uuid': 'node-1', 'name': 'node', 'summary': '', 'group_id': 'g1'}],
+    )
+    driver.save_vector_to_aoss_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bulk_ingest_rejects_projection_reserved_attributes_before_graph_write():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.graph_operations_interface = None
+    tx = MagicMock()
+    tx.run = AsyncMock()
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    node = EntityNode(
+        uuid='node-1',
+        name='node',
+        name_embedding=[1.0, 0.0],
+        group_id='g1',
+        created_at=now,
+        attributes={'_graphiti_vector_delete_pending': True},
+    )
+
+    with pytest.raises(ValueError, match='_graphiti_vector_delete_pending'):
+        await add_nodes_and_edges_bulk_tx(tx, [], [], [node], [], MagicMock(), driver)
+
+    tx.run.assert_not_awaited()
+
+
 class TestNeptuneClientTimeouts:
     """A boto3 client with no explicit Config falls back to 60s connect/read
     timeouts and minimal retries, which turns a slow-but-alive Neptune query
@@ -1299,22 +1603,138 @@ class TestNeptuneClientTimeouts:
         assert NEPTUNE_BOTO_CONFIG.retries['max_attempts'] >= 1
 
 
+def test_graphiti_rejects_neptune_embedder_dimension_mismatch():
+    driver = MagicMock()
+    driver.provider = GraphProvider.NEPTUNE
+    driver.embedding_dim = 2
+    embedder = MagicMock()
+    embedder.config.embedding_dim = 3
+
+    with pytest.raises(
+        ValueError,
+        match=r'NeptuneDriver embedding_dim \(2\).*embedder dimension \(3\)',
+    ):
+        Graphiti(
+            graph_driver=driver,
+            llm_client=MagicMock(),
+            embedder=embedder,
+        )
+
+
 class TestCosineSimilarityFromKnnScore:
     """The vector indexes use the faiss engine's cosinesimil space, where
-    OpenSearch scores as 1 / (1 + d) and d = 1 - cosine_similarity."""
+    OpenSearch scores as (1 + cosine_similarity) / 2."""
 
     @pytest.mark.parametrize(
         ('cosine', 'expected_score'),
-        [(1.0, 1.0), (0.0, 0.5), (-1.0, 1 / 3)],
+        [(1.0, 1.0), (0.0, 0.5), (-1.0, 0.0)],
     )
     def test_round_trips_reference_cosine_values(self, cosine, expected_score):
-        d = 1 - cosine
-        score = 1 / (1 + d)
+        score = (1 + cosine) / 2
         assert score == pytest.approx(expected_score)
         assert cosine_similarity_from_knn_score(score) == pytest.approx(cosine)
 
     def test_zero_score_does_not_raise(self):
         assert cosine_similarity_from_knn_score(0.0) == -1.0
+
+
+class TestNeptuneKnnQuery:
+    def _driver(self) -> NeptuneDriver:
+        driver = object.__new__(NeptuneDriver)
+        driver.embedding_dim = 2
+        driver.vector_search_enabled = True
+        driver._execute_aoss_search = AsyncMock(  # type: ignore[method-assign]
+            return_value={'hits': {'hits': []}}
+        )
+        return driver
+
+    @pytest.mark.asyncio
+    async def test_zero_limit_does_not_query_aoss(self):
+        driver = self._driver()
+
+        result = await driver.run_aoss_knn_query('node_name_embedding', [1.0, 0.0], 0, 0.5)
+
+        assert result == []
+        driver._execute_aoss_search.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('group_ids', 'uuids'),
+        [([], None), (None, [])],
+    )
+    async def test_empty_filter_does_not_query_aoss(self, group_ids, uuids):
+        driver = self._driver()
+
+        result = await driver.run_aoss_knn_query(
+            'edge_fact_embedding',
+            [1.0, 0.0],
+            10,
+            0.5,
+            group_ids=group_ids,
+            uuids=uuids,
+        )
+
+        assert result == []
+        driver._execute_aoss_search.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_group_and_uuid_filters_are_pushed_into_knn_query(self):
+        driver = self._driver()
+        driver._execute_aoss_search.return_value = {  # type: ignore[attr-defined]
+            'hits': {'hits': [{'_score': 0.75, '_source': {'uuid': 'edge-1'}}]}
+        }
+
+        result = await driver.run_aoss_knn_query(
+            'edge_fact_embedding',
+            [1.0, 0.0],
+            5,
+            0.4,
+            group_ids=['group-1'],
+            uuids=['edge-1', 'edge-2'],
+        )
+
+        assert result == [{'id': 'edge-1', 'score': pytest.approx(0.5)}]
+        driver._execute_aoss_search.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'edge_fact_embedding',
+            {
+                'size': 5,
+                '_source': ['uuid'],
+                'query': {
+                    'knn': {
+                        'embedding': {
+                            'vector': [1.0, 0.0],
+                            'k': 5,
+                            'filter': {
+                                'bool': {
+                                    'filter': [
+                                        {'terms': {'group_id': ['group-1']}},
+                                        {'terms': {'uuid': ['edge-1', 'edge-2']}},
+                                    ]
+                                }
+                            },
+                        }
+                    }
+                },
+            },
+            vector=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_query_dimension_must_match_vector_index(self):
+        driver = self._driver()
+
+        with pytest.raises(ValueError, match='dimension 3; expected 2'):
+            await driver.run_aoss_knn_query('node_name_embedding', [1.0, 0.0, 0.0], 10, 0.5)
+
+        driver._execute_aoss_search.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_disabled_vector_search_cannot_query_aoss(self):
+        driver = self._driver()
+        driver.vector_search_enabled = False
+
+        with pytest.raises(RuntimeError, match='vector search is disabled'):
+            await driver.run_aoss_knn_query('node_name_embedding', [1.0, 0.0], 10, 0.5)
 
 
 class TestVectorIndexUnsupportedError:
@@ -1362,6 +1782,52 @@ class TestVectorIndexUnsupportedError:
                 }
             )
 
+    def test_vector_index_authorization_failure_is_not_reclassified(self):
+        driver = object.__new__(NeptuneDriver)
+        driver._aoss_host = 'aoss.example.com'
+        driver.aoss_client = MagicMock()
+        driver.aoss_client.indices.exists.return_value = False
+        driver.aoss_client.indices.create.side_effect = PermissionError(
+            'authorization_exception while creating knn_vector index'
+        )
+        vector_index = neptune_driver_module._vector_aoss_indices(4)[0]
+
+        with pytest.raises(PermissionError, match='authorization_exception'):
+            driver._create_aoss_index(vector_index)
+
+    def test_existing_incompatible_vector_index_fails_validation(self):
+        driver = object.__new__(NeptuneDriver)
+        driver._aoss_host = 'aoss.example.com'
+        driver.aoss_client = MagicMock()
+        driver.aoss_client.indices.exists.return_value = True
+        driver.aoss_client.indices.get_mapping.return_value = {
+            'node_name_embedding': {
+                'mappings': {
+                    'properties': {
+                        'uuid': {'type': 'keyword'},
+                        'group_id': {'type': 'keyword'},
+                        'embedding': {
+                            'type': 'knn_vector',
+                            'dimension': 8,
+                            'method': {
+                                'name': 'hnsw',
+                                'engine': 'faiss',
+                                'space_type': 'cosinesimil',
+                            },
+                        },
+                    }
+                }
+            }
+        }
+        driver.aoss_client.indices.get_settings.return_value = {
+            'node_name_embedding': {'settings': {'index': {'knn': 'true'}}}
+        }
+
+        with pytest.raises(VectorIndexConfigurationError, match=r'dimension=8.*expected 4'):
+            driver._create_aoss_index(neptune_driver_module._vector_aoss_indices(4)[0])
+
+        driver.aoss_client.indices.create.assert_not_called()
+
     def test_existing_index_is_not_recreated(self):
         driver = object.__new__(NeptuneDriver)
         driver._aoss_host = 'aoss.example.com'
@@ -1387,3 +1853,245 @@ class TestVectorIndexUnsupportedError:
             call.kwargs['index'] for call in driver.aoss_client.indices.create.call_args_list
         }
         assert created_names == {'node_name_embedding', 'edge_fact_embedding'}
+
+    @pytest.mark.asyncio
+    async def test_disabled_startup_creates_only_text_indices(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.vector_search_enabled = False
+        driver.vector_projection_enabled = False
+        driver._create_aoss_index = MagicMock()  # type: ignore[method-assign]
+
+        with patch.object(neptune_driver_module.asyncio, 'sleep', new=AsyncMock()) as sleep:
+            await driver.create_aoss_indices()
+
+        created_names = {
+            call.args[0]['index_name']
+            for call in driver._create_aoss_index.call_args_list  # type: ignore[attr-defined]
+        }
+        assert created_names == {
+            index['index_name'] for index in neptune_driver_module.text_aoss_indices
+        }
+        sleep.assert_awaited_once_with(60)
+
+
+class TestVectorProjectionDeletion:
+    def test_uuid_delete_writes_strict_versioned_tombstones(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.aoss_client = MagicMock()
+
+        with patch.object(neptune_driver_module.helpers, 'bulk', return_value=(2, [])) as bulk:
+            deleted = driver.delete_from_aoss(
+                'node_name_embedding',
+                uuids=['node-1', 'node-2'],
+                versions={'node-1': 4, 'node-2': 9},
+            )
+
+        assert deleted == 2
+        assert bulk.call_args.args[1] == [
+            {
+                '_op_type': 'index',
+                '_index': 'node_name_embedding',
+                '_id': 'node-1',
+                '_version': neptune_driver_module.vector_aoss_external_version(4),
+                '_version_type': 'external',
+                'uuid': 'node-1',
+                'projection_deleted': True,
+            },
+            {
+                '_op_type': 'index',
+                '_index': 'node_name_embedding',
+                '_id': 'node-2',
+                '_version': neptune_driver_module.vector_aoss_external_version(9),
+                '_version_type': 'external',
+                'uuid': 'node-2',
+                'projection_deleted': True,
+            },
+        ]
+
+    def test_older_save_version_conflict_is_a_superseded_success(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.vector_projection_enabled = True
+        driver._vector_aoss_indices = neptune_driver_module._vector_aoss_indices(2)
+        driver._aoss_indices = driver._vector_aoss_indices
+        driver.aoss_client = MagicMock()
+        conflict = {
+            'index': {
+                '_id': 'node-1',
+                'status': 409,
+                'error': {'type': 'version_conflict_engine_exception'},
+            }
+        }
+
+        with patch.object(
+            neptune_driver_module.helpers, 'bulk', return_value=(0, [conflict])
+        ) as bulk:
+            assert (
+                driver.save_vector_to_aoss(
+                    'node_name_embedding',
+                    [
+                        {
+                            'uuid': 'node-1',
+                            'group_id': 'g1',
+                            'embedding': [1.0, 0.0],
+                            '_version': 3,
+                        }
+                    ],
+                )
+                == 1
+            )
+
+        assert bulk.call_args.args[1][0]['_version_type'] == 'external'
+
+    def test_older_tombstone_version_conflict_is_a_superseded_success(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.aoss_client = MagicMock()
+        conflict = {
+            'index': {
+                '_id': 'node-1',
+                'status': 409,
+                'error': {'type': 'version_conflict_engine_exception'},
+            }
+        }
+
+        with patch.object(neptune_driver_module.helpers, 'bulk', return_value=(0, [conflict])):
+            assert (
+                driver.delete_from_aoss(
+                    'node_name_embedding',
+                    uuids=['node-1'],
+                    versions={'node-1': 3},
+                )
+                == 1
+            )
+
+    def test_unrelated_409_is_not_treated_as_a_version_conflict(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.vector_projection_enabled = True
+        driver._vector_aoss_indices = neptune_driver_module._vector_aoss_indices(2)
+        driver._aoss_indices = driver._vector_aoss_indices
+        driver.aoss_client = MagicMock()
+        unrelated = {
+            'index': {
+                '_id': 'node-1',
+                'status': 409,
+                'error': {'type': 'resource_already_exists_exception'},
+            }
+        }
+
+        with (
+            patch.object(
+                neptune_driver_module.helpers,
+                'bulk',
+                return_value=(0, [unrelated]),
+            ),
+            pytest.raises(AossProjectionError, match='indexed 0/1'),
+        ):
+            driver.save_vector_to_aoss(
+                'node_name_embedding',
+                [
+                    {
+                        'uuid': 'node-1',
+                        'group_id': 'g1',
+                        'embedding': [1.0, 0.0],
+                        '_version': 3,
+                    }
+                ],
+            )
+
+    @pytest.mark.asyncio
+    async def test_disabled_reset_does_not_delete_vector_indices(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.vector_projection_enabled = False
+        driver._aoss_indices = (
+            neptune_driver_module.text_aoss_indices + neptune_driver_module._vector_aoss_indices(2)
+        )
+        driver._vector_aoss_indices = neptune_driver_module._vector_aoss_indices(2)
+        driver.aoss_client = MagicMock()
+        driver.vector_aoss_client = MagicMock()
+        driver.aoss_client.indices.exists.return_value = True
+        driver.vector_aoss_client.indices.exists.return_value = True
+
+        await driver.delete_aoss_indices()
+
+        deleted_text_indices = {
+            call.kwargs['index'] for call in driver.aoss_client.indices.delete.call_args_list
+        }
+        assert deleted_text_indices == {
+            index['index_name'] for index in neptune_driver_module.text_aoss_indices
+        }
+        driver.vector_aoss_client.indices.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_explicit_vector_reset_uses_vector_collection(self):
+        driver = object.__new__(NeptuneDriver)
+        driver._vector_aoss_indices = neptune_driver_module._vector_aoss_indices(2)
+        driver.aoss_client = MagicMock()
+        driver.vector_aoss_client = MagicMock()
+        driver.vector_aoss_client.indices.exists.return_value = True
+
+        await driver.delete_vector_aoss_indices()
+
+        deleted_vector_indices = {
+            call.kwargs['index'] for call in driver.vector_aoss_client.indices.delete.call_args_list
+        }
+        assert deleted_vector_indices == {'node_name_embedding', 'edge_fact_embedding'}
+        driver.aoss_client.indices.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_vector_create_search_save_and_delete_use_separate_client(self):
+        driver = object.__new__(NeptuneDriver)
+        driver.embedding_dim = 2
+        driver.vector_search_enabled = True
+        driver.vector_projection_enabled = True
+        driver._vector_aoss_indices = neptune_driver_module._vector_aoss_indices(2)
+        driver._aoss_indices = neptune_driver_module.text_aoss_indices + driver._vector_aoss_indices
+        driver._aoss_host = 'text.example.com'
+        driver._vector_aoss_host = 'vector.example.com'
+        driver.aoss_client = MagicMock()
+        driver.vector_aoss_client = MagicMock()
+        driver.vector_aoss_client.indices.exists.return_value = False
+        driver.vector_aoss_client.search.return_value = {
+            'hits': {'hits': [{'_score': 1.0, '_source': {'uuid': 'node-1'}}]}
+        }
+
+        await driver.create_vector_aoss_indices()
+        driver.vector_aoss_client.indices.exists.return_value = True
+        result = await driver.run_aoss_knn_query('node_name_embedding', [1.0, 0.0], 1, 0.5)
+        with patch.object(
+            neptune_driver_module.helpers,
+            'bulk',
+            side_effect=[(1, []), (1, [])],
+        ) as bulk:
+            assert (
+                driver.save_vector_to_aoss(
+                    'node_name_embedding',
+                    [
+                        {
+                            'uuid': 'node-1',
+                            'group_id': 'g1',
+                            'embedding': [1.0, 0.0],
+                            '_version': 1,
+                        }
+                    ],
+                )
+                == 1
+            )
+            assert (
+                driver.delete_from_aoss(
+                    'node_name_embedding',
+                    uuids=['node-1'],
+                    versions={'node-1': 2},
+                )
+                == 1
+            )
+
+        assert result == [{'id': 'node-1', 'score': 1.0}]
+        assert {
+            call.kwargs['index'] for call in driver.vector_aoss_client.indices.create.call_args_list
+        } == {'node_name_embedding', 'edge_fact_embedding'}
+        driver.vector_aoss_client.search.assert_called_once()
+        assert [call.args[0] for call in bulk.call_args_list] == [
+            driver.vector_aoss_client,
+            driver.vector_aoss_client,
+        ]
+        driver.aoss_client.search.assert_not_called()
+        driver.aoss_client.indices.create.assert_not_called()

@@ -14,15 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.neptune.projection_versions import (
+    clear_projection_sync_pending,
+    defer_cancellation_until_complete,
+    reserve_projection_versions,
+    validate_batch_size,
+    validate_projection_attributes,
+)
 from graphiti_core.driver.operations.entity_node_ops import EntityNodeOperations
 from graphiti_core.driver.query_executor import QueryExecutor, Transaction
-from graphiti_core.driver.record_parsers import entity_node_from_record
+from graphiti_core.driver.record_parsers import (
+    entity_node_from_neptune_record as entity_node_from_record,
+)
 from graphiti_core.errors import NodeGroupMismatchError, NodeNotFoundError
-from graphiti_core.helpers import query_result_record_count
+from graphiti_core.helpers import get_neptune_projection_versions, query_result_record_count
 from graphiti_core.models.nodes.node_db_queries import (
     get_entity_node_return_query,
     get_entity_node_save_bulk_query,
@@ -30,16 +41,91 @@ from graphiti_core.models.nodes.node_db_queries import (
 )
 from graphiti_core.nodes import EntityNode
 
+if TYPE_CHECKING:
+    from graphiti_core.driver.neptune_driver import NeptuneDriver
+
 logger = logging.getLogger(__name__)
+
+_NODE_CANONICAL_PROPERTIES = frozenset(
+    {
+        'uuid',
+        'name',
+        'name_embedding',
+        'group_id',
+        'summary',
+        'created_at',
+        'labels',
+    }
+)
 
 
 class NeptuneEntityNodeOperations(EntityNodeOperations):
+    def __init__(self, driver: NeptuneDriver | None = None):
+        self._driver = driver
+
+    async def _sync_vector_projections(
+        self,
+        executor: QueryExecutor,
+        nodes: list[EntityNode],
+        batch_size: int,
+        projection_versions: dict[str, int],
+        tx: Transaction | None,
+    ) -> None:
+        if self._driver is None:
+            return
+
+        persisted = [node for node in nodes if node.uuid in projection_versions]
+        if persisted:
+            self._driver.save_to_aoss(
+                'node_name_and_summary',
+                [
+                    {
+                        'uuid': node.uuid,
+                        'name': node.name,
+                        'summary': node.summary,
+                        'group_id': node.group_id,
+                    }
+                    for node in persisted
+                ],
+            )
+        if getattr(self._driver, 'vector_projection_enabled', True) is False:
+            # Keep the exact graph generation pending so enabling projections can repair every
+            # write that occurred while the rollout was disabled.
+            return
+        for i in range(0, len(persisted), batch_size):
+            chunk = persisted[i : i + batch_size]
+            documents: list[dict[str, Any]] = []
+            for node in chunk:
+                document: dict[str, Any] = {
+                    'uuid': node.uuid,
+                    'group_id': node.group_id,
+                    '_version': projection_versions[node.uuid],
+                }
+                if node.name_embedding is not None:
+                    document['embedding'] = node.name_embedding
+                documents.append(document)
+            indexed = await self._driver.save_vector_to_aoss_async('node_name_embedding', documents)
+            if indexed != len(documents):
+                raise RuntimeError(
+                    'OpenSearch node vector projection is incomplete: '
+                    f'indexed {indexed}/{len(documents)} documents'
+                )
+            await clear_projection_sync_pending(
+                executor,
+                'node',
+                {node.uuid: projection_versions[node.uuid] for node in chunk},
+                tx,
+                batch_size=batch_size,
+            )
+
+    @defer_cancellation_until_complete
     async def save(
         self,
         executor: QueryExecutor,
         node: EntityNode,
         tx: Transaction | None = None,
     ) -> None:
+        validate_projection_attributes(node.attributes, _NODE_CANONICAL_PROPERTIES)
         entity_data: dict[str, Any] = {
             'uuid': node.uuid,
             'name': node.name,
@@ -60,8 +146,18 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
         if await query_result_record_count(result) != 1:
             raise NodeGroupMismatchError()
 
+        projection_versions = get_neptune_projection_versions(result)
+        await self._sync_vector_projections(
+            executor,
+            [node],
+            batch_size=1,
+            projection_versions=projection_versions,
+            tx=tx,
+        )
+
         logger.debug(f'Saved Node to Graph: {node.uuid}')
 
+    @defer_cancellation_until_complete
     async def save_bulk(
         self,
         executor: QueryExecutor,
@@ -69,8 +165,16 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
         tx: Transaction | None = None,
         batch_size: int = 100,
     ) -> None:
-        prepared: list[dict[str, Any]] = []
+        validate_batch_size(batch_size)
         for node in nodes:
+            validate_projection_attributes(node.attributes, _NODE_CANONICAL_PROPERTIES)
+
+        # A single UUID represents one materialized projection. Collapse duplicate caller
+        # entries before either store is mutated so Neptune and OpenSearch deterministically
+        # observe the same last-write-wins value and generation.
+        unique_nodes = list({node.uuid: node for node in nodes}.values())
+        prepared: list[dict[str, Any]] = []
+        for node in unique_nodes:
             entity_data: dict[str, Any] = {
                 'uuid': node.uuid,
                 'name': node.name,
@@ -98,32 +202,166 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
         for query, node_data in zip(queries, prepared, strict=True):
             grouped.setdefault(query, []).append(node_data)
 
+        projection_versions: dict[str, int] = {}
         for query, group_nodes in grouped.items():
             for i in range(0, len(group_nodes), batch_size):
                 chunk = group_nodes[i : i + batch_size]
                 if tx is not None:
-                    await tx.run(query, nodes=chunk)
+                    result = await tx.run(query, nodes=chunk)
                 else:
-                    await executor.execute_query(query, nodes=chunk)
+                    result = await executor.execute_query(query, nodes=chunk)
+                projection_versions.update(get_neptune_projection_versions(result))
 
+        if set(projection_versions) != {node.uuid for node in unique_nodes}:
+            raise NodeGroupMismatchError()
+
+        await self._sync_vector_projections(
+            executor,
+            unique_nodes,
+            batch_size=batch_size,
+            projection_versions=projection_versions,
+            tx=tx,
+        )
+
+    @defer_cancellation_until_complete
     async def delete(
         self,
         executor: QueryExecutor,
         node: EntityNode,
         tx: Transaction | None = None,
     ) -> None:
-        query = """
-            MATCH (n {uuid: $uuid})
-            WHERE n:Entity OR n:Episodic OR n:Community
-            DETACH DELETE n
-        """
-        if tx is not None:
-            await tx.run(query, uuid=node.uuid)
-        else:
-            await executor.execute_query(query, uuid=node.uuid)
-
+        await self._delete_uuids(executor, [node.uuid], tx=tx, batch_size=100)
         logger.debug(f'Deleted Node: {node.uuid}')
 
+    @staticmethod
+    def _record_uuids(result: Any) -> list[str]:
+        records = result[0] if isinstance(result, tuple) else result
+        if not isinstance(records, list):
+            return []
+        return list(
+            dict.fromkeys(
+                record['uuid']
+                for record in records
+                if isinstance(record, dict) and isinstance(record.get('uuid'), str)
+            )
+        )
+
+    async def _run_query(
+        self,
+        executor: QueryExecutor,
+        query: str,
+        tx: Transaction | None,
+        **kwargs: Any,
+    ) -> Any:
+        if tx is not None:
+            return await tx.run(query, **kwargs)
+        return await executor.execute_query(query, **kwargs)
+
+    async def _delete_incident_edges(
+        self,
+        executor: QueryExecutor,
+        deletions: list[dict[str, Any]],
+        tx: Transaction | None,
+        batch_size: int,
+    ) -> None:
+        # Marking every node pending takes the same endpoint write locks used by edge saves.
+        # New incident edges are therefore rejected while these bounded pages are drained.
+        query = """
+            UNWIND $deletions AS deletion
+            MATCH (n:Entity {uuid: deletion.uuid})-[e:RELATES_TO]-()
+            WHERE coalesce(n._graphiti_vector_delete_pending, false) = true
+              AND n._graphiti_projection_version = deletion.projection_version
+            RETURN DISTINCT e.uuid AS uuid
+            ORDER BY uuid
+            LIMIT $batch_size
+        """
+        from graphiti_core.driver.neptune.operations.entity_edge_ops import (
+            NeptuneEntityEdgeOperations,
+        )
+
+        edge_ops = NeptuneEntityEdgeOperations(self._driver)
+        while True:
+            result = await self._run_query(
+                executor,
+                query,
+                tx,
+                deletions=deletions,
+                batch_size=batch_size,
+            )
+            incident_edge_uuids = self._record_uuids(result)
+            if not incident_edge_uuids:
+                return
+            await edge_ops.delete_by_uuids(
+                executor,
+                incident_edge_uuids,
+                tx=tx,
+                batch_size=batch_size,
+            )
+
+    async def _delete_chunk(
+        self,
+        executor: QueryExecutor,
+        uuids: list[str],
+        tx: Transaction | None,
+        batch_size: int,
+    ) -> None:
+        node_versions = await reserve_projection_versions(
+            executor,
+            'node',
+            uuids,
+            tx,
+            batch_size=batch_size,
+        )
+        deletions = [{'uuid': uuid, 'projection_version': node_versions[uuid]} for uuid in uuids]
+        prepare_query = """
+            UNWIND $deletions AS deletion
+            MATCH (n:Entity {uuid: deletion.uuid})
+            SET n._graphiti_endpoint_lock = true
+            REMOVE n._graphiti_endpoint_lock
+            WITH n, deletion
+            WHERE coalesce(n._graphiti_projection_version, 0) < deletion.projection_version
+            SET n._graphiti_vector_delete_pending = true
+            SET n._graphiti_projection_version = deletion.projection_version
+            RETURN n.uuid AS uuid
+        """
+        await self._run_query(executor, prepare_query, tx, deletions=deletions)
+        await self._delete_incident_edges(executor, deletions, tx, batch_size)
+
+        if self._driver is not None:
+            await self._driver.delete_from_aoss_async(
+                'node_name_embedding',
+                uuids=uuids,
+                versions=node_versions,
+            )
+
+        finalize_query = """
+            UNWIND $deletions AS deletion
+            MATCH (n:Entity)
+            WHERE n.uuid = deletion.uuid
+              AND coalesce(n._graphiti_vector_delete_pending, false) = true
+              AND n._graphiti_projection_version = deletion.projection_version
+            DETACH DELETE n
+        """
+        await self._run_query(executor, finalize_query, tx, deletions=deletions)
+
+    async def _delete_uuids(
+        self,
+        executor: QueryExecutor,
+        uuids: list[str],
+        tx: Transaction | None,
+        batch_size: int,
+    ) -> None:
+        validate_batch_size(batch_size)
+        unique_uuids = list(dict.fromkeys(uuids))
+        for start in range(0, len(unique_uuids), batch_size):
+            await self._delete_chunk(
+                executor,
+                unique_uuids[start : start + batch_size],
+                tx,
+                batch_size,
+            )
+
+    @defer_cancellation_until_complete
     async def delete_by_group_id(
         self,
         executor: QueryExecutor,
@@ -131,15 +369,27 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
         tx: Transaction | None = None,
         batch_size: int = 100,
     ) -> None:
+        validate_batch_size(batch_size)
         query = """
             MATCH (n:Entity {group_id: $group_id})
-            DETACH DELETE n
+            RETURN n.uuid AS uuid
+            ORDER BY uuid
+            LIMIT $batch_size
         """
-        if tx is not None:
-            await tx.run(query, group_id=group_id)
-        else:
-            await executor.execute_query(query, group_id=group_id)
+        while True:
+            result = await self._run_query(
+                executor,
+                query,
+                tx,
+                group_id=group_id,
+                batch_size=batch_size,
+            )
+            uuids = self._record_uuids(result)
+            if not uuids:
+                return
+            await self._delete_uuids(executor, uuids, tx, batch_size)
 
+    @defer_cancellation_until_complete
     async def delete_by_uuids(
         self,
         executor: QueryExecutor,
@@ -147,15 +397,7 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
         tx: Transaction | None = None,
         batch_size: int = 100,
     ) -> None:
-        query = """
-            MATCH (n:Entity)
-            WHERE n.uuid IN $uuids
-            DETACH DELETE n
-        """
-        if tx is not None:
-            await tx.run(query, uuids=uuids)
-        else:
-            await executor.execute_query(query, uuids=uuids)
+        await self._delete_uuids(executor, uuids, tx, batch_size)
 
     async def get_by_uuid(
         self,
@@ -164,6 +406,7 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
     ) -> EntityNode:
         query = """
             MATCH (n:Entity {uuid: $uuid})
+            WHERE coalesce(n._graphiti_vector_delete_pending, false) = false
             RETURN
             """ + get_entity_node_return_query(GraphProvider.NEPTUNE)
         records, _, _ = await executor.execute_query(query, uuid=uuid)
@@ -180,6 +423,7 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
         query = """
             MATCH (n:Entity)
             WHERE n.uuid IN $uuids
+              AND coalesce(n._graphiti_vector_delete_pending, false) = false
             RETURN
             """ + get_entity_node_return_query(GraphProvider.NEPTUNE)
         records, _, _ = await executor.execute_query(query, uuids=uuids)
@@ -198,6 +442,7 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
             """
             MATCH (n:Entity)
             WHERE n.group_id IN $group_ids
+              AND coalesce(n._graphiti_vector_delete_pending, false) = false
             """
             + cursor_clause
             + """
@@ -224,6 +469,7 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
     ) -> None:
         query = """
             MATCH (n:Entity {uuid: $uuid})
+            WHERE coalesce(n._graphiti_vector_delete_pending, false) = false
             RETURN [x IN split(n.name_embedding, ",") | toFloat(x)] AS name_embedding
         """
         records, _, _ = await executor.execute_query(query, uuid=node.uuid)
@@ -241,6 +487,7 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
         query = """
             MATCH (n:Entity)
             WHERE n.uuid IN $uuids
+              AND coalesce(n._graphiti_vector_delete_pending, false) = false
             RETURN DISTINCT n.uuid AS uuid, [x IN split(n.name_embedding, ",") | toFloat(x)] AS name_embedding
         """
         embedding_map: dict[str, list[float]] = {}

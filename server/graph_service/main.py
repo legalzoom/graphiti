@@ -1,11 +1,17 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from importlib.metadata import version
+from typing import cast
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 from graphiti_core.async_limiter import AsyncCapacityOverloadedError
+from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.driver.neptune.vector_reconciliation import (
+    ProjectionReconciliationDriver,
+    run_pending_projection_reconciler,
+)
 
 from graph_service.auth import (
     AUTHORIZER_STATE_ATTR,
@@ -63,6 +69,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     authorizer = build_graphiti_authorizer(settings)
     client: ZepGraphiti | None = None
+    vector_reconciler: asyncio.Task[None] | None = None
     try:
         # JWT mode eagerly resolves the configured LZ JWKS. A pod never starts
         # accepting traffic with an empty verification-key cache.
@@ -75,9 +82,22 @@ async def lifespan(app: FastAPI):
         client = build_graphiti_client(settings)
         set_graphiti_client(app, client)
         await client.build_indices_and_constraints()
+        if client.driver.provider == GraphProvider.NEPTUNE:
+            neptune_driver = cast(ProjectionReconciliationDriver, client.driver)
+            vector_reconciler = asyncio.create_task(
+                run_pending_projection_reconciler(
+                    neptune_driver,
+                    settings.neptune_vector_reconcile_interval_seconds,
+                ),
+                name='neptune-vector-projection-reconciler',
+            )
         yield
     finally:
         try:
+            if vector_reconciler is not None:
+                vector_reconciler.cancel()
+                with suppress(asyncio.CancelledError):
+                    await vector_reconciler
             if client is not None:
                 # The only place this client is closed. The ingest router's lifespan is
                 # merged inside this one by `include_router`, so it has already closed

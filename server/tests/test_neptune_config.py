@@ -33,13 +33,26 @@ def test_neptune_backend_builds_driver_with_configured_endpoints(monkeypatch):
     _install_fake_neptune_module(monkeypatch, driver_constructor)
     monkeypatch.setattr(zep_graphiti, 'ZepGraphiti', graphiti_constructor)
 
-    zep_graphiti._create_graphiti_client(_settings(neptune_port=8282, aoss_port=8443))
+    zep_graphiti._create_graphiti_client(
+        _settings(
+            neptune_port=8282,
+            aoss_port=8443,
+            vector_aoss_host='vector-search.example',
+            vector_aoss_port=9443,
+            neptune_vector_projection_enabled=True,
+            neptune_vector_search_enabled=True,
+        )
+    )
 
     driver_constructor.assert_called_once_with(
         host='neptune-db://cluster.example',
         aoss_host='search.example',
         port=8282,
         aoss_port=8443,
+        vector_aoss_host='vector-search.example',
+        vector_aoss_port=9443,
+        vector_search_enabled=True,
+        vector_projection_enabled=True,
     )
     graphiti_constructor.assert_called_once_with(graph_driver=driver)
 

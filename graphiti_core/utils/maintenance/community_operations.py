@@ -39,10 +39,18 @@ async def get_community_clusters(
     community_clusters: list[list[EntityNode]] = []
 
     if group_ids is None:
+        pending_delete_filter = (
+            'AND coalesce(n._graphiti_vector_delete_pending, false) = false'
+            if driver.provider == GraphProvider.NEPTUNE
+            else ''
+        )
         group_id_values, _, _ = await driver.execute_query(
             """
             MATCH (n:Entity)
             WHERE n.group_id IS NOT NULL
+            """
+            + pending_delete_filter
+            + """
             RETURN
                 collect(DISTINCT n.group_id) AS group_ids
             """
@@ -60,6 +68,12 @@ async def get_community_clusters(
             if driver.provider == GraphProvider.KUZU:
                 match_query = """
                 MATCH (n:Entity {group_id: $group_id, uuid: $uuid})-[:RELATES_TO]-(e:RelatesToNode_)-[:RELATES_TO]-(m: Entity {group_id: $group_id})
+                """
+            elif driver.provider == GraphProvider.NEPTUNE:
+                match_query += """
+                WHERE coalesce(n._graphiti_vector_delete_pending, false) = false
+                  AND coalesce(e._graphiti_vector_delete_pending, false) = false
+                  AND coalesce(m._graphiti_vector_delete_pending, false) = false
                 """
             records, _, _ = await driver.execute_query(
                 match_query
@@ -283,9 +297,17 @@ async def determine_entity_community(
             pass
 
     # Check if the node is already part of a community
+    pending_entity_filter = (
+        'WHERE coalesce(n._graphiti_vector_delete_pending, false) = false'
+        if driver.provider == GraphProvider.NEPTUNE
+        else ''
+    )
     records, _, _ = await driver.execute_query(
         """
         MATCH (c:Community)-[:HAS_MEMBER]->(n:Entity {uuid: $entity_uuid})
+        """
+        + pending_entity_filter
+        + """
         RETURN
         """
         + COMMUNITY_NODE_RETURN,
@@ -302,6 +324,13 @@ async def determine_entity_community(
     if driver.provider == GraphProvider.KUZU:
         match_query = """
             MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[:RELATES_TO]-(e:RelatesToNode_)-[:RELATES_TO]-(n:Entity {uuid: $entity_uuid})
+        """
+    elif driver.provider == GraphProvider.NEPTUNE:
+        match_query = """
+            MATCH (c:Community)-[:HAS_MEMBER]->(m:Entity)-[e:RELATES_TO]-(n:Entity {uuid: $entity_uuid})
+            WHERE coalesce(m._graphiti_vector_delete_pending, false) = false
+              AND coalesce(e._graphiti_vector_delete_pending, false) = false
+              AND coalesce(n._graphiti_vector_delete_pending, false) = false
         """
     records, _, _ = await driver.execute_query(
         match_query

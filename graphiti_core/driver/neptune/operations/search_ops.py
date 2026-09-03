@@ -24,9 +24,13 @@ from graphiti_core.driver.operations.search_ops import SearchOperations
 from graphiti_core.driver.query_executor import QueryExecutor
 from graphiti_core.driver.record_parsers import (
     community_node_from_record,
-    entity_edge_from_record,
-    entity_node_from_record,
     episodic_node_from_record,
+)
+from graphiti_core.driver.record_parsers import (
+    entity_edge_from_neptune_record as entity_edge_from_record,
+)
+from graphiti_core.driver.record_parsers import (
+    entity_node_from_neptune_record as entity_node_from_record,
 )
 from graphiti_core.edges import EntityEdge
 from graphiti_core.models.edges.edge_db_queries import get_entity_edge_return_query
@@ -40,6 +44,12 @@ from graphiti_core.search.search_filters import (
     SearchFilters,
     edge_search_filter_query_constructor,
     node_search_filter_query_constructor,
+)
+from graphiti_core.search.search_utils import (
+    edge_similarity_search as shared_edge_similarity_search,
+)
+from graphiti_core.search.search_utils import (
+    node_similarity_search as shared_node_similarity_search,
 )
 from graphiti_core.search.search_utils import (
     run_neptune_similarity_pipeline,
@@ -78,11 +88,23 @@ class NeptuneSearchOperations(SearchOperations):
         for r in res['hits']['hits']:
             input_ids.append({'id': r['_source']['uuid'], 'score': r['_score']})
 
+        filter_queries, filter_params = node_search_filter_query_constructor(
+            search_filter, GraphProvider.NEPTUNE
+        )
+        if group_ids is not None:
+            filter_queries.append('n.group_id IN $group_ids')
+            filter_params['group_ids'] = group_ids
+        filter_queries.append('coalesce(n._graphiti_vector_delete_pending, false) = false')
+        filter_query = ' AND ' + ' AND '.join(filter_queries)
+
         cypher = (
             """
             UNWIND $ids as i
             MATCH (n:Entity)
             WHERE n.uuid=i.id
+            """
+            + filter_query
+            + """
             RETURN
             """
             + get_entity_node_return_query(GraphProvider.NEPTUNE)
@@ -96,6 +118,7 @@ class NeptuneSearchOperations(SearchOperations):
             cypher,
             ids=input_ids,
             limit=limit,
+            **filter_params,
         )
 
         return [entity_node_from_record(r) for r in records]
@@ -109,63 +132,53 @@ class NeptuneSearchOperations(SearchOperations):
         limit: int = 10,
         min_score: float = 0.6,
     ) -> list[EntityNode]:
+        if self._driver is not None:
+            return await shared_node_similarity_search(
+                self._driver,
+                search_vector,
+                search_filter,
+                group_ids,
+                limit,
+                min_score,
+            )
+
+        # Unbound operation objects intentionally accept the narrower QueryExecutor contract.
+        # Keep their legacy Neptune scan path instead of assuming GraphDriver-only attributes.
         filter_queries, filter_params = node_search_filter_query_constructor(
             search_filter, GraphProvider.NEPTUNE
         )
-
         if group_ids is not None:
             filter_queries.append('n.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
-
-        filter_query = ''
-        if filter_queries:
-            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
-
-        # Neptune: fetch all embeddings, compute cosine in Python
+        filter_queries.append('coalesce(n._graphiti_vector_delete_pending, false) = false')
+        filter_query = ' WHERE ' + ' AND '.join(filter_queries) if filter_queries else ''
         query = (
             'MATCH (n:Entity)'
             + filter_query
-            + """
-            RETURN DISTINCT id(n) as id, n.name_embedding as embedding
-            """
+            + ' RETURN DISTINCT id(n) AS id, n.name_embedding AS embedding'
         )
 
         async def execute_neptune_similarity_search() -> list[EntityNode]:
-            resp, _, _ = await executor.execute_query(
-                query,
-                **filter_params,
-            )
-
+            resp, _, _ = await executor.execute_query(query, **filter_params)
             if not resp:
                 return []
-
             input_ids = await run_neptune_similarity_scorer(
                 score_neptune_similarity_records, search_vector, resp, min_score
             )
-
             if not input_ids:
                 return []
-
-            cypher = (
-                """
-            UNWIND $ids as i
-            MATCH (n:Entity)
-            WHERE id(n)=i.id
-            RETURN
-            """
+            hydration_query = (
+                'UNWIND $ids AS i MATCH (n:Entity) WHERE id(n) = i.id '
+                'AND coalesce(n._graphiti_vector_delete_pending, false) = false RETURN '
                 + get_entity_node_return_query(GraphProvider.NEPTUNE)
-                + """
-            ORDER BY i.score DESC
-            LIMIT $limit
-            """
+                + ' ORDER BY i.score DESC LIMIT $limit'
             )
             records, _, _ = await executor.execute_query(
-                cypher,
+                hydration_query,
                 ids=input_ids,
                 limit=limit,
             )
-
-            return [entity_node_from_record(r) for r in records]
+            return [entity_node_from_record(record) for record in records]
 
         return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
 
@@ -189,6 +202,16 @@ class NeptuneSearchOperations(SearchOperations):
             filter_queries.append('n.group_id IN $group_ids')
             filter_queries.append('origin.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
+        filter_queries.extend(
+            [
+                'coalesce(n._graphiti_vector_delete_pending, false) = false',
+                'coalesce(origin._graphiti_vector_delete_pending, false) = false',
+                'all(path_relationship IN relationships(path) WHERE '
+                'coalesce(path_relationship._graphiti_vector_delete_pending, false) = false)',
+                'all(path_node IN nodes(path) WHERE '
+                'coalesce(path_node._graphiti_vector_delete_pending, false) = false)',
+            ]
+        )
 
         filter_query = ''
         if filter_queries:
@@ -197,7 +220,7 @@ class NeptuneSearchOperations(SearchOperations):
         cypher = (
             f"""
             UNWIND $bfs_origin_node_uuids AS origin_uuid
-            MATCH (origin {{uuid: origin_uuid}})-[e:RELATES_TO|MENTIONS*1..{max_depth}]->(n:Entity)
+            MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS*1..{max_depth}]->(n:Entity)
             WHERE (origin:Entity OR origin:Episodic)
             AND n.group_id = origin.group_id
             """
@@ -244,6 +267,13 @@ class NeptuneSearchOperations(SearchOperations):
         if group_ids is not None:
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
+        filter_queries.extend(
+            [
+                'coalesce(e._graphiti_vector_delete_pending, false) = false',
+                'coalesce(n._graphiti_vector_delete_pending, false) = false',
+                'coalesce(m._graphiti_vector_delete_pending, false) = false',
+            ]
+        )
 
         filter_query = ''
         if filter_queries:
@@ -290,78 +320,75 @@ class NeptuneSearchOperations(SearchOperations):
         limit: int = 10,
         min_score: float = 0.6,
     ) -> list[EntityEdge]:
+        if self._driver is not None:
+            return await shared_edge_similarity_search(
+                self._driver,
+                search_vector,
+                source_node_uuid,
+                target_node_uuid,
+                search_filter,
+                group_ids,
+                limit,
+                min_score,
+            )
+
         filter_queries, filter_params = edge_search_filter_query_constructor(
             search_filter, GraphProvider.NEPTUNE
         )
-
         if group_ids is not None:
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
-
-            if source_node_uuid is not None:
-                filter_params['source_uuid'] = source_node_uuid
-                filter_queries.append('n.uuid = $source_uuid')
-
-            if target_node_uuid is not None:
-                filter_params['target_uuid'] = target_node_uuid
-                filter_queries.append('m.uuid = $target_uuid')
-
-        filter_query = ''
-        if filter_queries:
-            filter_query = ' WHERE ' + (' AND '.join(filter_queries))
-
-        # Fetch all embeddings, compute cosine similarity in Python
+        if source_node_uuid is not None:
+            filter_queries.append('n.uuid = $source_uuid')
+            filter_params['source_uuid'] = source_node_uuid
+        if target_node_uuid is not None:
+            filter_queries.append('m.uuid = $target_uuid')
+            filter_params['target_uuid'] = target_node_uuid
+        filter_queries.extend(
+            [
+                'coalesce(e._graphiti_vector_delete_pending, false) = false',
+                'coalesce(n._graphiti_vector_delete_pending, false) = false',
+                'coalesce(m._graphiti_vector_delete_pending, false) = false',
+            ]
+        )
+        filter_query = ' WHERE ' + ' AND '.join(filter_queries) if filter_queries else ''
         query = (
             'MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)'
             + filter_query
-            + """
-            RETURN DISTINCT id(e) as id, e.fact_embedding as embedding
-            """
+            + ' RETURN DISTINCT id(e) AS id, e.fact_embedding AS embedding'
         )
 
         async def execute_neptune_similarity_search() -> list[EntityEdge]:
-            resp, _, _ = await executor.execute_query(
-                query,
-                **filter_params,
-            )
-
+            resp, _, _ = await executor.execute_query(query, **filter_params)
             if not resp:
                 return []
-
             input_ids = await run_neptune_similarity_scorer(
                 score_neptune_similarity_records, search_vector, resp, min_score
             )
-
             if not input_ids:
                 return []
-
-            cypher = """
-            UNWIND $ids as i
-            MATCH ()-[r]->()
-            WHERE id(r) = i.id
-            RETURN
-                r.uuid AS uuid,
-                r.group_id AS group_id,
-                startNode(r).uuid AS source_node_uuid,
-                endNode(r).uuid AS target_node_uuid,
-                r.created_at AS created_at,
-                r.name AS name,
-                r.fact AS fact,
-                split(r.episodes, ",") AS episodes,
-                r.expired_at AS expired_at,
-                r.valid_at AS valid_at,
-                r.invalid_at AS invalid_at,
-                properties(r) AS attributes
-            ORDER BY i.score DESC
-            LIMIT $limit
-            """
+            hydration_query = (
+                """
+                UNWIND $ids AS i
+                MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
+                WHERE id(e) = i.id
+                  AND coalesce(e._graphiti_vector_delete_pending, false) = false
+                  AND coalesce(n._graphiti_vector_delete_pending, false) = false
+                  AND coalesce(m._graphiti_vector_delete_pending, false) = false
+                RETURN
+                """
+                + get_entity_edge_return_query(GraphProvider.NEPTUNE)
+                + """
+                ORDER BY i.score DESC
+                LIMIT $limit
+                """
+            )
             records, _, _ = await executor.execute_query(
-                cypher,
+                hydration_query,
                 ids=input_ids,
                 limit=limit,
             )
-
-            return [entity_edge_from_record(r) for r in records]
+            return [entity_edge_from_record(record) for record in records]
 
         return await run_neptune_similarity_pipeline(execute_neptune_similarity_search)
 
@@ -384,6 +411,13 @@ class NeptuneSearchOperations(SearchOperations):
         if group_ids is not None:
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
+        filter_queries.extend(
+            [
+                'coalesce(e._graphiti_vector_delete_pending, false) = false',
+                'coalesce(n._graphiti_vector_delete_pending, false) = false',
+                'coalesce(m._graphiti_vector_delete_pending, false) = false',
+            ]
+        )
 
         filter_query = ''
         if filter_queries:
@@ -393,7 +427,11 @@ class NeptuneSearchOperations(SearchOperations):
             f"""
             UNWIND $bfs_origin_node_uuids AS origin_uuid
             MATCH path = (origin {{uuid: origin_uuid}})-[:RELATES_TO|MENTIONS *1..{max_depth}]->(n:Entity)
-            WHERE origin:Entity OR origin:Episodic
+            WHERE (origin:Entity OR origin:Episodic)
+              AND all(path_relationship IN relationships(path) WHERE
+                  coalesce(path_relationship._graphiti_vector_delete_pending, false) = false)
+              AND all(path_node IN nodes(path) WHERE
+                  coalesce(path_node._graphiti_vector_delete_pending, false) = false)
             UNWIND relationships(path) AS rel
             MATCH (n:Entity)-[e:RELATES_TO {{uuid: rel.uuid}}]-(m:Entity)
             """
