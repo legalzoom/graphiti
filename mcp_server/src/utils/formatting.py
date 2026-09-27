@@ -3,9 +3,9 @@
 from typing import Any
 
 from graphiti_core.edges import EntityEdge
-from graphiti_core.nodes import EntityNode
+from graphiti_core.nodes import EntityNode, EpisodicNode
 
-from models.response_types import EdgeResult, NodeResult
+from models.response_types import EdgeResult, EpisodeResult, NodeResult
 
 
 def to_node_result(node: EntityNode) -> NodeResult:
@@ -20,6 +20,20 @@ def to_node_result(node: EntityNode) -> NodeResult:
         summary=node.summary,
         group_id=node.group_id,
         attributes=attrs,
+    )
+
+
+def to_episode_result(episode: EpisodicNode) -> EpisodeResult:
+    """Build an EpisodeResult TypedDict from an EpisodicNode."""
+    return EpisodeResult(
+        uuid=episode.uuid,
+        name=episode.name,
+        content=episode.content,
+        created_at=episode.created_at.isoformat() if episode.created_at else None,
+        valid_at=episode.valid_at.isoformat() if episode.valid_at else None,
+        source=episode.source.value,
+        source_description=episode.source_description,
+        group_id=episode.group_id,
     )
 
 

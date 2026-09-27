@@ -39,6 +39,7 @@ from models.response_types import (
     BuildCommunitiesResponse,
     CommunityResult,
     EpisodeEntitiesResponse,
+    EpisodeLookupResponse,
     EpisodeSearchResponse,
     ErrorResponse,
     FactSearchResponse,
@@ -64,7 +65,7 @@ from services.factories import (
 )
 from services.graphiti_scope import driver_for_group, graphiti_for_group
 from services.queue_service import QueueService
-from utils.formatting import format_fact_result, to_edge_result, to_node_result
+from utils.formatting import format_fact_result, to_edge_result, to_episode_result, to_node_result
 from utils.type_config import (
     build_edge_type_map,
     build_edge_types,
@@ -1184,24 +1185,9 @@ async def get_episodes(
             required_scope=ToolScope.READ,
         )
 
-        # Format the results
-        episode_results = []
-        for episode in episodes:
-            episode_dict = {
-                'uuid': episode.uuid,
-                'name': episode.name,
-                'content': episode.content,
-                'created_at': episode.created_at.isoformat() if episode.created_at else None,
-                'source': episode.source.value
-                if hasattr(episode.source, 'value')
-                else str(episode.source),
-                'source_description': episode.source_description,
-                'group_id': episode.group_id,
-            }
-            episode_results.append(episode_dict)
-
         return EpisodeSearchResponse(
-            message='Episodes retrieved successfully', episodes=episode_results
+            message='Episodes retrieved successfully',
+            episodes=[to_episode_result(episode) for episode in episodes],
         )
     except McpAuthorizationError:
         raise
@@ -1209,6 +1195,57 @@ async def get_episodes(
         error_msg = str(e)
         logger.error(f'Error getting episodes: {error_msg}')
         return ErrorResponse(error=f'Error getting episodes: {error_msg}')
+
+
+@secured_tool(ToolScope.READ, group_parameter='group_id')
+async def get_episode(
+    uuid: str,
+    group_id: str | None = None,
+) -> EpisodeLookupResponse | ErrorResponse:
+    """Get one stored episode by UUID.
+
+    add_memory only queues an episode, and the episode is stored when its processing
+    finishes. `episode` is null while the episode is still queued, when its processing
+    failed, and when no episode has this UUID. An episode found in another group is
+    refused, never returned.
+
+    Args:
+        uuid: UUID of the episode
+        group_id: Group containing the episode. Falls back to the configured default group.
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    try:
+        client = await graphiti_service.get_client()
+        effective_group_id = group_id or _default_group_id()
+        if not effective_group_id:
+            return ErrorResponse(error='No group_id provided and no default group_id is configured')
+        scoped_client = await graphiti_for_group(client, effective_group_id)
+
+        try:
+            episode = await EpisodicNode.get_by_uuid(scoped_client.driver, uuid)
+        except NodeNotFoundError:
+            return EpisodeLookupResponse(
+                message=f'No episode with UUID {uuid} is stored', episode=None
+            )
+        _require_resource_in_groups(
+            episode.group_id,
+            [effective_group_id],
+            required_scope=ToolScope.READ,
+            resource_name='episode',
+        )
+        return EpisodeLookupResponse(
+            message='Episode retrieved successfully', episode=to_episode_result(episode)
+        )
+    except McpAuthorizationError:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting episode: {error_msg}')
+        return ErrorResponse(error=f'Error getting episode: {error_msg}')
 
 
 @secured_tool(ToolScope.WRITE, group_parameter='group_id')

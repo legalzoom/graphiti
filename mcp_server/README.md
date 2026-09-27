@@ -638,6 +638,8 @@ when enabled they require the admin bearer token. Other tools require the scopes
 - `delete_episode`: Delete an episode and cascade-delete the entities/facts it solely created.
 - `get_entity_edge`: Get an entity edge by its UUID.
 - `get_episodes`: Get the most recent episodes for a specific group.
+- `get_episode`: Get one stored episode by UUID. `episode` is null until the queued episode has been
+  processed, and stays null if its processing failed.
 - `clear_graph`: Clear all data from the knowledge graph for the given group(s).
 - `get_status`: Get the status of the Graphiti MCP server and database connection.
 

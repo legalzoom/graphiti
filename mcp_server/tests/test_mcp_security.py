@@ -8,6 +8,7 @@ import subprocess
 import sys
 import textwrap
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -19,7 +20,7 @@ from graphiti_core import Graphiti
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.edges import EntityEdge
 from graphiti_core.errors import GroupIdValidationError, NodeNotFoundError
-from graphiti_core.nodes import EntityNode, EpisodicNode, SagaNode
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode, SagaNode
 from graphiti_core.search.search_config import SearchResults
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
@@ -371,7 +372,8 @@ async def test_get_episodes_routes_falkor_groups_and_applies_one_global_limit(
             name=uuid,
             content='content',
             created_at=None,
-            source='text',
+            valid_at=None,
+            source=EpisodeType.text,
             source_description='test',
             group_id=group_id,
         )
@@ -946,6 +948,7 @@ async def test_stdio_uuid_tools_preserve_requested_group_integrity(monkeypatch) 
         await registered_tool('delete_entity_edge')(uuid='edge', group_id='team-a'),
         await registered_tool('delete_episode')(uuid='episode', group_id='team-a'),
         await registered_tool('get_episode_entities')(episode_uuids=['episode'], group_id='team-a'),
+        await registered_tool('get_episode')(uuid='episode', group_id='team-a'),
         await registered_tool('add_triplet')(
             source_node_name='source',
             edge_name='relates',
@@ -970,6 +973,86 @@ async def test_stdio_uuid_tools_preserve_requested_group_integrity(monkeypatch) 
     scoped_client.get_nodes_and_edges_by_episode.assert_not_awaited()
     scoped_client.add_triplet.assert_not_awaited()
     queue.add_episode.assert_not_awaited()
+
+
+def install_episode_lookup(
+    monkeypatch, settings: McpSecuritySettings, lookup: AsyncMock
+) -> tuple[object, object, AsyncMock]:
+    base_client = SimpleNamespace(driver=SimpleNamespace(provider=GraphProvider.NEPTUNE))
+    scoped_driver = object()
+    group_client = AsyncMock(return_value=SimpleNamespace(driver=scoped_driver))
+    monkeypatch.setattr(graphiti_mcp_server, 'MCP_SECURITY', settings)
+    monkeypatch.setattr(graphiti_mcp_server, 'active_transport', 'http')
+    monkeypatch.setattr(
+        graphiti_mcp_server,
+        'graphiti_service',
+        SimpleNamespace(get_client=AsyncMock(return_value=base_client)),
+    )
+    monkeypatch.setattr(graphiti_mcp_server, 'graphiti_for_group', group_client)
+    monkeypatch.setattr(EpisodicNode, 'get_by_uuid', lookup)
+    return base_client, scoped_driver, group_client
+
+
+@pytest.mark.asyncio
+async def test_get_episode_returns_the_stored_episode_from_the_group_scoped_client(
+    monkeypatch,
+) -> None:
+    settings = settings_from()
+    token = await StaticTokenVerifier(settings).verify_token(READ_TOKEN)
+    assert token is not None
+    stored = EpisodicNode(
+        uuid='episode-uuid',
+        name='settled finding',
+        group_id='team-a',
+        labels=[],
+        source=EpisodeType.json,
+        content='{"outcome": "fixed"}',
+        source_description='review outcome',
+        created_at=datetime(2026, 9, 27, 8, 0, tzinfo=timezone.utc),
+        valid_at=datetime(2026, 9, 26, 21, 30, tzinfo=timezone.utc),
+    )
+    lookup = AsyncMock(return_value=stored)
+    base_client, scoped_driver, group_client = install_episode_lookup(monkeypatch, settings, lookup)
+
+    token_context = auth_context_var.set(AuthenticatedUser(token))
+    try:
+        result = await registered_tool('get_episode')(uuid='episode-uuid', group_id='team-a')
+    finally:
+        auth_context_var.reset(token_context)
+
+    assert result == {
+        'message': 'Episode retrieved successfully',
+        'episode': {
+            'uuid': 'episode-uuid',
+            'name': 'settled finding',
+            'content': '{"outcome": "fixed"}',
+            'created_at': '2026-09-27T08:00:00+00:00',
+            'valid_at': '2026-09-26T21:30:00+00:00',
+            'source': 'json',
+            'source_description': 'review outcome',
+            'group_id': 'team-a',
+        },
+    }
+    group_client.assert_awaited_once_with(base_client, 'team-a')
+    lookup.assert_awaited_once_with(scoped_driver, 'episode-uuid')
+
+
+@pytest.mark.asyncio
+async def test_get_episode_reports_an_unstored_uuid_as_null(monkeypatch) -> None:
+    settings = settings_from()
+    token = await StaticTokenVerifier(settings).verify_token(READ_TOKEN)
+    assert token is not None
+    lookup = AsyncMock(side_effect=NodeNotFoundError('queued-uuid'))
+    _, scoped_driver, _ = install_episode_lookup(monkeypatch, settings, lookup)
+
+    token_context = auth_context_var.set(AuthenticatedUser(token))
+    try:
+        result = await registered_tool('get_episode')(uuid='queued-uuid', group_id='team-a')
+    finally:
+        auth_context_var.reset(token_context)
+
+    assert result == {'message': 'No episode with UUID queued-uuid is stored', 'episode': None}
+    lookup.assert_awaited_once_with(scoped_driver, 'queued-uuid')
 
 
 @pytest.mark.asyncio

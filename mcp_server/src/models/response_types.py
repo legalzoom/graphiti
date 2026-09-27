@@ -33,9 +33,25 @@ class FactSearchResponse(TypedDict):
     facts: list[dict[str, Any]]
 
 
+class EpisodeResult(TypedDict):
+    uuid: str
+    name: str
+    content: str
+    created_at: str | None
+    valid_at: str | None
+    source: str
+    source_description: str
+    group_id: str
+
+
 class EpisodeSearchResponse(TypedDict):
     message: str
-    episodes: list[dict[str, Any]]
+    episodes: list[EpisodeResult]
+
+
+class EpisodeLookupResponse(TypedDict):
+    message: str
+    episode: EpisodeResult | None
 
 
 class StatusResponse(TypedDict):
