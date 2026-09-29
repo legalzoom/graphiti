@@ -85,7 +85,8 @@ class TestNeptuneDriverAsyncBoundary:
         assert result == [{'ok': True}]
 
     @pytest.mark.asyncio
-    async def test_execute_query_list_preserves_last_result(self):
+    @pytest.mark.parametrize('via_session', [False, True])
+    async def test_query_list_preserves_parameters_and_all_results(self, via_session):
         driver = object.__new__(NeptuneDriver)
         calls = []
 
@@ -95,7 +96,8 @@ class TestNeptuneDriverAsyncBoundary:
 
         driver._run_query = run_query
 
-        result, _, _ = await driver.execute_query(
+        execute = driver.session().run if via_session else driver.execute_query
+        result, _, _ = await execute(
             [
                 ('RETURN 1', {'first': True}),
                 ('RETURN 2', {'second': True}),
@@ -106,7 +108,7 @@ class TestNeptuneDriverAsyncBoundary:
             ('RETURN 1', {'first': True}),
             ('RETURN 2', {'second': True}),
         ]
-        assert result == [{'query': 'RETURN 2'}]
+        assert result == [{'query': 'RETURN 1'}, {'query': 'RETURN 2'}]
 
     @pytest.mark.asyncio
     async def test_aoss_search_does_not_block_event_loop_and_uses_requested_limit(self):

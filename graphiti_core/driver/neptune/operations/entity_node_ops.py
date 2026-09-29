@@ -192,18 +192,11 @@ class NeptuneEntityNodeOperations(EntityNodeOperations):
 
         queries = get_entity_node_save_bulk_query(GraphProvider.NEPTUNE, prepared)
 
-        # Neptune bakes each node's labels into its query text (openCypher has
-        # no equivalent to Neo4j's `SET n:$(node.labels)`), so query text is a
-        # pure function of a node's label set. Group nodes by that query text
-        # so a node only gets UNWOUND through the query built for its own
-        # labels, then chunk each group so a single request's payload stays
-        # bounded regardless of how many nodes share a label combination.
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for query, node_data in zip(queries, prepared, strict=True):
-            grouped.setdefault(query, []).append(node_data)
-
+        # The shared query builder binds each label group. Keep requests bounded
+        # here without rebuilding or changing that query-to-node association.
         projection_versions: dict[str, int] = {}
-        for query, group_nodes in grouped.items():
+        for query, parameters in queries:
+            group_nodes = parameters['nodes']
             for i in range(0, len(group_nodes), batch_size):
                 chunk = group_nodes[i : i + batch_size]
                 if tx is not None:
