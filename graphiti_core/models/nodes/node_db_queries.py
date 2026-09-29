@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Any
+from typing import Any, Literal, overload
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.helpers import validate_node_labels
@@ -278,6 +278,18 @@ def get_entity_node_save_query(provider: GraphProvider, labels: str, has_aoss: b
             )
 
 
+@overload
+def get_entity_node_save_bulk_query(
+    provider: Literal[GraphProvider.NEPTUNE], nodes: list[dict], has_aoss: bool = False
+) -> list[tuple[str, dict[str, Any]]]: ...
+
+
+@overload
+def get_entity_node_save_bulk_query(
+    provider: GraphProvider, nodes: list[dict], has_aoss: bool = False
+) -> str | Any: ...
+
+
 def get_entity_node_save_bulk_query(
     provider: GraphProvider, nodes: list[dict], has_aoss: bool = False
 ) -> str | Any:
@@ -305,13 +317,19 @@ def get_entity_node_save_bulk_query(
                     )
             return queries
         case GraphProvider.NEPTUNE:
-            queries = []
+            # Neptune requires static labels in query text. Bind each label-specific
+            # query to its own nodes so every caller, including episode ingestion,
+            # preserves that association. Label order does not change the group.
+            grouped: dict[tuple[str, ...], list[dict]] = {}
             for node in nodes:
-                labels = ''
-                for label in node['labels']:
-                    labels += f' SET n:{label}\n'
+                label_set = tuple(sorted(set(node['labels'])))
+                grouped.setdefault(label_set, []).append(node)
+            queries = []
+            for label_set, group_nodes in grouped.items():
+                labels = ''.join(f' SET n:{label}\n' for label in label_set)
                 queries.append(
-                    f"""
+                    (
+                        f"""
                         UNWIND $nodes AS node
                         MERGE (projection:GraphitiProjectionVersion {{
                             projection_id: "node:" + node.uuid
@@ -343,7 +361,9 @@ def get_entity_node_save_bulk_query(
                         SET n._graphiti_projection_version = projection_version
                         SET n._graphiti_vector_sync_pending = projection_version
                         RETURN n.uuid AS uuid, projection_version
-                    """
+                    """,
+                        {'nodes': group_nodes},
+                    )
                 )
             return queries
         case GraphProvider.KUZU:

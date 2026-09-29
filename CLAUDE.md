@@ -121,6 +121,7 @@ docker-compose up
 
 ### Testing Requirements
 
+- Provider write regressions must exercise the actual episode producer, session and driver path, not only direct operation helpers. Mock external I/O rather than the query/session boundary. A label-specific bulk query must carry only its own node population, and split-query results must retain every persisted UUID and projection generation. Add new driver tests to the explicit focused-driver CI command because the general unit gate excludes that directory.
 - Run tests with `make test` or `pytest`
 - Integration tests require database connections and are marked with `_int` suffix
 - Use `pytest-xdist` for parallel test execution

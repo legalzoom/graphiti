@@ -36,12 +36,13 @@ def test_entity_node_save_query_rejects_unsafe_labels_when_validation_is_bypasse
         )
 
 
-def test_entity_node_save_bulk_query_rejects_unsafe_labels_when_validation_is_bypassed():
+@pytest.mark.parametrize('provider', [GraphProvider.FALKORDB, GraphProvider.NEPTUNE])
+def test_entity_node_save_bulk_query_rejects_unsafe_labels_when_validation_is_bypassed(provider):
     with pytest.raises(
         NodeLabelValidationError, match='node_labels must start with a letter or underscore'
     ):
         get_entity_node_save_bulk_query(
-            GraphProvider.FALKORDB,
+            provider,
             [
                 {
                     'uuid': 'node-1',

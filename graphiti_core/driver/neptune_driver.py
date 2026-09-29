@@ -630,7 +630,7 @@ class NeptuneDriver(GraphDriver):
             return query
 
     async def execute_query(
-        self, cypher_query_, **kwargs: Any
+        self, cypher_query_: str | list[tuple[str, dict[str, Any]]], **kwargs: Any
     ) -> tuple[list[dict[str, Any]], None, None]:
         params = dict(kwargs)
         # Unwrap nested 'params' dict (legacy search_utils compatibility)
@@ -642,8 +642,9 @@ class NeptuneDriver(GraphDriver):
             params.pop(key, None)
         if isinstance(cypher_query_, list):
             result: list[dict[str, Any]] = []
-            for q in cypher_query_:
-                result, _, _ = await self._execute_query_in_thread(q[0], q[1])
+            for query, query_params in cypher_query_:
+                records, _, _ = await self._execute_query_in_thread(query, query_params)
+                result.extend(records)
             return result, None, None
         else:
             return await self._execute_query_in_thread(cypher_query_, params)
@@ -1431,11 +1432,5 @@ class NeptuneDriverSession(GraphDriverSession):
         # Directly await the provided async function with `self` as the transaction/session
         return await func(self, *args, **kwargs)
 
-    async def run(self, query: str | list, **kwargs: Any) -> Any:
-        if isinstance(query, list):
-            res = None
-            for q in query:
-                res = await self.driver.execute_query(q, **kwargs)
-            return res
-        else:
-            return await self.driver.execute_query(str(query), **kwargs)
+    async def run(self, query: str | list[tuple[str, dict[str, Any]]], **kwargs: Any) -> Any:
+        return await self.driver.execute_query(query, **kwargs)
