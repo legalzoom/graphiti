@@ -33,6 +33,14 @@ class FactSearchResponse(TypedDict):
     facts: list[dict[str, Any]]
 
 
+class GraphBrowseResponse(TypedDict):
+    group_id: str
+    nodes: list[NodeResult]
+    facts: list[dict[str, Any]]
+    next_node_cursor: str | None
+    next_fact_cursor: str | None
+
+
 class EpisodeSearchResponse(TypedDict):
     message: str
     episodes: list[dict[str, Any]]

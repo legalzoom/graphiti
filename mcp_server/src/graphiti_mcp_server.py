@@ -25,7 +25,7 @@ from graphiti_core.driver.neptune.vector_reconciliation import (
     run_pending_projection_reconciler,
 )
 from graphiti_core.edges import EntityEdge
-from graphiti_core.errors import NodeNotFoundError
+from graphiti_core.errors import GroupsEdgesNotFoundError, NodeNotFoundError
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode, SagaNode
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_filters import SearchFilters
@@ -42,6 +42,7 @@ from models.response_types import (
     EpisodeSearchResponse,
     ErrorResponse,
     FactSearchResponse,
+    GraphBrowseResponse,
     NodeSearchResponse,
     SagaSummaryResponse,
     StatusResponse,
@@ -768,6 +769,78 @@ async def add_memory(
         error_msg = str(e)
         logger.error(f'Error queuing episode: {error_msg}')
         return ErrorResponse(error=f'Error queuing episode: {error_msg}')
+
+
+@secured_tool(ToolScope.READ, group_parameter='group_id')
+async def browse_group_graph(
+    group_id: str,
+    node_cursor: str | None = None,
+    fact_cursor: str | None = None,
+    max_nodes: int = 32,
+    max_facts: int = 48,
+) -> GraphBrowseResponse | ErrorResponse:
+    """Read one cursor page of a group's entities and relationships without semantic search.
+
+    Edge endpoints are included so a page can draw connections even when their
+    entities fall on another node page. Cursors walk the complete group in UUID order.
+    """
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+    if not 0 <= max_nodes <= 64 or not 0 <= max_facts <= 100 or max_nodes + max_facts == 0:
+        return ErrorResponse(
+            error='max_nodes must be 0-64 and max_facts must be 0-100, with one nonzero'
+        )
+
+    try:
+        client = await graphiti_service.get_client()
+        driver = await driver_for_group(client, group_id)
+        node_rows = (
+            await EntityNode.get_by_group_ids(
+                driver, [group_id], limit=max_nodes + 1, uuid_cursor=node_cursor
+            )
+            if max_nodes
+            else []
+        )
+        try:
+            fact_rows = (
+                await EntityEdge.get_by_group_ids(
+                    driver, [group_id], limit=max_facts + 1, uuid_cursor=fact_cursor
+                )
+                if max_facts
+                else []
+            )
+        except GroupsEdgesNotFoundError:
+            fact_rows = []
+
+        _authorize_returned_groups(node_rows + fact_rows, [group_id], required_scope=ToolScope.READ)
+        page_nodes = node_rows[:max_nodes]
+        page_facts = fact_rows[:max_facts]
+        endpoint_ids = list(
+            {
+                endpoint
+                for edge in page_facts
+                for endpoint in (edge.source_node_uuid, edge.target_node_uuid)
+            }
+            - {node.uuid for node in page_nodes}
+        )
+        endpoint_nodes = (
+            await EntityNode.get_by_uuids(driver, endpoint_ids, group_id=group_id)
+            if endpoint_ids
+            else []
+        )
+        _authorize_returned_groups(endpoint_nodes, [group_id], required_scope=ToolScope.READ)
+        return GraphBrowseResponse(
+            group_id=group_id,
+            nodes=[to_node_result(node) for node in page_nodes + endpoint_nodes],
+            facts=[format_fact_result(edge) for edge in page_facts],
+            next_node_cursor=page_nodes[-1].uuid if len(node_rows) > max_nodes else None,
+            next_fact_cursor=page_facts[-1].uuid if len(fact_rows) > max_facts else None,
+        )
+    except McpAuthorizationError:
+        raise
+    except Exception as exc:
+        logger.error('Error browsing graph: %s', exc)
+        return ErrorResponse(error=f'Error browsing graph: {exc}')
 
 
 @secured_tool(ToolScope.READ, group_parameter='group_ids')
