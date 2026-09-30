@@ -629,6 +629,10 @@ when enabled they require the admin bearer token. Other tools require the scopes
   `previous_episode_uuids`, `update_communities`, and `saga` / `saga_previous_episode_uuid`.
 - `add_triplet`: Add a single fact (source entity -> fact -> target entity) directly, bypassing extraction.
 - `search_nodes`: Search the knowledge graph for relevant entities; supports `entity_types` and `center_node_uuid`.
+- `browse_group_graph`: Read a group without a search query. Pass `group_id`, optional
+  `node_cursor` and `fact_cursor`, and per-page `max_nodes` (0–64) and `max_facts` (0–100).
+  Results include relationship endpoint nodes and independent next cursors; continue until both are null.
+  The group ID is a scope, not an entity or a root node.
 - `search_memory_facts`: Search for relevant facts (edges); supports `edge_types`, `center_node_uuid`,
   and `valid_at` / `invalid_at` date-range filters.
 - `summarize_saga`: Generate or refresh the running summary of a saga's episodes.
