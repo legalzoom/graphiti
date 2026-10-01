@@ -121,6 +121,8 @@ docker-compose up
 
 ### Testing Requirements
 
+- MCP composition passes the process OpenTelemetry tracer to every Graphiti client. Reuse the library's stage spans and configured provider; do not introduce a parallel exporter or log source payloads for diagnostics. Tracing context managers yield once and preserve original operation failures and cancellation. Guard this with real in-memory SDK spans through MCP initialization and search, not only constructor mocks. Exporter setup and live diagnostic availability require separate operational verification.
+- Neptune full-text result limits must reach the actual OpenSearch body and hydration unchanged, subject to the driver's declared maximum. Test both shared search and bound operations through real request construction, mocking only external I/O. A correct result limit does not establish pre-candidate group filtering or live recall quality.
 - Provider write regressions must exercise the actual episode producer, session and driver path, not only direct operation helpers. Mock external I/O rather than the query/session boundary. A label-specific bulk query must carry only its own node population, and split-query results must retain every persisted UUID and projection generation. Add new driver tests to the explicit focused-driver CI command because the general unit gate excludes that directory.
 - Run tests with `make test` or `pytest`
 - Integration tests require database connections and are marked with `_int` suffix

@@ -751,6 +751,14 @@ The Graphiti MCP Server uses HTTP transport (at endpoint `/mcp/`). Claude Deskto
 - Docker and Docker Compose (for the default FalkorDB combined container)
 - (Optional) Neo4j database (version 5.26 or later) if not using the default FalkorDB setup
 
+## Distributed tracing
+
+The MCP server supplies the process OpenTelemetry tracer to Graphiti for every database backend. The existing native spans expose search stages, candidate/result counts and model-call metadata. No separate exporter or raw prompt/response recorder is installed by the server.
+
+Configure the OpenTelemetry provider, exporter and sampling through your deployment's instrumentation. With no configured provider/exporter, this wiring does not send traces anywhere. Application startup or a successful tool response does not establish that stage spans reached an observability backend. Verify an actual search trace after instrumenting the process. Standard exception events can contain error messages, so the exporter and its redaction policy must be appropriate for the source data.
+
+Distributed tracing is separate from the anonymous usage telemetry below. `GRAPHITI_TELEMETRY_ENABLED` controls that usage collection, not the process OpenTelemetry provider.
+
 ## Telemetry
 
 The Graphiti MCP server uses the Graphiti core library, which includes anonymous telemetry collection. When you initialize the Graphiti MCP server, anonymous usage statistics are collected to help improve the framework.

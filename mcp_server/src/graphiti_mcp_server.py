@@ -31,6 +31,7 @@ from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
+from opentelemetry import trace
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
@@ -421,6 +422,7 @@ class GraphitiService:
             self.entity_types = build_entity_types(self.config.graphiti.entity_types)
             self.edge_types = build_edge_types(self.config.graphiti.edge_types)
             self.edge_type_map = build_edge_type_map(self.config.graphiti.edge_type_map)
+            tracer = trace.get_tracer(__name__)
 
             # Initialize Graphiti client with appropriate driver
             try:
@@ -443,6 +445,7 @@ class GraphitiService:
                         embedder=embedder_client,
                         cross_encoder=cross_encoder_client,
                         max_coroutines=self.semaphore_limit,
+                        tracer=tracer,
                     )
                 elif db_provider == 'neptune':
                     from graphiti_core.driver.neptune_driver import NeptuneDriver
@@ -465,6 +468,7 @@ class GraphitiService:
                         embedder=embedder_client,
                         cross_encoder=cross_encoder_client,
                         max_coroutines=self.semaphore_limit,
+                        tracer=tracer,
                     )
                 else:
                     # For Neo4j (default), use the original approach
@@ -476,6 +480,7 @@ class GraphitiService:
                         embedder=embedder_client,
                         cross_encoder=cross_encoder_client,
                         max_coroutines=self.semaphore_limit,
+                        tracer=tracer,
                     )
             except Exception as db_error:
                 # Check for connection errors
