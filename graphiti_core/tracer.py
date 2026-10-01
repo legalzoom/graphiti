@@ -145,15 +145,11 @@ class OpenTelemetryTracer(Tracer):
         self._span_prefix = span_prefix.rstrip('.')
 
     @contextmanager
-    def start_span(self, name: str) -> Generator[OpenTelemetrySpan | NoOpSpan, None, None]:
+    def start_span(self, name: str) -> Generator[OpenTelemetrySpan, None, None]:
         """Start a new OpenTelemetry span with the configured prefix."""
-        try:
-            full_name = f'{self._span_prefix}.{name}'
-            with self._tracer.start_as_current_span(full_name) as span:
-                yield OpenTelemetrySpan(span)
-        except Exception:
-            # If tracing fails, yield a no-op span to prevent breaking the operation
-            yield NoOpSpan()
+        full_name = f'{self._span_prefix}.{name}'
+        with self._tracer.start_as_current_span(full_name) as span:
+            yield OpenTelemetrySpan(span)
 
 
 def create_tracer(otel_tracer: Any | None = None, span_prefix: str = 'graphiti') -> Tracer:

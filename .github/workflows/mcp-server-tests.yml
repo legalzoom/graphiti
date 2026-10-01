@@ -67,6 +67,7 @@ jobs:
             tests/test_neptune_config.py \
             tests/test_core_parity.py \
             tests/test_mcp_security.py \
+            tests/test_tracing.py \
             -m "not integration"
       - name: Type-check MCP security and routing surfaces
         working-directory: mcp_server
@@ -78,6 +79,7 @@ jobs:
           src/graphiti_mcp_server.py
           tests/test_core_parity.py
           tests/test_mcp_security.py
+          tests/test_tracing.py
       - name: Wait for FalkorDB
         run: |
           for i in $(seq 1 30); do

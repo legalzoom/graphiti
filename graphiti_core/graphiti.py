@@ -18,6 +18,7 @@ import logging
 from contextlib import suppress
 from datetime import datetime
 from time import time
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -71,7 +72,7 @@ from graphiti_core.search.search_utils import (
     get_mentioned_nodes,
 )
 from graphiti_core.telemetry import capture_event
-from graphiti_core.tracer import Tracer, create_tracer
+from graphiti_core.tracer import create_tracer
 from graphiti_core.utils.bulk_utils import (
     RawEpisode,
     add_nodes_and_edges_bulk,
@@ -104,6 +105,9 @@ from graphiti_core.utils.maintenance.node_operations import (
 )
 from graphiti_core.utils.ontology_utils.entity_types_utils import validate_entity_types
 from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS
+
+if TYPE_CHECKING:
+    from opentelemetry.trace import Tracer as OTelTracer
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +149,7 @@ class Graphiti:
         store_raw_episode_content: bool = True,
         graph_driver: GraphDriver | None = None,
         max_coroutines: int | None = None,
-        tracer: Tracer | None = None,
+        tracer: 'OTelTracer | None' = None,
         trace_span_prefix: str = 'graphiti',
     ):
         """
@@ -179,7 +183,7 @@ class Graphiti:
         max_coroutines : int | None, optional
             The maximum number of concurrent operations allowed. Overrides SEMAPHORE_LIMIT set in the environment.
             If not set, the Graphiti default is used.
-        tracer : Tracer | None, optional
+        tracer : opentelemetry.trace.Tracer | None, optional
             An OpenTelemetry tracer instance for distributed tracing. If not provided, tracing is disabled (no-op).
         trace_span_prefix : str, optional
             Prefix to prepend to all span names. Defaults to 'graphiti'.

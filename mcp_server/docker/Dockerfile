@@ -80,7 +80,7 @@ RUN --mount=type=secret,id=socket_api_key \
     fi; \
     sed -i '/\[tool\.uv\.sources\]/,/graphiti-core/d' pyproject.toml; \
     if [ -n "${GRAPHITI_CORE_VERSION}" ]; then \
-      sed -i "s/graphiti-core\[falkordb\][>=]\+[0-9]\+\.[0-9]\+\.[0-9]\+/graphiti-core[falkordb]==${GRAPHITI_CORE_VERSION}/" pyproject.toml; \
+      sed -i "s/graphiti-core\[falkordb,tracing\][>=]\+[0-9]\+\.[0-9]\+\.[0-9]\+/graphiti-core[falkordb,tracing]==${GRAPHITI_CORE_VERSION}/" pyproject.toml; \
     fi; \
     echo "Regenerating lock file for PyPI graphiti-core..."; \
     rm -f uv.lock; \

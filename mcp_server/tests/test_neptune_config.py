@@ -1,7 +1,7 @@
 import asyncio
 import sys
 from types import ModuleType
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
 from graphiti_core.driver.driver import GraphProvider
@@ -189,6 +189,7 @@ async def test_graphiti_service_wires_neptune_driver_and_main_reranker(monkeypat
         embedder=embedder_client,
         cross_encoder=cross_encoder_client,
         max_coroutines=7,
+        tracer=ANY,
     )
     client.build_indices_and_constraints.assert_awaited_once_with()
     assert service.vector_reconciler is not None

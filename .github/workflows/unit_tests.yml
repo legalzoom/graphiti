@@ -71,6 +71,7 @@ jobs:
             tests/driver/test_neptune_batching.py \
             tests/driver/test_neptune_driver.py \
             tests/driver/test_neptune_episode_entity_labels.py \
+            tests/driver/test_neptune_fulltext_limits.py \
             tests/driver/test_neptune_pending_delete_visibility.py \
             tests/driver/test_neptune_projection_security.py \
             tests/driver/test_neptune_search_ops_delegation.py \

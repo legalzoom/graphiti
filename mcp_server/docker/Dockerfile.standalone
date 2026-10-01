@@ -98,10 +98,10 @@ RUN --mount=type=secret,id=socket_api_key \
     fi; \
     if [ "$USE_LOCAL_CORE" = "true" ]; then \
       echo "Resolving graphiti-core from local source at /app"; \
-      sed -i 's/graphiti-core\[falkordb\]/graphiti-core[falkordb,neptune]/' pyproject.toml; \
+      sed -i 's/graphiti-core\[falkordb,tracing\]/graphiti-core[falkordb,neptune,tracing]/' pyproject.toml; \
     else \
       sed -i '/\[tool\.uv\.sources\]/,/graphiti-core/d' pyproject.toml; \
-      sed -i "s/graphiti-core\[falkordb\][>=]\+[0-9]\+\.[0-9]\+\.[0-9]\+/graphiti-core[neo4j,falkordb,neptune]==${GRAPHITI_CORE_VERSION}/" pyproject.toml; \
+      sed -i "s/graphiti-core\[falkordb,tracing\][>=]\+[0-9]\+\.[0-9]\+\.[0-9]\+/graphiti-core[neo4j,falkordb,neptune,tracing]==${GRAPHITI_CORE_VERSION}/" pyproject.toml; \
       echo "Regenerating lock file for PyPI graphiti-core..."; \
     fi; \
     rm -f uv.lock; \

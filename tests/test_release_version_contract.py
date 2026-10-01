@@ -1,7 +1,13 @@
 import importlib
 import re
+import shlex
+import subprocess
 import sys
 from pathlib import Path
+from string import Template
+
+import pytest
+from packaging.requirements import Requirement
 
 tomllib = importlib.import_module('tomllib' if sys.version_info >= (3, 11) else 'tomli')
 
@@ -44,7 +50,8 @@ def test_neptune_release_images_install_the_required_core_extra():
     assert 'elif [ "$INSTALL_NEPTUNE" = "true" ]; then EXTRA="[neptune]"' in server_dockerfile
     assert 'INSTALL_NEPTUNE=true' in server_release_workflow
     assert (
-        'graphiti-core[neo4j,falkordb,neptune]==${GRAPHITI_CORE_VERSION}' in standalone_dockerfile
+        'graphiti-core[neo4j,falkordb,neptune,tracing]==${GRAPHITI_CORE_VERSION}'
+        in standalone_dockerfile
     )
 
     # The version stamp is written on BOTH install paths, so assert both rather
@@ -87,6 +94,46 @@ def test_fork_images_can_install_graphiti_core_from_local_source():
     # [tool.uv.sources] path entry in place instead of stripping it.
     assert '$UV_CMD pip install --reinstall --no-cache "/app${EXTRA}"' in server_dockerfile
     assert (
-        "sed -i 's/graphiti-core\\[falkordb\\]/graphiti-core[falkordb,neptune]/' pyproject.toml"
+        "sed -i 's/graphiti-core\\[falkordb,tracing\\]/graphiti-core[falkordb,neptune,tracing]/' pyproject.toml"
         in standalone_dockerfile
     )
+
+
+@pytest.mark.parametrize(
+    ('filename', 'required_extras', 'transform_count'),
+    [
+        ('Dockerfile', {'falkordb', 'tracing'}, 1),
+        ('Dockerfile.standalone', {'falkordb', 'neptune', 'tracing'}, 2),
+    ],
+)
+def test_image_dependency_transforms_preserve_tracing(filename, required_extras, transform_count):
+    """Apply the actual image substitutions to the actual project, without shell execution."""
+    dockerfile = (ROOT / 'mcp_server/docker' / filename).read_text()
+    project = (ROOT / 'mcp_server/pyproject.toml').read_text()
+    version = _project_version(ROOT / 'pyproject.toml')
+    transforms = [
+        shlex.split(line.strip().removesuffix(' \\').removesuffix(';'))[2]
+        for line in dockerfile.splitlines()
+        if 'sed -i' in line and 's/graphiti-core' in line
+    ]
+    assert len(transforms) == transform_count
+
+    for transform in transforms:
+        expression = Template(transform).substitute(GRAPHITI_CORE_VERSION=version)
+        result = subprocess.run(
+            ['sed', expression],
+            input=project,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=5,
+        )
+        requirements = [
+            Requirement(value) for value in tomllib.loads(result.stdout)['project']['dependencies']
+        ]
+        core = next(
+            requirement for requirement in requirements if requirement.name == 'graphiti-core'
+        )
+        assert required_extras <= core.extras
+        if '${GRAPHITI_CORE_VERSION}' in transform:
+            assert str(core.specifier) == f'=={version}'
