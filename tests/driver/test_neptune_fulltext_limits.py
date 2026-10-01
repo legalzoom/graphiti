@@ -28,7 +28,11 @@ async def test_fulltext_limit_reaches_request_and_hydration(result_limit, bound_
         )
         for i in range(2 * result_limit)
     ]
-    records = {edge.uuid: edge.model_dump(mode='json') for edge in candidates}
+    # Neptune persists datetime.isoformat(), not Pydantic's JSON datetime format.
+    records = {
+        edge.uuid: {**edge.model_dump(mode='json'), 'created_at': edge.created_at.isoformat()}
+        for edge in candidates
+    }
     driver = object.__new__(NeptuneDriver)
     driver.aoss_client = Mock()
     driver.client = Mock()

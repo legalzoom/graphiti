@@ -1,7 +1,7 @@
 """Synthetic MCP composition tests using real Graphiti and in-memory SDK spans."""
 
-from importlib import import_module
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -47,7 +47,14 @@ async def test_service_emits_native_search_spans(
         edge_fulltext_search=AsyncMock(return_value=[]),
         edge_similarity_search=AsyncMock(return_value=[]),
     )
-    monkeypatch.setattr(import_module(driver_module), driver_name, Mock(return_value=driver))
+    # Optional database SDKs are outside this composition test. Keep Graphiti
+    # itself real, but replace driver imports before loading their dependencies.
+    if driver_module == 'graphiti_core.graphiti':
+        module = sys.modules[driver_module]
+    else:
+        module = ModuleType(driver_module)
+        monkeypatch.setitem(sys.modules, driver_module, module)
+    monkeypatch.setattr(module, driver_name, Mock(return_value=driver), raising=False)
     llm = Mock(spec=LLMClient)
     embedder = Mock(spec=EmbedderClient)
     embedder.create = AsyncMock(return_value=[0.1, 0.2])
