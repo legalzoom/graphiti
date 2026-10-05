@@ -15,13 +15,33 @@ limitations under the License.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 from graphiti_core.driver.query_executor import QueryExecutor
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 
 
+@dataclass(frozen=True)
+class SearchIndexPruneResult:
+    index_name: str
+    examined: int
+    retained: int
+    orphaned: int
+    removed: int
+
+
 class GraphMaintenanceOperations(ABC):
+    async def prune_search_index(
+        self,
+        executor: QueryExecutor,
+        group_id: str,
+        *,
+        dry_run: bool,
+    ) -> list[SearchIndexPruneResult]:
+        """Prune absent graph records from derived search storage, preserving live records."""
+        raise NotImplementedError('This provider does not support search-index pruning')
+
     @abstractmethod
     async def clear_data(
         self,

@@ -13,6 +13,20 @@ class SuccessResponse(TypedDict):
     message: str
 
 
+class SearchIndexPruneCounts(TypedDict):
+    index_name: str
+    examined: int
+    retained: int
+    orphaned: int
+    removed: int
+
+
+class SearchIndexPruneResponse(TypedDict):
+    group_id: str
+    dry_run: bool
+    indices: list[SearchIndexPruneCounts]
+
+
 class NodeResult(TypedDict):
     uuid: str
     name: str

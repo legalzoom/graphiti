@@ -121,6 +121,7 @@ docker-compose up
 
 ### Testing Requirements
 
+- Neptune group clear owns keyword cleanup as well as graph deletion. Exercise the public clear helper and real driver against external-I/O fixtures. Repair must preserve exact foreign groups and live records, treat retirement tombstones as deleted for retrieval, and fail on incomplete search or conditional-delete failure. Never fall back to unconditional deletion or a shared-index reset. Applied cleanup requires quiesced group writers; local mocks do not qualify the deployed provider's concurrency metadata support.
 - Provider write regressions must exercise the actual episode producer, session and driver path, not only direct operation helpers. Mock external I/O rather than the query/session boundary. A label-specific bulk query must carry only its own node population, and split-query results must retain every persisted UUID and projection generation. Add new driver tests to the explicit focused-driver CI command because the general unit gate excludes that directory.
 - Run tests with `make test` or `pytest`
 - Integration tests require database connections and are marked with `_int` suffix

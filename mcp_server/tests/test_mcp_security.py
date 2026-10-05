@@ -1218,6 +1218,122 @@ async def test_clear_graph_preserves_one_transaction_for_shared_database_backend
     group_driver.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('credential', 'group', 'enabled'),
+    [
+        (READ_TOKEN, 'team-a', True),
+        (WRITE_TOKEN, 'team-a', True),
+        (ADMIN_TOKEN, 'foreign', True),
+        (ADMIN_TOKEN, '', True),
+        (ADMIN_TOKEN, 'team-a', False),
+    ],
+)
+async def test_prune_search_index_refuses_unauthorized_access_before_io(
+    monkeypatch,
+    credential,
+    group,
+    enabled,
+) -> None:
+    settings = settings_from({'GRAPHITI_MCP_DESTRUCTIVE_TOOLS_ENABLED': str(enabled).lower()})
+    token = await StaticTokenVerifier(settings).verify_token(credential)
+    assert token is not None
+    get_client = AsyncMock()
+    monkeypatch.setattr(graphiti_mcp_server, 'MCP_SECURITY', settings)
+    monkeypatch.setattr(graphiti_mcp_server, 'active_transport', 'http')
+    monkeypatch.setattr(
+        graphiti_mcp_server, 'graphiti_service', SimpleNamespace(get_client=get_client)
+    )
+    token_context = auth_context_var.set(AuthenticatedUser(token))
+    try:
+        with pytest.raises(McpAuthorizationError):
+            await registered_tool('prune_search_index')(group_id=group)
+    finally:
+        auth_context_var.reset(token_context)
+    get_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dry_run', [True, False])
+async def test_prune_search_index_admin_preserves_explicit_scope_and_mode(monkeypatch, dry_run):
+    from graphiti_core.driver.operations.graph_ops import SearchIndexPruneResult
+
+    settings = settings_from({'GRAPHITI_MCP_DESTRUCTIVE_TOOLS_ENABLED': 'true'})
+    token = await StaticTokenVerifier(settings).verify_token(ADMIN_TOKEN)
+    assert token is not None
+    prune = AsyncMock(
+        return_value=[SearchIndexPruneResult('episode_content', 2, 1, 1, 0 if dry_run else 1)]
+    )
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEPTUNE, graph_ops=SimpleNamespace(prune_search_index=prune)
+    )
+    client = SimpleNamespace(driver=driver)
+    monkeypatch.setattr(graphiti_mcp_server, 'MCP_SECURITY', settings)
+    monkeypatch.setattr(graphiti_mcp_server, 'active_transport', 'http')
+    monkeypatch.setattr(
+        graphiti_mcp_server,
+        'graphiti_service',
+        SimpleNamespace(get_client=AsyncMock(return_value=client)),
+    )
+    token_context = auth_context_var.set(AuthenticatedUser(token))
+    try:
+        result = await registered_tool('prune_search_index')(group_id='team-a', dry_run=dry_run)
+    finally:
+        auth_context_var.reset(token_context)
+    prune.assert_awaited_once_with(driver, 'team-a', dry_run=dry_run)
+    assert result == {
+        'group_id': 'team-a',
+        'dry_run': dry_run,
+        'indices': [
+            {
+                'index_name': 'episode_content',
+                'examined': 2,
+                'retained': 1,
+                'orphaned': 1,
+                'removed': 0 if dry_run else 1,
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'error', [NotImplementedError('unsupported'), RuntimeError('private-provider-detail')]
+)
+async def test_prune_search_index_failure_is_explicit_and_redacted(monkeypatch, caplog, error):
+    prune = AsyncMock(side_effect=error)
+    driver = SimpleNamespace(
+        provider=GraphProvider.NEPTUNE, graph_ops=SimpleNamespace(prune_search_index=prune)
+    )
+    monkeypatch.setattr(graphiti_mcp_server, 'active_transport', 'stdio')
+    monkeypatch.setattr(
+        graphiti_mcp_server,
+        'graphiti_service',
+        SimpleNamespace(
+            get_client=AsyncMock(return_value=SimpleNamespace(driver=driver)),
+        ),
+    )
+    result = await registered_tool('prune_search_index')(group_id='team-a', dry_run=False)
+    assert 'error' in result
+    assert 'private-provider-detail' not in str(result) + caplog.text
+    assert ('unsupported' if isinstance(error, NotImplementedError) else 'partial') in result[
+        'error'
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('group', ['', ' ', 'team a'])
+async def test_prune_search_index_validates_scope_even_without_http_auth(monkeypatch, group):
+    get_client = AsyncMock()
+    monkeypatch.setattr(graphiti_mcp_server, 'active_transport', 'stdio')
+    monkeypatch.setattr(
+        graphiti_mcp_server, 'graphiti_service', SimpleNamespace(get_client=get_client)
+    )
+    result = await registered_tool('prune_search_index')(group_id=group)
+    assert 'error' in result
+    get_client.assert_not_awaited()
+
+
 def test_secured_tool_omits_destructive_registration_in_required_mode(monkeypatch) -> None:
     settings = settings_from()
     isolated_server = FastMCP('destructive-registration-test')
@@ -1289,7 +1405,7 @@ def test_required_mode_protocol_hides_destructive_tools_and_denies_wrong_scope()
                 )
             )
             names = {tool['name'] for tool in listed['result']['tools']}
-            assert not {'clear_graph', 'delete_episode', 'delete_entity_edge'} & names
+            assert not {'clear_graph', 'delete_episode', 'delete_entity_edge', 'prune_search_index'} & names
 
             denied = response_body(
                 client.post(

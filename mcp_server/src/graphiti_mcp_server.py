@@ -26,6 +26,7 @@ from graphiti_core.driver.neptune.vector_reconciliation import (
 )
 from graphiti_core.edges import EntityEdge
 from graphiti_core.errors import GroupsEdgesNotFoundError, NodeNotFoundError
+from graphiti_core.helpers import validate_group_id
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode, SagaNode
 from graphiti_core.search.search_config import SearchResults
 from graphiti_core.search.search_filters import SearchFilters
@@ -45,6 +46,8 @@ from models.response_types import (
     GraphBrowseResponse,
     NodeSearchResponse,
     SagaSummaryResponse,
+    SearchIndexPruneCounts,
+    SearchIndexPruneResponse,
     StatusResponse,
     SuccessResponse,
     TripletResponse,
@@ -1624,6 +1627,51 @@ async def clear_graph(
         error_msg = str(e)
         logger.error(f'Error clearing graph: {error_msg}')
         return ErrorResponse(error=f'Error clearing graph: {error_msg}')
+
+
+@secured_tool(ToolScope.ADMIN, group_parameter='group_id', destructive=True)
+async def prune_search_index(
+    group_id: str, dry_run: bool = True
+) -> SearchIndexPruneResponse | ErrorResponse:
+    """Remove orphan keyword documents for one explicit group, preserving live graph records.
+
+    Neptune only. Defaults to a read-only dry run. Apply requires quiesced writers:
+    this is not an atomic graph/index snapshot. A failure may follow partial cleanup.
+    """
+    if not group_id or group_id.strip() != group_id:
+        return ErrorResponse(error='Search-index pruning requires an explicit nonblank group')
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+    try:
+        validate_group_id(group_id)
+        client = await graphiti_service.get_client()
+        driver = await driver_for_group(client, group_id)
+        if driver.graph_ops is None:
+            raise NotImplementedError('Search-index pruning is unsupported')
+        results = await driver.graph_ops.prune_search_index(driver, group_id, dry_run=dry_run)
+        return SearchIndexPruneResponse(
+            group_id=group_id,
+            dry_run=dry_run,
+            indices=[
+                SearchIndexPruneCounts(
+                    index_name=result.index_name,
+                    examined=result.examined,
+                    retained=result.retained,
+                    orphaned=result.orphaned,
+                    removed=result.removed,
+                )
+                for result in results
+            ],
+        )
+    except NotImplementedError:
+        return ErrorResponse(error='Search-index pruning is unsupported by this provider')
+    except Exception as exc:
+        # Provider exception text can include source data and connection details.
+        logger.error('Search-index pruning failed (error_type=%s)', type(exc).__name__)
+        return ErrorResponse(
+            error='Search-index pruning failed; cleanup may be partial. '
+            'Inspect service diagnostics before another dry run.'
+        )
 
 
 @secured_tool(ToolScope.READ)

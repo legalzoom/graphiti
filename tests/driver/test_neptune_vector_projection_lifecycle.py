@@ -1085,6 +1085,11 @@ class ClearDriver:
     def __init__(self, entity_node_ops: DeleteRecorder) -> None:
         self.entity_node_ops = entity_node_ops
         self.vector_index_reset = False
+        self.keyword_prunes: list[tuple[str | None, bool]] = []
+
+    async def prune_keyword_indices(self, group_id: str | None, *, dry_run: bool) -> list:
+        self.keyword_prunes.append((group_id, dry_run))
+        return []
 
     async def delete_vector_aoss_indices(self) -> None:
         self.vector_index_reset = True
@@ -1120,6 +1125,7 @@ class TestGraphClearLifecycle:
         assert all('NOT n:GraphitiProjectionVersion' in query for query in select_queries)
         assert all('NOT n:Entity' in query for query in select_queries)
         assert driver.vector_index_reset is False
+        assert driver.keyword_prunes == [(None, False)]
 
 
 class GenericGraphOpsRecorder:

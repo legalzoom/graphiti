@@ -20,8 +20,14 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from graphiti_core.driver.driver import GraphProvider
-from graphiti_core.driver.neptune.projection_versions import validate_batch_size
-from graphiti_core.driver.operations.graph_ops import GraphMaintenanceOperations
+from graphiti_core.driver.neptune.projection_versions import (
+    defer_cancellation_until_complete,
+    validate_batch_size,
+)
+from graphiti_core.driver.operations.graph_ops import (
+    GraphMaintenanceOperations,
+    SearchIndexPruneResult,
+)
 from graphiti_core.driver.operations.graph_utils import Neighbor, label_propagation
 from graphiti_core.driver.query_executor import QueryExecutor
 from graphiti_core.driver.record_parsers import (
@@ -45,6 +51,20 @@ logger = logging.getLogger(__name__)
 class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
     def __init__(self, driver: NeptuneDriver | None = None):
         self._driver = driver
+
+    @defer_cancellation_until_complete
+    async def prune_search_index(
+        self,
+        executor: QueryExecutor,
+        group_id: str,
+        *,
+        dry_run: bool,
+    ) -> list[SearchIndexPruneResult]:
+        if self._driver is None:
+            raise RuntimeError('Neptune search-index pruning requires a bound driver')
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError('Search-index pruning requires an explicit group')
+        return await self._driver.prune_keyword_indices(group_id, dry_run=dry_run)
 
     async def _delete_remaining_nodes(
         self,
@@ -96,6 +116,7 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
                     break
                 await executor.execute_query(delete_query, ids=ids)
 
+    @defer_cancellation_until_complete
     async def clear_data(
         self,
         executor: QueryExecutor,
@@ -146,6 +167,11 @@ class NeptuneGraphMaintenanceOperations(GraphMaintenanceOperations):
             group_ids=group_ids,
             batch_size=batch_size,
         )
+        if self._driver is not None:
+            # Also handles index-only orphans left by earlier clears. A later graph join
+            # hiding them from final results is not evidence of index cleanup.
+            for group_id in dict.fromkeys(group_ids) if group_ids is not None else [None]:
+                await self._driver.prune_keyword_indices(group_id, dry_run=False)
 
     async def build_indices_and_constraints(
         self,

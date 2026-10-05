@@ -318,7 +318,7 @@ Send the selected credential as `Authorization: Bearer <token>`. Permissions are
 
 Requested `group_id`/`group_ids` values and UUID-backed resources are checked against the token's
 group binding. Cross-group episode context, center-node references, and reused node UUIDs are
-rejected. `delete_entity_edge`, `delete_episode`, and `clear_graph` are omitted by default in
+rejected. `delete_entity_edge`, `delete_episode`, `clear_graph`, and `prune_search_index` are omitted by default in
 required mode; `--destroy-graph` is disabled whenever HTTP auth is enabled. The `/health` endpoint
 remains unauthenticated for orchestrator probes and does not expose graph data.
 
@@ -621,7 +621,7 @@ For HTTP transport (default), you can use this configuration:
 
 The Graphiti MCP server exposes the following tools:
 
-In security-required HTTP mode, the three destructive tools are omitted unless explicitly enabled;
+In security-required HTTP mode, destructive tools are omitted unless explicitly enabled;
 when enabled they require the admin bearer token. Other tools require the scopes documented above.
 
 - `add_memory`: Add an episode to the knowledge graph (supports text, JSON, and message formats).
@@ -643,7 +643,23 @@ when enabled they require the admin bearer token. Other tools require the scopes
 - `get_entity_edge`: Get an entity edge by its UUID.
 - `get_episodes`: Get the most recent episodes for a specific group.
 - `clear_graph`: Clear all data from the knowledge graph for the given group(s).
+  Neptune also prunes orphan keyword documents after graph deletion, including leftovers from prior clears.
+  Retired episode tombstones and vector-generation ledgers remain intact.
+- `prune_search_index`: Neptune-only orphan keyword repair for one explicit `group_id`.
+  Defaults to `dry_run=true`; use `dry_run=false` only after quiescing writers and inspecting the dry run.
+  It preserves live graph records, exact foreign groups and vector indexes. Per-index counts report
+  examined, retained, orphaned and actually removed documents. No graph records are written.
 - `get_status`: Get the status of the Graphiti MCP server and database connection.
+
+Keyword cleanup uses bounded search pages and native conditional bulk deletion. The provider must
+return sequence numbers and primary terms and honor their delete preconditions. Missing metadata,
+partial search, version conflicts and bulk failures stop cleanup without unconditional fallback.
+Earlier pages may already be removed when an error is returned. Cancellation waits for the active
+maintenance operation to finish before returning. Search refresh is asynchronous, and traversal is
+not an atomic graph/index snapshot: pause and drain all writers to the target group for clear or
+applied repair. Qualify dry-run metadata and a disposable-group applied repair on the deployed
+provider before using this operation on important data. This does not repair every individual-delete
+path or rebuild missing documents.
 
 Custom entity types and edge (fact) types — including which edge types may connect which entity types —
 can be configured under the `graphiti` section of `config/config.yaml`. See the `entity_types`,

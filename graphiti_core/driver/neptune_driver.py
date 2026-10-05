@@ -60,7 +60,10 @@ from graphiti_core.driver.operations.entity_edge_ops import EntityEdgeOperations
 from graphiti_core.driver.operations.entity_node_ops import EntityNodeOperations
 from graphiti_core.driver.operations.episode_node_ops import EpisodeNodeOperations
 from graphiti_core.driver.operations.episodic_edge_ops import EpisodicEdgeOperations
-from graphiti_core.driver.operations.graph_ops import GraphMaintenanceOperations
+from graphiti_core.driver.operations.graph_ops import (
+    GraphMaintenanceOperations,
+    SearchIndexPruneResult,
+)
 from graphiti_core.driver.operations.has_episode_edge_ops import HasEpisodeEdgeOperations
 from graphiti_core.driver.operations.next_episode_edge_ops import NextEpisodeEdgeOperations
 from graphiti_core.driver.operations.saga_node_ops import SagaNodeOperations
@@ -151,6 +154,7 @@ NEPTUNE_BOTO_CONFIG = Config(
 text_aoss_indices = [
     {
         'index_name': 'node_name_and_summary',
+        'graph_match': 'MATCH (record:Entity)',
         'body': {
             'mappings': {
                 'properties': {
@@ -168,6 +172,7 @@ text_aoss_indices = [
     },
     {
         'index_name': 'community_name',
+        'graph_match': 'MATCH (record:Community)',
         'body': {
             'mappings': {
                 'properties': {
@@ -184,6 +189,7 @@ text_aoss_indices = [
     },
     {
         'index_name': 'episode_content',
+        'graph_match': 'MATCH (record:Episodic)',
         'body': {
             'mappings': {
                 'properties': {
@@ -207,6 +213,7 @@ text_aoss_indices = [
     },
     {
         'index_name': 'edge_name_and_fact',
+        'graph_match': 'MATCH ()-[record:RELATES_TO]->()',
         'body': {
             'mappings': {
                 'properties': {
@@ -978,6 +985,19 @@ class NeptuneDriver(GraphDriver):
         else:
             lease.release()
             return response
+
+    async def prune_keyword_indices(
+        self, group_id: str | None, *, dry_run: bool
+    ) -> list[SearchIndexPruneResult]:
+        from graphiti_core.driver.neptune.keyword_cleanup import prune_keyword_indices
+
+        return await prune_keyword_indices(
+            self,
+            text_aoss_indices,
+            group_id=group_id,
+            dry_run=dry_run,
+            page_size=MAX_AOSS_QUERY_SIZE,
+        )
 
     async def run_aoss_query(self, name: str, query_text: str, limit: int = 10) -> dict[str, Any]:
         for index in self._configured_aoss_indices():
